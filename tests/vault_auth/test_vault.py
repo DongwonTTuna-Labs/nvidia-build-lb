@@ -16,6 +16,7 @@ from nvidia_build_lb.vault import (
     VaultEnvelope,
     VaultFailureCode,
     VaultKeyLengthError,
+    VaultKeyVerifier,
 )
 
 pytestmark = pytest.mark.vault_auth
@@ -155,6 +156,19 @@ def test_vault_rejects_wrong_key_and_row_swap() -> None:
     # Then: both contexts fail through the same authenticated-envelope class.
     assert wrong_key.value.code is VaultFailureCode.AUTHENTICATION_FAILED
     assert row_swap.value.code is VaultFailureCode.AUTHENTICATION_FAILED
+
+
+def test_vault_key_verifier_matches_only_the_bound_master_key() -> None:
+    vault = Vault(SecretBytes(b"a" * 32))
+
+    verifier = vault.build_key_verifier()
+
+    assert len(verifier.salt) == 32
+    assert len(verifier.digest) == 32
+    assert vault.matches_key_verifier(verifier) is True
+    assert Vault(SecretBytes(b"b" * 32)).matches_key_verifier(verifier) is False
+    with pytest.raises(ValueError, match="vault_key_verifier_invalid"):
+        _ = VaultKeyVerifier(b"short", verifier.digest)
 
 
 def test_vault_rejects_unknown_envelope_version_before_decryption() -> None:

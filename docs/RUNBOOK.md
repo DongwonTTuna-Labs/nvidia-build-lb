@@ -13,8 +13,9 @@
 
 ## First deployment
 
-Set `APP_IMAGE` and `POSTGRES_IMAGE` to reviewed immutable GHCR references. Do
-not use a mutable tag.
+Set the two registry digest variables to only the reviewed 64 lowercase hex
+characters after `@sha256:`. The production wrapper rejects tags, complete image
+references, uppercase values, and malformed digests before Compose runs.
 
 ```console
 set +x
@@ -24,24 +25,28 @@ sudo sh -c 'umask 077; openssl rand 32 > /opt/nvidia-build-lb/secrets/vault_mast
 sudo sh -c 'umask 077; openssl rand -hex 32 | tr -d "\n" > /opt/nvidia-build-lb/secrets/db_password'
 sudo chown root:root /opt/nvidia-build-lb/secrets/*
 sudo chmod 0600 /opt/nvidia-build-lb/secrets/*
-export NBLB_APP_IMAGE="$APP_IMAGE"
-export NBLB_POSTGRES_IMAGE="$POSTGRES_IMAGE"
+export NBLB_APP_REGISTRY_DIGEST="$APP_REGISTRY_DIGEST"
+export NBLB_POSTGRES_REGISTRY_DIGEST="$POSTGRES_REGISTRY_DIGEST"
 export NBLB_SECRET_DIR=/opt/nvidia-build-lb/secrets
-docker compose config --quiet
-docker compose up -d
+scripts/ops/production-compose.sh config --quiet
+scripts/ops/production-compose.sh up -d
 ```
 
 Compose waits for PostgreSQL health, runs the migration container, then starts
 the one-worker gateway. Migrations take a dedicated PostgreSQL session advisory
 lock, so concurrent rollout attempts serialize. Lock acquisition has a bounded
-statement timeout and failure is surfaced only as `migration_failed`.
+statement timeout and failure is surfaced only as `migration_failed`. The
+required Alembic head is `0004_vault_key_verifier`. On first startup after that
+migration, the app initializes the singleton verifier only after every existing
+upstream ciphertext decrypts with the configured vault key; every later startup
+requires the salted verifier HMAC to match or fails closed.
 
 ## Health and safe inspection
 
 ```console
 curl --fail --header 'Host: 127.0.0.1:2456' http://127.0.0.1:2456/health
-docker compose ps
-docker compose logs --no-color --since 10m app migrate db
+scripts/ops/production-compose.sh ps
+scripts/ops/production-compose.sh logs --no-color --since 10m app migrate db
 ```
 
 Expected ready response is `{"status":"ok","ready":true}`. Use only filtered
@@ -63,7 +68,7 @@ secret bind may remain pinned to the old inode.
 ```console
 set +x
 sudo sh -c 'umask 077; printf nblb_admin_ > /opt/nvidia-build-lb/secrets/.admin_token.next; openssl rand -hex 32 | tr -d "\n" >> /opt/nvidia-build-lb/secrets/.admin_token.next; chown root:root /opt/nvidia-build-lb/secrets/.admin_token.next; chmod 0600 /opt/nvidia-build-lb/secrets/.admin_token.next; mv /opt/nvidia-build-lb/secrets/.admin_token.next /opt/nvidia-build-lb/secrets/admin_token; sync -f /opt/nvidia-build-lb/secrets/admin_token; sync -f /opt/nvidia-build-lb/secrets'
-docker compose up -d --force-recreate --no-deps app
+scripts/ops/production-compose.sh up -d --force-recreate --no-deps app
 ```
 
 Do not rotate `vault_master_key` in isolation. Existing NVIDIA ciphertext is

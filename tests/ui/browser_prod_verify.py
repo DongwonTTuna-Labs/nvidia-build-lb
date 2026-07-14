@@ -15,20 +15,35 @@ from .browser_prod_models import (
     BrowserNetworkProjection,
     NativeStableProjection,
     ProductionBrowserReceipt,
+    ProductionRunCandidate,
 )
 from .lighthouse_gate import LighthouseReceipt
 
 _UUID: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _READ_CHUNK_BYTES: Final = 1024 * 1024
 
-type _CaptureIndexBinding = dict[
-    Literal["run-a", "run-b"],
-    Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")],
-]
+_EXPECTED_CAPTURE_COUNT: Final = 32
+_EXPECTED_SCENARIO_COUNT: Final = 10
+_EXPECTED_ADVERSARIAL_PROBE_COUNT: Final = 5
+_EXPECTED_LIGHTHOUSE_AUDIT_COUNT: Final = 4
+_EXPECTED_NATIVE_STABLE_COUNT: Final = 6
+_EXPECTED_NATIVE_CAPTURE_COUNT: Final = 10
 
 
 class _StrictModel(BaseModel):
     model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True)
+
+
+class _RunArtifactHashes(_StrictModel):
+    adversarial: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    candidate: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    capture_index: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    lighthouse: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    manual_qa: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    stack_cleanup: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+
+
+type _RunArtifactBinding = dict[Literal["run-a", "run-b"], _RunArtifactHashes]
 
 
 @final
@@ -38,16 +53,18 @@ class _Arguments(argparse.Namespace):
         self.evidence_dir = Path()
         self.source_sha = ""
         self.image_digest = ""
+        self.postgres_image_digest = ""
 
 
 class _VisualReview(_StrictModel):
     blocking_findings: tuple[str, ...]
     fresh_cleanup_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     image_digest: str
+    postgres_image_digest: str
     lane: Literal["objective-visual", "design-accessibility-persona"]
     process_baseline_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-    run_capture_index_sha256: _CaptureIndexBinding
-    schema_version: Literal[1]
+    run_artifact_sha256: _RunArtifactBinding
+    schema_version: Literal[2]
     source_tree_sha256: str
     status: Literal["PASS"]
 
@@ -55,9 +72,10 @@ class _VisualReview(_StrictModel):
 class _ReviewRequest(_StrictModel):
     fresh_cleanup_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")] | None
     image_digest: str
+    postgres_image_digest: str
     process_baseline_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
-    run_capture_index_sha256: _CaptureIndexBinding
-    schema_version: Literal[1]
+    run_artifact_sha256: _RunArtifactBinding
+    schema_version: Literal[2]
     source_tree_sha256: str
     status: Literal["PASS", "REVIEW_REQUIRED"]
 
@@ -94,6 +112,7 @@ class _FreshCleanupReceipt(_StrictModel):
 class _DeterminismReceipt(_StrictModel):
     comparisons: _DeterminismComparisons
     image_digest: str
+    postgres_image_digest: str
     runs: tuple[Literal["runs/run-a"], Literal["runs/run-b"]]
     schema_version: Literal[1]
     source_tree_sha256: str
@@ -128,11 +147,31 @@ class _VisualReviewStates(_StrictModel):
 class _CandidateReceipt(_StrictModel):
     capture_count_per_run: int
     image_digest: str
+    postgres_image_digest: str
     lighthouse_medians: tuple[_LighthouseProjection, ...]
     schema_version: Literal[1]
     source_tree_sha256: str
     status: Literal["PASS", "REVIEW_REQUIRED"]
     visual_reviews: _VisualReviewStates
+
+
+class _RunStackCleanupRemaining(_StrictModel):
+    browser_processes: Literal[0]
+    browser_temporary_directories: Literal[0]
+    containers: Literal[0]
+    lighthouse_processes: Literal[0]
+    networks: Literal[0]
+    playwright_drivers: Literal[0]
+    port_listeners: Literal[0]
+    temporary_postgres_images: Literal[0]
+    volumes: Literal[0]
+
+
+class _RunStackCleanupReceipt(_StrictModel):
+    remaining: _RunStackCleanupRemaining
+    run: Literal["run-a", "run-b"]
+    schema_version: Literal[1]
+    status: Literal["PASS"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,11 +194,25 @@ class _ManualProjection:
     network: tuple[BrowserNetworkProjection, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _RunEvidence:
+    run_name: Literal["run-a", "run-b"]
+    manual: ProductionBrowserReceipt
+    capture: CaptureIndex
+    lighthouse: LighthouseReceipt
+    adversarial: AdversarialReceipt
+    candidate: ProductionRunCandidate
+    stack_cleanup: _RunStackCleanupReceipt
+    source_sha: str
+    image_digest: str
+
+
 def _arguments() -> _Arguments:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--evidence-dir", type=Path, required=True)
     _ = parser.add_argument("--source-sha", required=True)
     _ = parser.add_argument("--image-digest", required=True)
+    _ = parser.add_argument("--postgres-image-digest", required=True)
     arguments = _Arguments()
     _ = parser.parse_args(namespace=arguments)
     return arguments
@@ -434,6 +487,75 @@ def _verified_capture_index(run: Path) -> tuple[CaptureIndex, str]:
     return capture, hashlib.sha256(index_bytes).hexdigest()
 
 
+def _run_artifact_hashes(run: Path, capture_index_sha256: str) -> _RunArtifactHashes:
+    return _RunArtifactHashes(
+        adversarial=hashlib.sha256(_read_regular_bytes(run / "adversarial.json")).hexdigest(),
+        candidate=hashlib.sha256(_read_regular_bytes(run / "candidate.json")).hexdigest(),
+        capture_index=capture_index_sha256,
+        lighthouse=hashlib.sha256(_read_regular_bytes(run / "lighthouse.json")).hexdigest(),
+        manual_qa=hashlib.sha256(_read_regular_bytes(run / "manual-qa.json")).hexdigest(),
+        stack_cleanup=hashlib.sha256(_read_regular_bytes(run / "stack-cleanup.json")).hexdigest(),
+    )
+
+
+def _assert_run_receipts(evidence: _RunEvidence) -> None:
+    run_name = evidence.run_name
+    manual = evidence.manual
+    capture = evidence.capture
+    lighthouse = evidence.lighthouse
+    adversarial = evidence.adversarial
+    candidate = evidence.candidate
+    stack_cleanup = evidence.stack_cleanup
+    source_sha = evidence.source_sha
+    image_digest = evidence.image_digest
+    _assert_exact(manual.run_name, run_name, "manual run identity changed")
+    _assert_exact(candidate.run_name, run_name, "candidate run identity changed")
+    _assert_exact(stack_cleanup.run, run_name, "cleanup run identity changed")
+    _assert_exact(manual.source_tree_sha256, source_sha, "manual source binding changed")
+    _assert_exact(candidate.source_tree_sha256, source_sha, "candidate source binding changed")
+    _assert_exact(manual.image_digest, image_digest, "manual image binding changed")
+    _assert_exact(candidate.image_digest, image_digest, "candidate image binding changed")
+    _assert_exact(lighthouse.image_digest, image_digest, "Lighthouse image binding changed")
+    _assert_exact(len(capture.captures), _EXPECTED_CAPTURE_COUNT, "capture count changed")
+    _assert_exact(candidate.capture_count, _EXPECTED_CAPTURE_COUNT, "candidate count changed")
+    _assert_exact(len(manual.scenarios), _EXPECTED_SCENARIO_COUNT, "scenario count changed")
+    _assert_exact(
+        len(adversarial.probes),
+        _EXPECTED_ADVERSARIAL_PROBE_COUNT,
+        "adversarial probe count changed",
+    )
+    _assert_exact(
+        tuple(probe.status for probe in adversarial.probes),
+        ("passed",) * _EXPECTED_ADVERSARIAL_PROBE_COUNT,
+        "adversarial probe status changed",
+    )
+    _assert_exact(
+        len(lighthouse.audits),
+        _EXPECTED_LIGHTHOUSE_AUDIT_COUNT,
+        "Lighthouse audit count changed",
+    )
+    _assert_exact(
+        tuple((audit.route, audit.form_factor) for audit in lighthouse.audits),
+        (
+            ("admin", "mobile"),
+            ("admin", "desktop"),
+            ("showcase", "mobile"),
+            ("showcase", "desktop"),
+        ),
+        "Lighthouse audit tuple changed",
+    )
+    _assert_exact(
+        len(manual.native.stable),
+        _EXPECTED_NATIVE_STABLE_COUNT,
+        "native stable projection count changed",
+    )
+    _assert_exact(
+        len(manual.native.capture_ids),
+        _EXPECTED_NATIVE_CAPTURE_COUNT,
+        "native capture identity count changed",
+    )
+
+
 def _assert_exact(left: object, right: object, reason: str) -> None:
     if left != right:
         raise AssertionError(reason)
@@ -463,15 +585,55 @@ def main() -> int:
     lighthouse_b = LighthouseReceipt.model_validate_json(
         _read_regular_bytes(run_b / "lighthouse.json")
     )
-    for receipt in (manual_a, manual_b):
-        _assert_exact(receipt.image_digest, args.image_digest, "browser image binding changed")
-        _assert_exact(
-            receipt.source_tree_sha256,
-            args.source_sha,
-            "browser source binding changed",
+    adversarial_a = AdversarialReceipt.model_validate_json(
+        _read_regular_bytes(run_a / "adversarial.json")
+    )
+    adversarial_b = AdversarialReceipt.model_validate_json(
+        _read_regular_bytes(run_b / "adversarial.json")
+    )
+    candidate_a = ProductionRunCandidate.model_validate_json(
+        _read_regular_bytes(run_a / "candidate.json")
+    )
+    candidate_b = ProductionRunCandidate.model_validate_json(
+        _read_regular_bytes(run_b / "candidate.json")
+    )
+    stack_cleanup_a = _RunStackCleanupReceipt.model_validate_json(
+        _read_regular_bytes(run_a / "stack-cleanup.json")
+    )
+    stack_cleanup_b = _RunStackCleanupReceipt.model_validate_json(
+        _read_regular_bytes(run_b / "stack-cleanup.json")
+    )
+    _assert_run_receipts(
+        _RunEvidence(
+            run_name="run-a",
+            manual=manual_a,
+            capture=capture_a,
+            lighthouse=lighthouse_a,
+            adversarial=adversarial_a,
+            candidate=candidate_a,
+            stack_cleanup=stack_cleanup_a,
+            source_sha=args.source_sha,
+            image_digest=args.image_digest,
         )
-    for receipt in (lighthouse_a, lighthouse_b):
-        _assert_exact(receipt.image_digest, args.image_digest, "Lighthouse image binding changed")
+    )
+    _assert_run_receipts(
+        _RunEvidence(
+            run_name="run-b",
+            manual=manual_b,
+            capture=capture_b,
+            lighthouse=lighthouse_b,
+            adversarial=adversarial_b,
+            candidate=candidate_b,
+            stack_cleanup=stack_cleanup_b,
+            source_sha=args.source_sha,
+            image_digest=args.image_digest,
+        )
+    )
+    _assert_exact(adversarial_a, adversarial_b, "adversarial receipt tuple changed")
+    run_artifact_binding: _RunArtifactBinding = {
+        "run-a": _run_artifact_hashes(run_a, capture_index_sha_a),
+        "run-b": _run_artifact_hashes(run_b, capture_index_sha_b),
+    }
     manual_projection_a = _manual_projection(manual_a)
     capture_projection_a = _capture_projection(capture_a)
     lighthouse_projection_a = _lighthouse_projection(lighthouse_a)
@@ -504,16 +666,14 @@ def main() -> int:
     review_request = _ReviewRequest(
         fresh_cleanup_sha256=fresh_cleanup_sha,
         image_digest=args.image_digest,
+        postgres_image_digest=args.postgres_image_digest,
         process_baseline_sha256=process_baseline_sha,
-        run_capture_index_sha256={
-            "run-a": capture_index_sha_a,
-            "run-b": capture_index_sha_b,
-        },
-        schema_version=1,
+        run_artifact_sha256=run_artifact_binding,
+        schema_version=2,
         source_tree_sha256=args.source_sha,
         status="REVIEW_REQUIRED",
     )
-    review_binding = review_request.run_capture_index_sha256
+    review_binding = review_request.run_artifact_sha256
     _write(root / "review-request.json", review_request)
     _write(
         root / "determinism.json",
@@ -525,6 +685,7 @@ def main() -> int:
                 source_and_image_binding_exact=True,
             ),
             image_digest=args.image_digest,
+            postgres_image_digest=args.postgres_image_digest,
             runs=("runs/run-a", "runs/run-b"),
             schema_version=1,
             source_tree_sha256=args.source_sha,
@@ -537,10 +698,11 @@ def main() -> int:
             blocking_findings=(),
             fresh_cleanup_sha256=fresh_cleanup_sha,
             image_digest=args.image_digest,
+            postgres_image_digest=args.postgres_image_digest,
             lane="objective-visual",
             process_baseline_sha256=process_baseline_sha,
-            run_capture_index_sha256=review_binding,
-            schema_version=1,
+            run_artifact_sha256=review_binding,
+            schema_version=2,
             source_tree_sha256=args.source_sha,
             status="PASS",
         ),
@@ -551,10 +713,11 @@ def main() -> int:
             blocking_findings=(),
             fresh_cleanup_sha256=fresh_cleanup_sha,
             image_digest=args.image_digest,
+            postgres_image_digest=args.postgres_image_digest,
             lane="design-accessibility-persona",
             process_baseline_sha256=process_baseline_sha,
-            run_capture_index_sha256=review_binding,
-            schema_version=1,
+            run_artifact_sha256=review_binding,
+            schema_version=2,
             source_tree_sha256=args.source_sha,
             status="PASS",
         ),
@@ -567,6 +730,7 @@ def main() -> int:
         _CandidateReceipt(
             capture_count_per_run=len(capture_projection_a),
             image_digest=args.image_digest,
+            postgres_image_digest=args.postgres_image_digest,
             lighthouse_medians=lighthouse_projection_a,
             schema_version=1,
             source_tree_sha256=args.source_sha,
@@ -586,9 +750,10 @@ def main() -> int:
         _ReviewRequest(
             fresh_cleanup_sha256=fresh_cleanup_sha,
             image_digest=args.image_digest,
+            postgres_image_digest=args.postgres_image_digest,
             process_baseline_sha256=process_baseline_sha,
-            run_capture_index_sha256=review_request.run_capture_index_sha256,
-            schema_version=1,
+            run_artifact_sha256=review_request.run_artifact_sha256,
+            schema_version=2,
             source_tree_sha256=args.source_sha,
             status="PASS",
         ),

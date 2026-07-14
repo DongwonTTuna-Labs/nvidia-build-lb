@@ -2,7 +2,7 @@ name: nvidia-build-lb
 
 services:
   db:
-    image: ${NBLB_POSTGRES_IMAGE:?immutable PostgreSQL image digest required}
+    image: ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_POSTGRES_REGISTRY_DIGEST:?raw PostgreSQL registry digest required}
     environment:
       POSTGRES_DB: nvidia_build_lb
       POSTGRES_USER: nvidia_build_lb
@@ -43,7 +43,7 @@ services:
     stop_grace_period: 30s
 
   migrate:
-    image: ${NBLB_APP_IMAGE:?immutable application image digest required}
+    image: ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_APP_REGISTRY_DIGEST:?raw application registry digest required}
     environment:
       NVIDIA_BUILD_LB_MODE: migrate
       NVIDIA_BUILD_LB_DATABASE_URL: postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb
@@ -77,7 +77,7 @@ services:
     stop_grace_period: 30s
 
   app:
-    image: ${NBLB_APP_IMAGE:?immutable application image digest required}
+    image: ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_APP_REGISTRY_DIGEST:?raw application registry digest required}
     environment:
       NVIDIA_BUILD_LB_MODE: app
       NVIDIA_BUILD_LB_DATABASE_URL: postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb
@@ -116,7 +116,7 @@ services:
       migrate:
         condition: service_completed_successfully
     ports:
-      - ${NBLB_BIND_ADDRESS:-127.0.0.1}:${NBLB_PORT:-2456}:2456
+      - 127.0.0.1:${NBLB_PORT:-2456}:2456
     networks:
       - data
       - egress

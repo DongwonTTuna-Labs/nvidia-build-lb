@@ -17,9 +17,19 @@ uv run pytest -q
 make help
 ```
 
-`make help` lists the stable verification targets. A release candidate must pass
-`build-candidate`, `test-browser-prod`, `verify-local`, and `scan-release` on the
-same immutable image ID before publication.
+`make help` lists the stable verification targets. `build-candidate` records one
+byte-identical source manifest and one immutable application/PostgreSQL image
+ID pair. `test-browser-prod`, `verify-local`, and `scan-release` must all reuse
+that exact three-part identity before publication:
+
+```console
+make build-candidate EVIDENCE_DIR=.omo/evidence/task-6a-release
+APP_IMAGE_ID="$(jq -er .image_digest .omo/evidence/task-6a-release/candidate.json)"
+POSTGRES_IMAGE_ID="$(jq -er .postgres_image_digest .omo/evidence/task-6a-release/candidate.json)"
+SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json
+make verify-local IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR=.omo/evidence/task-7-verify
+make scan-release IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR=.omo/evidence/task-7-scan
+```
 
 Operational documentation:
 
@@ -31,4 +41,7 @@ Operational documentation:
 
 The supplied Compose surface binds only `127.0.0.1:2456`; it intentionally
 does not create public DNS, tunnel, or reverse-proxy ingress. This project is
-independent and is not affiliated with NVIDIA Corporation.
+invoked through `scripts/ops/production-compose.sh`, which accepts only raw
+64-hex GHCR registry digests and rejects mutable image tags before Compose
+runs. This project is independent and is not affiliated with NVIDIA
+Corporation.

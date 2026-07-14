@@ -33,8 +33,14 @@ capabilities, and `NoNewPrivs=1`.
   only that verified public value in a temporary scan copy. Missing, additional,
   or changed values fail closed; every other metadata byte remains scanned.
 - Vulnerable dependency/image: the locked Python graph is audited by
-  `pip-audit`; the immutable application image is scanned by Trivy for unfixed
-  high/critical vulnerabilities before publication.
+  `pip-audit`; both immutable application and PostgreSQL images are scanned by
+  Trivy for all high/critical vulnerabilities before publication. Unfixed
+  findings are not ignored.
+- The application builder/runtime share one digest-pinned official Python 3.13
+  Alpine base that is scanned before release. The PostgreSQL image keeps the
+  pinned 17.9 major/minor base, upgrades only exact patched Alpine crypto/XML
+  packages, and removes the unused `gosu` binary; the root prestart performs
+  the only UID handoff with `setpriv` before the official entrypoint runs.
 - Mutable supply chain: GitHub Actions use full 40-hex commit pins, Docker base
   images and Dockerfile frontend use digests, workflows have minimum explicit
   permissions, and GHCR publishes commit-addressed tags without `latest`.
@@ -63,17 +69,27 @@ capabilities, and `NoNewPrivs=1`.
 
 ## Release gate
 
-The same immutable image must pass:
+The exact application/PostgreSQL image ID pair and byte-identical source
+manifest produced by `build-candidate` must pass every later gate:
 
 ```console
-make verify-local IMAGE_DIGEST=sha256:... EVIDENCE_DIR=.omo/evidence/task-7-verify
-make scan-release IMAGE_DIGEST=sha256:... EVIDENCE_DIR=.omo/evidence/task-7-scan
+make test-browser-prod IMAGE_DIGEST=sha256:... POSTGRES_IMAGE_DIGEST=sha256:... SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json EVIDENCE_DIR=.omo/evidence/task-6b-release
+make verify-local IMAGE_DIGEST=sha256:... POSTGRES_IMAGE_DIGEST=sha256:... SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json EVIDENCE_DIR=.omo/evidence/task-7-verify
+make scan-release IMAGE_DIGEST=sha256:... POSTGRES_IMAGE_DIGEST=sha256:... SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json EVIDENCE_DIR=.omo/evidence/task-7-scan
 ```
 
-Both scripts claim a new evidence directory, fail closed, label every Docker
-resource they create, and write `manual-qa.json`, `adversarial.json`, and
-`cleanup.json`. A scanner outage, unavailable vulnerability database, mutable
-Action reference, finding, missing cleanup, or digest/source mismatch is FAIL.
+Each script claims a new evidence directory, fails closed, labels every Docker
+resource it creates, and writes bound receipts. The release scan covers both
+images and the source tree without `--ignore-unfixed`. A scanner outage,
+unavailable vulnerability database, mutable Action reference, finding, missing
+cleanup, source-manifest byte drift, or either image-ID drift is FAIL.
+
+After the runtime audit records at least three distinct disproved hypotheses,
+each hypothesis must cite a SHA-256 already present in the four gate artifact
+sets. `scripts/qa/canonical_evidence.py create` binds those artifacts, both
+image IDs, the source manifest, backup/restore receipts, visual reviews, and the
+runtime audit into one exclusive mode-`0600` receipt. Re-run the same invocation
+with `verify` instead of `create` before treating that receipt as current.
 
 ## Residual risks
 

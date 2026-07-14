@@ -143,6 +143,44 @@ def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
     ]
 
 
+def test_initial_service_outage_is_not_rendered_as_authentication_failure() -> None:
+    document, _ = _admin_document()
+    script = load_web_resource(WebResource("admin-script"))
+
+    assert 'id="login-error"' in document
+    assert 'id="login-offline"' in document
+    assert "Authentication failed." in document
+    assert "Service unavailable." in document
+    assert "mountLogin(false, true)" in script
+    assert 'byId("login-offline").focus()' in script
+
+
+def test_management_action_failures_preserve_details_and_force_401_reauthentication() -> None:
+    script = load_web_resource(WebResource("admin-script"))
+    show_problem = script[
+        script.index("function showProblem") : script.index("function setDashboardBusy")
+    ]
+    clear_sensitive = script[
+        script.index("function clearSensitiveUi") : script.index("function mountLogin")
+    ]
+
+    assert 'setText("global-error-message", message)' in show_problem
+    assert 'byId("global-error").hidden = false' in show_problem
+    assert 'byId("stale-warning").hidden = !hasSafeData' in show_problem
+    assert "return" not in show_problem
+    assert "resetRequestController()" in clear_sensitive
+    assert 'document.querySelectorAll("dialog")' in clear_sensitive
+    assert 'byId("one-time-token").textContent = ""' in clear_sensitive
+    for start, end in (
+        ("async function runKeyAction", "function openConfirmation"),
+        ("async function confirmPendingAction", "async function submitUpstream"),
+        ("async function submitUpstream", "async function submitDownstream"),
+        ("async function submitDownstream", "async function copyToken"),
+    ):
+        consumer = script[script.index(start) : script.index(end)]
+        assert "if (response.status === 401) { mountLogin(true); return; }" in consumer
+
+
 def test_admin_static_sources_have_no_embedded_secret_or_unsafe_sink() -> None:
     # Given: all three production browser resources.
     resources = tuple(

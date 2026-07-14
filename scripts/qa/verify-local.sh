@@ -7,6 +7,8 @@ cd "$ROOT"
 
 EVIDENCE_DIR=${EVIDENCE_DIR:-.omo/evidence/task-7-nvidia-build-lb}
 IMAGE_DIGEST=${IMAGE_DIGEST:-}
+POSTGRES_IMAGE_DIGEST=${POSTGRES_IMAGE_DIGEST:-}
+SOURCE_MANIFEST=${SOURCE_MANIFEST:-}
 PRIMARY_PORT=${NBLB_VERIFY_PRIMARY_PORT:-32456}
 RESTORE_PORT=${NBLB_VERIFY_RESTORE_PORT:-32457}
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -14,7 +16,6 @@ PROJECT_PRIMARY="nblb-todo7-primary-${RUN_ID,,}"
 PROJECT_RESTORE="nblb-todo7-restore-${RUN_ID,,}"
 PROJECT_PRIMARY=${PROJECT_PRIMARY//[^a-z0-9_-]/-}
 PROJECT_RESTORE=${PROJECT_RESTORE//[^a-z0-9_-]/-}
-POSTGRES_TAG="nvidia-build-lb-postgres:todo7-${RUN_ID,,}"
 PRIMARY_SECRET_DIR=""
 RESTORE_SECRET_DIR=""
 BAD_SECRET_DIR=""
@@ -34,7 +35,7 @@ primary_compose() {
     NBLB_QA_RUN_ID="$RUN_ID" \
     NBLB_QA_SECRET_DIR="$PRIMARY_SECRET_DIR" \
     NBLB_QA_PORT="$PRIMARY_PORT" \
-    NBLB_POSTGRES_IMAGE="$POSTGRES_TAG" \
+    NBLB_POSTGRES_IMAGE="$POSTGRES_IMAGE_DIGEST" \
     NBLB_CANDIDATE_IMAGE="$IMAGE_DIGEST" \
     NBLB_BACKUP_SOURCE=true \
     NBLB_RESTORE_ISOLATED=false \
@@ -45,7 +46,7 @@ restore_compose() {
     NBLB_QA_RUN_ID="$RUN_ID" \
     NBLB_QA_SECRET_DIR="$RESTORE_SECRET_DIR" \
     NBLB_QA_PORT="$RESTORE_PORT" \
-    NBLB_POSTGRES_IMAGE="$POSTGRES_TAG" \
+    NBLB_POSTGRES_IMAGE="$POSTGRES_IMAGE_DIGEST" \
     NBLB_CANDIDATE_IMAGE="$IMAGE_DIGEST" \
     NBLB_BACKUP_SOURCE=false \
     NBLB_RESTORE_ISOLATED=true \
@@ -70,12 +71,6 @@ volume_count() {
     docker volume ls -q --filter "label=nvidia-build-lb.run=$RUN_ID" | wc -l | tr -d ' '
 }
 
-postgres_image_count() {
-    docker image ls --quiet --no-trunc "$POSTGRES_TAG" \
-        | LC_ALL=C sort -u \
-        | awk 'NF {count += 1} END {print count + 0}'
-}
-
 port_count() {
     local port=$1
     ss -H -ltn "sport = :$port" 2>/dev/null | wc -l | tr -d ' '
@@ -85,7 +80,8 @@ remove_root_contents() {
     local path=$1
     [ -n "$path" ] && [ -d "$path" ] || return 0
     root_helper --mount "type=bind,source=$path,target=/target" \
-        "$IMAGE_DIGEST" -c 'rm -rf -- /target/* /target/.[!.]* /target/..?* 2>/dev/null || true' \
+        "$IMAGE_DIGEST" -c 'rm -rf -- /target/* /target/.[!.]* /target/..?* 2>/dev/null || true; chown "$1:$2" /target; chmod 0700 /target' \
+        helper "$(id -u)" "$(id -g)" \
         >/dev/null 2>&1
 }
 
@@ -102,10 +98,6 @@ cleanup() {
         primary_compose down --volumes --remove-orphans --timeout 20 >/dev/null 2>&1 \
             || cleanup_error=1
     fi
-    postgres_images=$(postgres_image_count) || { postgres_images=-1; cleanup_error=1; }
-    if [ "$postgres_images" -gt 0 ]; then
-        docker image rm "$POSTGRES_TAG" >/dev/null 2>&1 || cleanup_error=1
-    fi
     for path in "$PRIMARY_SECRET_DIR" "$RESTORE_SECRET_DIR" "$BAD_SECRET_DIR" "$BACKUP_BASE"; do
         if [ -n "$path" ] && [ -d "$path" ]; then
             remove_root_contents "$path" || cleanup_error=1
@@ -121,7 +113,7 @@ cleanup() {
     volumes=$(volume_count) || { volumes=-1; cleanup_error=1; }
     primary_listeners=$(port_count "$PRIMARY_PORT") || { primary_listeners=-1; cleanup_error=1; }
     restore_listeners=$(port_count "$RESTORE_PORT") || { restore_listeners=-1; cleanup_error=1; }
-    postgres_images=$(postgres_image_count) || { postgres_images=-1; cleanup_error=1; }
+    postgres_images=0
     temp_directories=0
     for path in "$PRIMARY_SECRET_DIR" "$RESTORE_SECRET_DIR" "$BAD_SECRET_DIR" "$CLIENT_DIR" "$BACKUP_BASE"; do
         [ -z "$path" ] || [ ! -e "$path" ] || temp_directories=$((temp_directories + 1))
@@ -176,6 +168,26 @@ wait_healthy() {
         [ "$state" = healthy ] && return 0
         [ "$state" = exited ] || [ "$state" = dead ] && return 1
         sleep 1
+    done
+    return 1
+}
+
+wait_container_exit() {
+    local container=$1
+    local state
+    for _ in $(seq 1 150); do
+        state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null) \
+            || state=missing
+        case "$state" in
+            exited|dead)
+                printf '%s\n' "$state"
+                return 0
+                ;;
+            missing)
+                return 1
+                ;;
+        esac
+        sleep 0.1
     done
     return 1
 }
@@ -277,13 +289,22 @@ run_wrong_app_secret() {
     [ "$status" -eq 70 ] && [ "$output" = prestart_failed ]
 }
 
-for command in curl docker flock git jq openssl sha256sum ss uv; do
+for command in cmp curl date docker flock git jq openssl realpath sha256sum ss uv; do
     command -v "$command" >/dev/null 2>&1 || fail required_command_unavailable
 done
 [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail image_digest_invalid
+[[ "$POSTGRES_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail postgres_image_digest_invalid
+[ -f "$SOURCE_MANIFEST" ] && [ ! -L "$SOURCE_MANIFEST" ] \
+    || fail source_manifest_invalid
+SOURCE_MANIFEST=$(realpath -e "$SOURCE_MANIFEST")
 observed_image=$(docker image inspect --format '{{.Id}}' "$IMAGE_DIGEST" 2>/dev/null) \
     || fail image_unavailable
 [ "$observed_image" = "$IMAGE_DIGEST" ] || fail image_digest_mismatch
+observed_postgres_image=$(docker image inspect --format '{{.Id}}' \
+    "$POSTGRES_IMAGE_DIGEST" 2>/dev/null) || fail postgres_image_unavailable
+[ "$observed_postgres_image" = "$POSTGRES_IMAGE_DIGEST" ] \
+    || fail postgres_image_digest_mismatch
 [ "$(port_count "$PRIMARY_PORT")" -eq 0 ] || fail primary_port_busy
 [ "$(port_count "$RESTORE_PORT")" -eq 0 ] || fail restore_port_busy
 CODEX_BEFORE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -334,17 +355,29 @@ printf '%s\n' invalid > "$BAD_SECRET_DIR/db_password"
 root_helper --mount "type=bind,source=$PRIMARY_SECRET_DIR,target=/secrets" \
     "$IMAGE_DIGEST" -c 'chown 0:0 /secrets/*; chmod 0600 /secrets/admin_token /secrets/vault_master_key /secrets/db_password /secrets/server_key /secrets/server_cert; chmod 0644 /secrets/ca_cert'
 root_helper --mount "type=bind,source=$RESTORE_SECRET_DIR,target=/secrets" \
-    "$IMAGE_DIGEST" -c 'chown 0:0 /secrets/*; chmod 0600 /secrets/admin_token /secrets/db_password /secrets/server_key /secrets/server_cert; chmod 0644 /secrets/ca_cert'
+    "$IMAGE_DIGEST" -c 'chown 0:0 /secrets /secrets/*; chmod 0700 /secrets; chmod 0600 /secrets/admin_token /secrets/db_password /secrets/server_key /secrets/server_cert; chmod 0644 /secrets/ca_cert'
 root_helper --mount "type=bind,source=$BAD_SECRET_DIR,target=/secrets" \
     "$IMAGE_DIGEST" -c 'chown 0:0 /secrets/*; chmod 0600 /secrets/*'
 
-uv run python scripts/qa/source_manifest.py --root "$ROOT" \
-    --output "$CLIENT_DIR/source-manifest.json"
-source_sha256=$(jq -er '.source_tree_sha256' "$CLIENT_DIR/source-manifest.json")
+uv run python -m scripts.qa.source_manifest --root "$ROOT" \
+    --output "$CLIENT_DIR/source-manifest-current.json"
+cmp "$SOURCE_MANIFEST" "$CLIENT_DIR/source-manifest-current.json" \
+    || fail source_manifest_mismatch
+cp "$SOURCE_MANIFEST" "$CLIENT_DIR/source-manifest.json"
+cp "$SOURCE_MANIFEST" "$EVIDENCE_DIR/source-manifest.json"
+chmod 0444 "$EVIDENCE_DIR/source-manifest.json"
+source_sha256=$(jq -er '.source_tree_sha256' "$SOURCE_MANIFEST")
+source_manifest_sha256=$(sha256sum "$SOURCE_MANIFEST" \
+    | awk 'NR == 1 {print $1} END {if (NR != 1) exit 1}')
 image_source_sha256=$(docker image inspect \
     --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' \
     "$IMAGE_DIGEST")
 [ "$source_sha256" = "$image_source_sha256" ] || fail image_source_mismatch
+postgres_source_sha256=$(docker image inspect \
+    --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' \
+    "$POSTGRES_IMAGE_DIGEST")
+[ "$source_sha256" = "$postgres_source_sha256" ] \
+    || fail postgres_image_source_mismatch
 
 uv run ruff check .
 uv run ruff format --check .
@@ -352,12 +385,10 @@ uv run basedpyright
 FULL_TEST_EVIDENCE=".omo/evidence/task-4-nvidia-build-lb/runs/todo7-full-$RUN_ID"
 EVIDENCE_DIR="$FULL_TEST_EVIDENCE" uv run pytest -q
 
-docker build --pull --file docker/postgres.Dockerfile --tag "$POSTGRES_TAG" .
-postgres_image_digest=$(docker image inspect --format '{{.Id}}' "$POSTGRES_TAG")
-NBLB_APP_IMAGE="$IMAGE_DIGEST" \
-NBLB_POSTGRES_IMAGE="$postgres_image_digest" \
+NBLB_APP_REGISTRY_DIGEST="${IMAGE_DIGEST#sha256:}" \
+NBLB_POSTGRES_REGISTRY_DIGEST="${POSTGRES_IMAGE_DIGEST#sha256:}" \
 NBLB_SECRET_DIR="$PRIMARY_SECRET_DIR" \
-docker compose -f compose.yml config --quiet
+scripts/ops/production-compose.sh config --quiet
 primary_compose config --quiet
 restore_compose config --quiet
 
@@ -452,20 +483,55 @@ curl --silent --show-error --fail-with-body --no-buffer \
 grep -Fq 'candidate fake upstream ok' "$CLIENT_DIR/chat-stream-response.txt"
 [ "$(grep -Fxc 'data: [DONE]' "$CLIENT_DIR/chat-stream-response.txt")" -eq 1 ]
 
-primary_compose stop db >/dev/null
+database_failure_app_id=$(primary_compose ps -q app)
+[ -n "$database_failure_app_id" ] || fail database_failure_app_missing
 stopped_db_status=200
+degraded_observed_epoch_ns=0
+primary_compose stop db >/dev/null &
+db_stop_pid=$!
 for _ in $(seq 1 45); do
-    stopped_db_status=$(curl --silent --header 'Host: 127.0.0.1:2456' \
-        --output /dev/null --write-out '%{http_code}' \
+    stopped_db_status=$(curl --silent --connect-timeout 1 --max-time 1 \
+        --header 'Host: 127.0.0.1:2456' \
+        --output "$CLIENT_DIR/stopped-db-health-probe.json" --write-out '%{http_code}' \
         "http://127.0.0.1:$PRIMARY_PORT/health" 2>/dev/null || true)
-    [ "$stopped_db_status" != 200 ] && break
-    sleep 1
+    if [ "$stopped_db_status" = 503 ] && jq -e \
+        '. == {"status":"degraded","ready":false}' \
+        "$CLIENT_DIR/stopped-db-health-probe.json" >/dev/null 2>&1; then
+        mv "$CLIENT_DIR/stopped-db-health-probe.json" \
+            "$CLIENT_DIR/stopped-db-health.json"
+        degraded_observed_epoch_ns=$(date -u +%s%N)
+        break
+    fi
+    sleep 0.1
 done
-[ "$stopped_db_status" != 200 ] || fail stopped_database_not_observed
+wait "$db_stop_pid" || fail stopped_database_stop_failed
+[ "$stopped_db_status" = 503 ] || fail stopped_database_not_observed
+jq -e '. == {"status":"degraded","ready":false}' \
+    "$CLIENT_DIR/stopped-db-health.json" >/dev/null \
+    || fail stopped_database_health_body_invalid
+[ "$degraded_observed_epoch_ns" -gt 0 ] || fail stopped_database_degraded_time_missing
+old_app_exit_state=$(wait_container_exit "$database_failure_app_id") \
+    || fail stopped_database_old_app_did_not_exit
+old_app_finished_at=$(docker inspect --format '{{.State.FinishedAt}}' \
+    "$database_failure_app_id") || fail stopped_database_old_app_exit_unavailable
+old_app_exit_epoch_ns=$(date -u --date="$old_app_finished_at" +%s%N) \
+    || fail stopped_database_old_app_exit_time_invalid
+old_app_grace_ns=$((old_app_exit_epoch_ns - degraded_observed_epoch_ns))
+old_app_grace_ms=$((old_app_grace_ns / 1000000))
+[ "$old_app_grace_ms" -ge 1500 ] && [ "$old_app_grace_ms" -le 15000 ] \
+    || fail stopped_database_grace_invalid
+[ "$(primary_compose ps -a -q app)" = "$database_failure_app_id" ] \
+    || fail stopped_database_old_app_identity_changed
+old_app_exit_code=$(docker inspect --format '{{.State.ExitCode}}' \
+    "$database_failure_app_id") || fail stopped_database_old_app_exit_unavailable
+[[ "$old_app_exit_code" =~ ^[0-9]+$ ]] || fail stopped_database_old_app_exit_invalid
 primary_compose start db >/dev/null
 wait_healthy primary db
 primary_compose up --detach --force-recreate --no-deps app
 wait_healthy primary app
+recreated_app_id=$(primary_compose ps -q app)
+[ -n "$recreated_app_id" ] && [ "$recreated_app_id" != "$database_failure_app_id" ] \
+    || fail stopped_database_old_app_not_replaced
 [ "$(api_status "$CLIENT_DIR/persistence.curl" "$PRIMARY_PORT" /v1/models)" = 200 ] \
     || fail restart_persistence_failed
 
@@ -568,30 +634,44 @@ unset corrupt_output
 docker exec --user 70 "$restore_db" \
     psql --no-psqlrc --set ON_ERROR_STOP=1 --username nvidia_build_lb \
     --dbname nvidia_build_lb \
-    --command "UPDATE alembic_version SET version_num='0003_nvidia_routing';" >/dev/null
+    --command "UPDATE alembic_version SET version_num='0004_vault_key_verifier';" >/dev/null
 restore_compose run --rm --no-deps migrate >/dev/null
 
 CODEX_AFTER=$(curl --silent --output /dev/null --write-out '%{http_code}' \
     http://127.0.0.1:2455/health 2>/dev/null || true)
 [ "$CODEX_AFTER" = 200 ] || fail codex_lb_changed
 
-cp "$CLIENT_DIR/source-manifest.json" "$EVIDENCE_DIR/source-manifest.json"
+uv run python -m scripts.qa.source_manifest --root "$ROOT" \
+    --output "$CLIENT_DIR/source-manifest-final.json"
+cmp "$SOURCE_MANIFEST" "$CLIENT_DIR/source-manifest-final.json" \
+    || fail source_manifest_changed
+[ "$(docker image inspect --format '{{.Id}}' "$IMAGE_DIGEST")" = "$IMAGE_DIGEST" ] \
+    || fail image_digest_changed
+[ "$(docker image inspect --format '{{.Id}}' "$POSTGRES_IMAGE_DIGEST")" = "$POSTGRES_IMAGE_DIGEST" ] \
+    || fail postgres_image_digest_changed
+
+cmp "$CLIENT_DIR/source-manifest.json" "$EVIDENCE_DIR/source-manifest.json" \
+    || fail source_manifest_evidence_changed
 jq -n \
     --arg run_id "$RUN_ID" --arg status PASS \
-    --arg image_digest "$IMAGE_DIGEST" --arg postgres_image_digest "$postgres_image_digest" \
+    --arg image_digest "$IMAGE_DIGEST" --arg postgres_image_digest "$POSTGRES_IMAGE_DIGEST" \
     --arg source_sha256 "$source_sha256" --arg key_id "$key_id" \
+    --arg source_manifest_sha256 "$source_manifest_sha256" \
     --arg key_fingerprint "$key_fingerprint" --arg token_id "$persistence_token_id" \
     --arg pair_id "$pair_id" \
-    '{schema_version:1,run_id:$run_id,status:$status,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,source_tree_sha256:$source_sha256,checks:{static_analysis:true,full_test_suite:true,production_compose_render:true,concurrent_migration_serialization:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,restart_persistence:true,admin_rotation:true,separate_backup:true,isolated_restore:true,restored_chat:true,existing_codex_lb_preserved:true},safe_identity:{upstream_key_id:$key_id,upstream_fingerprint:$key_fingerprint,persistence_downstream_token_id:$token_id,backup_pair_id:$pair_id}}' \
+    '{schema_version:3,run_id:$run_id,status:$status,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,source_tree_sha256:$source_sha256,source_manifest_sha256:$source_manifest_sha256,checks:{static_analysis:true,full_test_suite:true,production_compose_render:true,concurrent_migration_serialization:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,restart_persistence:true,admin_rotation:true,separate_backup:true,isolated_restore:true,restored_chat:true,existing_codex_lb_preserved:true,exact_database_failure_503:true,database_failure_grace_exit:true,old_app_replaced_after_exit:true,source_manifest_final_byte_exact:true,app_postgres_pair_preserved:true},safe_identity:{upstream_key_id:$key_id,upstream_fingerprint:$key_fingerprint,persistence_downstream_token_id:$token_id,backup_pair_id:$pair_id}}' \
     > "$EVIDENCE_DIR/manual-qa.json"
 jq -n \
     --arg run_id "$RUN_ID" --arg status PASS \
     --argjson migration_a "$migration_status_a" --argjson migration_b "$migration_status_b" \
     --arg stopped_db_status "$stopped_db_status" \
+    --arg old_app_exit_state "$old_app_exit_state" \
+    --argjson old_app_grace_ms "$old_app_grace_ms" \
+    --argjson old_app_exit_code "$old_app_exit_code" \
     --argjson revoked_status "$revoked_status" \
     --argjson old_admin_status "$old_admin_status" \
     --argjson new_admin_status "$new_admin_status" \
     --argjson corrupt_migration_status "$corrupt_migration_status" \
     --argjson codex_before "$CODEX_BEFORE" --argjson codex_after "$CODEX_AFTER" \
-    '{schema_version:1,run_id:$run_id,status:$status,checks:{concurrent_migration_exit_statuses:[$migration_a,$migration_b],stopped_database_health_status:$stopped_db_status,revoked_downstream_status:$revoked_status,old_admin_after_rotation_status:$old_admin_status,new_admin_after_rotation_status:$new_admin_status,corrupt_migration_exit_status:$corrupt_migration_status,missing_admin_secret_exit:70,missing_vault_secret_exit:70,missing_database_secret_exit:70,wrong_admin_secret_exit:70,wrong_vault_secret_exit:70,wrong_database_secret_exit:70,codex_lb_before:$codex_before,codex_lb_after:$codex_after}}' \
+    '{schema_version:2,run_id:$run_id,status:$status,checks:{concurrent_migration_exit_statuses:[$migration_a,$migration_b],database_failure:{health_status:$stopped_db_status,health_body_exact:true,configured_grace_seconds:2,observed_degraded_to_exit_milliseconds:$old_app_grace_ms,old_app_same_container_exited:true,old_app_exit_state:$old_app_exit_state,old_app_exit_code:$old_app_exit_code,replacement_container_new:true},revoked_downstream_status:$revoked_status,old_admin_after_rotation_status:$old_admin_status,new_admin_after_rotation_status:$new_admin_status,corrupt_migration_exit_status:$corrupt_migration_status,missing_admin_secret_exit:70,missing_vault_secret_exit:70,missing_database_secret_exit:70,wrong_admin_secret_exit:70,wrong_vault_secret_exit:70,wrong_database_secret_exit:70,codex_lb_before:$codex_before,codex_lb_after:$codex_after}}' \
     > "$EVIDENCE_DIR/adversarial.json"

@@ -1,9 +1,10 @@
 # NVIDIA Build LB Architecture Contract
 
-This document freezes the product boundary that later Todos implement. The
-current repository is an importable typed scaffold, not a running gateway.
-When an implementation and this contract disagree, the implementation is the
-defect unless the approved plan is revised first.
+This document freezes the implemented product boundary and its verification
+contract. The repository contains the typed gateway, migrations, production
+Compose surface, and local release gates. When an implementation and this
+contract disagree, the implementation is the defect unless the approved design
+is revised first.
 
 All durations, byte limits, retry counts, and queue sizes below are local
 product policy. They are not NVIDIA quotas, guarantees, or documented provider
@@ -460,9 +461,11 @@ Physical response retirement is hard-bounded. A retirement timeout or pinned
 runtime/transport drift withdraws readiness and cancels the process root. When
 a safe HTTP status, transport/deadline outcome, JSON success, or live-stream
 failure has already been selected, its terminal receipt is committed under a
-shield before that fail-stop cancellation is triggered. A direct stream close
-without a selected terminal triggers fail-stop immediately. Ordinary close
-errors never replace an already selected terminal.
+shield before that fail-stop cancellation is triggered. Any fatal adapter
+exception or unresolved pre-handoff close, including the initial or an
+intermediate `202` response, first commits a durable `CANCELLED` terminal under
+the routing coordinator's shield and only then triggers fail-stop. Ordinary
+close errors never replace an already selected terminal.
 
 ## 7. SSE contract
 
@@ -634,8 +637,10 @@ use narrow single-column reflow.
 ### 9.2 Browser runtime contract
 
 Browser QA uses Python `playwright==1.61.0`, whose managed-browser descriptor
-pins Chromium revision `1228`. `PLAYWRIGHT_BROWSERS_PATH` is exactly
-`/home/dongwonttuna/.cache/ms-playwright`. Ordinary QA may use only the existing
+pins Chromium revision `1228`. The cache root is the absolute
+`PLAYWRIGHT_BROWSERS_PATH` when configured, otherwise the current operating
+user's standard `~/.cache/ms-playwright`; relative overrides are rejected.
+Ordinary QA may use only the existing
 descriptor-selected `chromium-1228` or `chromium_headless_shell-1228`; native
 zoom uses only full `chromium-1228`. Neither phase uses an alternate index,
 channel, executable override, system fallback, separate Chrome manifest, or
@@ -769,15 +774,27 @@ capabilities and supplementary groups cleared. App and database cannot read
 each other's runtime files. Stop/reboot destroys tmpfs copies. Rotation is an
 atomic canonical-file replace plus restart of only the consuming service.
 
+Migration `0004_vault_key_verifier` adds one singleton database binding for the
+vault key. The binding is a fresh 32-byte salt plus HMAC-SHA-256 over the fixed
+`nvidia-build-lb:vault-key-verifier:v1` context; it is not a plaintext key or a
+reversible key derivative. An unbound upgraded database is initialized only
+after every existing upstream ciphertext decrypts successfully under the
+configured key. A bound database rejects every later startup whose key does
+not match, including a different but correctly sized 32-byte value.
+
 ## 11. PostgreSQL migration and backup custody
 
-Todo 1 has one schema-neutral, importable Alembic head: `0001_baseline`. Domain
-tables arrive with the vault Todo; no table is smuggled into the baseline.
+The current Alembic head is `0004_vault_key_verifier`: `0001_baseline` remains
+schema-neutral, `0002_vault_auth` adds encrypted vault/auth tables,
+`0003_nvidia_routing` adds durable routing state, and
+`0004_vault_key_verifier` adds the singleton vault-key binding.
 
-Backups are two separately custodied root-only artifacts:
+Backups are three separately custodied root-only artifacts:
 
 1. PostgreSQL logical dump containing encrypted vault rows and token digests.
 2. The matching vault master-key secret, never embedded in the dump archive.
+3. A strict manifest binding both hashes to the full safe database identity,
+   including the Alembic head and vault verifier salt/digest.
 
 Each has mode 0600, its own checksum and retention record, and a distinct path.
 Restore combines the matching pair only inside an isolated drill stack with a
@@ -850,10 +867,12 @@ journal, never silent mixed state.
 
 ## 13. Stable Make verification contract
 
-`EVIDENCE_DIR` is a non-secret output directory. `IMAGE_DIGEST` is an immutable
-image reference. `MODE` is exactly `one-key` or `two-key`. No target accepts a
-credential through argv, and no target may print a credential-bearing
-environment.
+`EVIDENCE_DIR` is a non-secret output directory. `IMAGE_DIGEST` and
+`POSTGRES_IMAGE_DIGEST` are the immutable local image IDs emitted together by
+one `build-candidate` run. `SOURCE_MANIFEST` is that run's exact manifest file;
+later gates require byte equality before and after execution. `MODE` is exactly
+`one-key` or `two-key`. No target accepts a credential through argv, and no
+target may print a credential-bearing environment.
 
 Every completed target writes `manual-qa.json`, `adversarial.json`, and
 `cleanup.json` under its evidence directory. Artifacts contain only exit codes,
@@ -863,23 +882,24 @@ paths absent. On interruption or failure, cleanup still runs before exit.
 Browser targets apply Section 9.4's stricter fresh task-owned leaf, pre-receipt
 capture rehash, observed nested cleanup, and two-fresh-run determinism rules.
 
-| Target | Exact command owned by Make | Required inputs | PASS and artifact | Cleanup | Todo 1 state |
+| Target | Exact command owned by Make | Required inputs | PASS and artifact | Cleanup | Implementation state |
 | --- | --- | --- | --- | --- | --- |
 | `contract-red` | `uv run python tests/contracts/verify_intentional_red.py --evidence-dir "$(EVIDENCE_DIR)"` | `EVIDENCE_DIR` | Collection exit 0; expected node IDs/classes equal observed; no bootstrap/skip/xfail; `intentional-red.json` | Verifier removes only its temp collection/run files | Lane 3 supplies the verifier; recipe is frozen |
 | `test-vault-auth` | `EVIDENCE_DIR="$(EVIDENCE_DIR)" uv run pytest -m vault_auth -q` | `EVIDENCE_DIR` | Migration/crypto/CRUD/token separation/scope/revoke marker suite exits 0 | Test-owned PostgreSQL/temp secrets absent | Direct marker frozen for Todo 2 |
 | `test-nvidia-routing` | `EVIDENCE_DIR="$(EVIDENCE_DIR)" uv run pytest -m nvidia_routing -q` | `EVIDENCE_DIR` | Fake-wire polling/SSE/RR/cooldown/failover suite exits 0 and ambiguous POST count is one | Fake server, port, task group, temp files absent | Direct marker frozen for Todo 3 |
 | `test-ui-fake` | `EVIDENCE_DIR="$(EVIDENCE_DIR)" uv run pytest -m ui_fake -q` | fresh task-4-owned `EVIDENCE_DIR` | Exact 1280 admin/showcase geometry/order plus serialized ordinary and native-200% fake-owner journeys pass; local axe serious/critical and axe-network counts zero | Nested cleanup observes browser descendants/driver/contexts/pages/profile/temp/fake thread/listener/clipboard/blackout all zero | Direct marker frozen for Todo 4 |
 | `test-api` | `EVIDENCE_DIR="$(EVIDENCE_DIR)" uv run pytest -m api -q` | `EVIDENCE_DIR` | Curl/OpenAI SDK stream, non-stream, scopes, errors, and log redaction exit 0 | API/fake upstream/DB/temp secrets absent | Direct marker frozen for Todo 5 |
-| `build-candidate` | `EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/build-candidate.sh` | `EVIDENCE_DIR` | Healthy non-root app/DB; source hash and local immutable digest recorded | QA containers/network/volume/ports/temp secrets absent | `scripts/qa/build-candidate.sh` intentionally unavailable until Todo 6A; missing script exits 78 |
-| `test-browser-prod` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/test-browser-prod.sh` | exact candidate digest plus fresh task-6b-owned `EVIDENCE_DIR` | Exact 1280 structures, ordinary owner journeys, and complete native-200% low-vision repeat on the same digest pass two visual reviews and cold audits; capture manifest is rehashed | Same Section 9.4 nested zero-resource observations, with two fresh deterministic runs | Script intentionally unavailable until Todo 6B; missing digest exits 64, missing script 78 |
-| `verify-local` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/verify-local.sh` | Both variables | Static/tests/migration/compose/restart/backup/isolated restore pass; codex-lb remains 200 | All QA stack and restore resources absent | Script intentionally unavailable until Todo 7; 64/78 behavior as above |
-| `scan-release` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/scan-release.sh` | Both variables | Dependency/container/filesystem/history/layer/action-pin scans exit 0 | Scanner caches/temp exports absent | Script intentionally unavailable until Todo 7; 64/78 behavior as above |
+| `build-candidate` | `EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/build-candidate.sh` | `EVIDENCE_DIR` | Manifest-bound read-only source snapshot builds and verifies one healthy immutable app/PG pair; both receipts and source manifest are recorded | QA containers/network/volume/ports/temp secrets absent; candidate images retained for later gates | Implemented; exclusive evidence directory required |
+| `test-browser-prod` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/test-browser-prod.sh` | exact app/PG pair, byte-identical 6A manifest, fresh task-6b-owned `EVIDENCE_DIR` | Exact 1280 structures, ordinary owner journeys, and native-200% low-vision repeat on the same pair pass deterministic runs, cold audits, and two artifact-bound visual reviews | Same Section 9.4 nested zero-resource observations; both candidate image IDs remain unchanged | Implemented; missing required input exits 64 |
+| `verify-local` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/verify-local.sh` | exact app/PG pair, manifest, evidence directory | Static/tests/migration/compose/restart/backup/isolated restore and exact DB-down 503 pass; codex-lb remains 200 | All QA stack and restore resources absent; both candidate IDs remain | Implemented; missing required input exits 64 |
+| `scan-release` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/scan-release.sh` | exact app/PG pair, manifest, evidence directory | Dependency/source/history/action-pin plus both-image vulnerability/secret scans exit 0 without ignoring unfixed findings | Scanner containers/temp exports absent; manifest bytes and both image IDs unchanged | Implemented; missing required input exits 64 |
 | `smoke-live` | `MODE="$(MODE)" IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-live.sh` | All three variables | Requested live matrix true; one-key never claims distribution | Plaintext temp/FD/process copies and task-owned runtime resources absent | Script intentionally unavailable until Todo 10A/10B; invalid input 64, missing script 78 |
 | `smoke-hermes` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-hermes.sh` | Both variables | Cutover, agent task, restart, failure path, rollback, final reapply pass | Lock released; intake restored; no temp plaintext; journal terminal or explicit fail-closed | Script intentionally unavailable until Todo 11B; 64/78 behavior as above |
 
 Recipe status 64 means a required non-secret Make input is invalid. Recipe
-status 78 means the named later-Todo script is intentionally not implemented
-yet. GNU Make reports either failed recipe as process exit 2 while preserving
+status 78 remains reserved for `smoke-live` and `smoke-hermes`, whose later live
+operator scripts are intentionally not implemented yet. GNU Make reports either
+failed recipe as process exit 2 while preserving
 the exact `Error 64` or `Error 78` classification and the stable diagnostic.
 These explicit failures are never PASS evidence. `make help` must always parse
 and exit zero.
@@ -893,16 +913,26 @@ sets a bounded statement timeout before blocking lock acquisition, clears that
 timeout after acquisition, runs the repository head on the same connection, and
 releases in `finally`. Connection loss also releases the session lock.
 
+A fatal service-epoch monitor observation withdraws lifecycle readiness
+synchronously. `/health` then short-circuits without database I/O and returns
+the exact degraded 503 body for a bounded two-second observability window before
+the process root is cancelled. This grace applies only to the database monitor;
+unresolved durable attempt commits and runtime/transport drift retain their
+immediate fail-stop path.
+
 Backups are quiesced while the app container is stopped. A backup is valid only
 as the tuple of a PostgreSQL custom dump, the exact vault master key in a
 separate root, and a strict manifest in a third root. The manifest binds hashes,
 sizes, Alembic revision, ordered upstream IDs/fingerprints, and aggregate hashes
-of ordered upstream identities and downstream IDs/digests. It contains no
+of ordered upstream identities and downstream IDs/digests, plus the database
+vault-verifier salt/digest. Before copying the key, backup verifies it against
+that database binding inside a network-disabled helper. The manifest contains no
 plaintext credential, ciphertext, nonce, raw downstream digest, DB password, or
 provider payload.
 
-Restore is forbidden against a database unless it is running, empty, and
-explicitly labeled `nvidia-build-lb.restore-isolated=true`. Both artifacts are
+Restore is forbidden against a database unless it is running, empty of all user
+schemas, relations, functions, and types, and explicitly labeled
+`nvidia-build-lb.restore-isolated=true`. Both artifacts are
 rehash-verified before mutation. The master key is installed atomically in the
 isolated target secret directory; `pg_restore --exit-on-error` loads the dump;
 then the exact safe database state must equal the manifest. Any mismatch is a
@@ -913,5 +943,7 @@ The production Compose surface requires immutable application and PostgreSQL
 image references, binds host loopback by default, disables Watchtower, retains
 read-only root filesystems and tmpfs handoff, and separates the internal data
 network from app egress. CI uses full commit-pinned Actions and explicit minimum
-permissions. GHCR publication emits only commit-addressed application and
+permissions. Publication builds the app/PG pair once from the same
+manifest-bound snapshot, scans those exact local image IDs, and only then tags
+and pushes the same IDs. GHCR emits only commit-addressed application and
 PostgreSQL tags; no mutable `latest` tag is produced.

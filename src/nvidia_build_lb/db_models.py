@@ -116,6 +116,35 @@ class SchedulerStateRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class VaultKeyVerifierRow(Base):
+    """Singleton HMAC verifier binding one master key to this database."""
+
+    __tablename__: str = "vault_key_verifier"
+    __table_args__: tuple[CheckConstraint, ...] = (
+        CheckConstraint("singleton_id = 1", name="ck_vault_verifier_singleton"),
+        CheckConstraint(
+            """
+            (
+                verifier_salt IS NULL
+                AND verifier_digest IS NULL
+                AND initialized_at IS NULL
+            )
+            OR (
+                octet_length(verifier_salt) = 32
+                AND octet_length(verifier_digest) = 32
+                AND initialized_at IS NOT NULL
+            )
+            """,
+            name="ck_vault_verifier_state",
+        ),
+    )
+
+    singleton_id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
+    verifier_salt: Mapped[bytes | None] = mapped_column(LargeBinary)
+    verifier_digest: Mapped[bytes | None] = mapped_column(LargeBinary)
+    initialized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class AdminEventRow(Base):
     """Secret-free append-only administration and attempt event."""
 

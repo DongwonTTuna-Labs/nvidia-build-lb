@@ -5,7 +5,11 @@ import subprocess
 from pathlib import Path
 from typing import ClassVar, Literal
 
+import pytest
 from pydantic import BaseModel, ConfigDict, Field
+
+from . import browser_prod_gate
+from .browser_observability import PageAudit
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,6 +46,8 @@ def test_browser_prod_gate_has_closed_entrypoint_and_dependency_surface() -> Non
     script = script_path.read_text(encoding="utf-8")
 
     assert "IMAGE_DIGEST" in script
+    assert "POSTGRES_IMAGE_DIGEST" in script
+    assert "SOURCE_MANIFEST" in script
     assert "EVIDENCE_DIR" in script
     assert "NBLB_QA_TASK_LABEL=todo6b-browser-prod" in script
     assert "trap cleanup EXIT" in script
@@ -56,9 +62,6 @@ def test_browser_prod_gate_has_closed_entrypoint_and_dependency_surface() -> Non
     assert 'if ! mkdir "$EVIDENCE_DIR" 2>/dev/null; then' in script
     assert 'mkdir -p "$EVIDENCE_DIR/runs"' not in script
     assert 'mkdir "$EVIDENCE_DIR/runs"' in script
-    assert "postgres_image_count()" in script
-    assert 'docker image ls --quiet --no-trunc "$POSTGRES_TAG"' in script
-    assert 'docker image inspect "$POSTGRES_TAG"' not in script
     assert "postgres_images=-1; cleanup_error=1" in script
     assert "temporary_postgres_image_count()" in script
     assert "remaining:{containers:0" not in script
@@ -79,6 +82,21 @@ def test_browser_prod_gate_has_closed_entrypoint_and_dependency_surface() -> Non
     assert lock.packages[""].dev_dependencies == {"lighthouse": "13.4.0"}
 
 
+def test_browser_prod_gate_reports_secret_safe_exception_phases() -> None:
+    audit = PageAudit()
+    audit.runtime_exceptions.extend(("upstream_enable_401", "upstream_probe_503"))
+    audit.page_errors.append("native-upstream_enable_401")
+
+    with pytest.raises(AssertionError) as raised:
+        browser_prod_gate.assert_expected_errors(audit)
+
+    assert str(raised.value) == (
+        "production browser observed a runtime or page exception: "
+        "runtime_phases=('upstream_enable_401', 'upstream_probe_503'); "
+        "page_phases=('native-upstream_enable_401',)"
+    )
+
+
 def test_browser_prod_gate_is_snapshot_bound_and_preserves_observed_cleanup() -> None:
     script = _text("scripts/qa/test-browser-prod.sh")
 
@@ -91,10 +109,13 @@ def test_browser_prod_gate_is_snapshot_bound_and_preserves_observed_cleanup() ->
     assert "NBLB_LIGHTHOUSE_PATH" in script
     assert 'cmp "$EVIDENCE_DIR/source-manifest.json" "$after"' in script
     assert '"$QA_SOURCE_DIR/compose.qa.yml"' in script
-    assert '"$QA_SOURCE_DIR/docker/postgres.Dockerfile"' in script
+    assert "docker buildx build" not in script
+    assert "NBLB_POSTGRES_IMAGE=$POSTGRES_IMAGE_DIGEST" in script
+    assert 'cmp "$SOURCE_MANIFEST" "$CLIENT_DIR/source-manifest-current.json"' in script
     assert "process-baseline.json" in script
     assert "process_baseline_sha256" in script
     assert "fresh_cleanup_sha256" in _text("tests/ui/browser_prod_verify.py")
+    assert "run_artifact_sha256" in _text("tests/ui/browser_prod_verify.py")
     assert "cleanup-fresh.json" in script
     assert "validate_fresh_cleanup" in script
     assert "atomic_open" in script

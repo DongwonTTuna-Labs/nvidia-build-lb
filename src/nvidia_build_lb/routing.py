@@ -9,7 +9,13 @@ import anyio
 from anyio.lowlevel import checkpoint_if_cancelled
 
 from nvidia_build_lb.attempt_types import AttemptLease, AttemptStartCommand
-from nvidia_build_lb.polling import FailureTerminal, JsonTerminal, StreamTerminal
+from nvidia_build_lb.pinned_runtime import PinnedRuntimeDriftError
+from nvidia_build_lb.polling import (
+    FailureTerminal,
+    JsonTerminal,
+    ResponseRetirementUnresolvedError,
+    StreamTerminal,
+)
 from nvidia_build_lb.representations import RepresentationProtocolError, json_to_sse_frames
 from nvidia_build_lb.routing_failures import (
     aggregate_failures,
@@ -33,6 +39,7 @@ from nvidia_build_lb.routing_reservations import no_eligible_failure, reservatio
 from nvidia_build_lb.scheduler_state import NoEligibleUpstreamKeyError
 from nvidia_build_lb.scheduler_types import SchedulerStateUnavailableError
 from nvidia_build_lb.terminal_retirement_fail_stop import fail_stop_after_terminal
+from nvidia_build_lb.transport_common import PinnedTransportDriftError
 from nvidia_build_lb.vault import VaultDecryptionError
 
 _MAX_PUBLIC_ATTEMPTS: Final = 2
@@ -81,14 +88,7 @@ class RoutingCoordinator:
             attempt_count += 1
             started_monotonic = self.dependencies.monotonic_clock.monotonic()
             await self._checkpoint_before_network(lease, started_monotonic)
-            try:
-                terminal = await self.dependencies.adapter.execute(
-                    credential=lease.credential,
-                    body=body,
-                )
-            except anyio.get_cancelled_exc_class():
-                await self._finalize_cancelled(lease, started_monotonic)
-                raise
+            terminal = await self._execute_attempt(lease, body, started_monotonic)
             handled = await self._handle_terminal(
                 terminal,
                 lease,
@@ -164,6 +164,32 @@ class RoutingCoordinator:
         if isinstance(terminal, StreamTerminal):
             return RoutedStream(terminal, lease, attempt_count, started_monotonic)
         return await self._finalize_failure(lease, terminal, started_monotonic)
+
+    async def _execute_attempt(
+        self,
+        lease: AttemptLease,
+        body: bytes,
+        started_monotonic: float,
+    ) -> JsonTerminal | StreamTerminal | FailureTerminal:
+        """Execute one reserved attempt and close fatal pre-handoff states."""
+        try:
+            return await self.dependencies.adapter.execute(
+                credential=lease.credential,
+                body=body,
+            )
+        except anyio.get_cancelled_exc_class():
+            await self._finalize_cancelled(lease, started_monotonic)
+            raise
+        except (
+            PinnedRuntimeDriftError,
+            PinnedTransportDriftError,
+            ResponseRetirementUnresolvedError,
+        ):
+            await self._retire_fatal_attempt(lease, started_monotonic)
+            raise
+        except BaseException:
+            await self._retire_fatal_attempt(lease, started_monotonic)
+            raise
 
     async def _handle_json(
         self,
@@ -244,3 +270,13 @@ class RoutingCoordinator:
             self.dependencies.monotonic_clock,
             started_monotonic,
         )
+
+    async def _retire_fatal_attempt(
+        self,
+        lease: AttemptLease,
+        started_monotonic: float,
+    ) -> None:
+        """Close a fatal pre-handoff attempt before forcing the process to stop."""
+        with suppress(BaseException):
+            await self._finalize_cancelled(lease, started_monotonic)
+        self.dependencies.fail_stop.trigger()

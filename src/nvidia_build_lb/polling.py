@@ -2,6 +2,7 @@
 
 from contextlib import suppress
 
+import anyio
 from pydantic import SecretStr
 
 from nvidia_build_lb.headers import (
@@ -19,6 +20,7 @@ from nvidia_build_lb.outcomes import (
     TransportSignal,
     map_public_outcome,
 )
+from nvidia_build_lb.pinned_runtime import PinnedRuntimeDriftError
 from nvidia_build_lb.poll_response_retirement import (
     close_response_with_deadline,
     retire_response_preserving_primary,
@@ -46,6 +48,7 @@ from nvidia_build_lb.response_retirement import (
     ResponseRetirementUnresolvedError,
     retire_response,
 )
+from nvidia_build_lb.transport_common import PinnedTransportDriftError
 
 __all__ = [
     "FailureTerminal",
@@ -144,9 +147,8 @@ async def poll_nvcf_result(
             retry_after_seconds=None,
             retirement_unresolved=retirement_unresolved,
         )
-    except BaseException:
-        if await _retire_latest_preserving_primary(active_responses):
-            dependencies.fail_stop.trigger()
+    except BaseException as error:
+        await _retire_after_primary(active_responses, error)
         raise
 
 
@@ -183,6 +185,32 @@ async def _retire_latest_preserving_primary(active_responses: list[NvidiaRespons
     if active_responses:
         return await retire_response_preserving_primary(active_responses.pop())
     return False
+
+
+async def _retire_after_primary(
+    active_responses: list[NvidiaResponse],
+    primary: BaseException,
+) -> None:
+    """Retire polling state without stealing routing's drift fail-stop ordering."""
+    if isinstance(primary, ResponseRetirementUnresolvedError):
+        # This response already consumed its one bounded close attempt. Routing
+        # owns terminal persistence and fail-stop; never reopen cleanup here.
+        active_responses.clear()
+        return
+    if isinstance(primary, (PinnedRuntimeDriftError, PinnedTransportDriftError)):
+        # The routing coordinator must persist CANCELLED before it withdraws
+        # readiness and cancels the process root. A second failure while closing
+        # the active poll response is cleanup evidence, not an earlier owner of
+        # fail-stop ordering.
+        with suppress(BaseException):
+            _ = await _retire_latest_preserving_primary(active_responses)
+        return
+    # Routing owns every pre-handoff fatal transition. Cancellation needs an
+    # explicit fatal signal only when physical response retirement is unknown;
+    # ordinary exceptions already enter routing's generic fatal path.
+    unresolved = await _retire_latest_preserving_primary(active_responses)
+    if unresolved and isinstance(primary, anyio.get_cancelled_exc_class()):
+        raise ResponseRetirementUnresolvedError from None
 
 
 def _equal_jitter_delay(jitter: JitterSource, exponent: int) -> float:

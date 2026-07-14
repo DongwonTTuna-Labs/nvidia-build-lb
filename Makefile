@@ -2,6 +2,8 @@ SHELL := /bin/sh
 .DEFAULT_GOAL := help
 
 IMAGE_DIGEST ?=
+POSTGRES_IMAGE_DIGEST ?=
+SOURCE_MANIFEST ?=
 MODE ?=
 
 contract-red: EVIDENCE_DIR ?= .omo/evidence/task-1-nvidia-build-lb
@@ -28,11 +30,14 @@ help:
 		'  test-ui-fake       Todo 4 pytest marker: ui_fake' \
 		'  test-api           Todo 5 pytest marker: api' \
 		'  build-candidate    Todo 6A candidate image and compose gate' \
-		'  test-browser-prod  Todo 6B candidate browser gate; requires IMAGE_DIGEST' \
-		'  verify-local       Todo 7 full local operations gate; requires IMAGE_DIGEST' \
-		'  scan-release       Todo 7 dependency, secret, history, action, and image scans' \
+		'  test-browser-prod  Todo 6B browser gate; requires app/PG digests and source manifest' \
+		'  verify-local       Todo 7 local gate; requires app/PG digests and source manifest' \
+		'  scan-release       Todo 7 scans; requires app/PG digests and source manifest' \
 		'  smoke-live         Todo 10A/10B script; requires MODE and IMAGE_DIGEST (reserved)' \
 		'  smoke-hermes       Todo 11B script; requires IMAGE_DIGEST (reserved)' \
+		'' \
+		'Build candidate.json records IMAGE_DIGEST and POSTGRES_IMAGE_DIGEST.' \
+		'Reuse those values and the same source-manifest.json for 6B and 7.' \
 		'' \
 		'All targets accept EVIDENCE_DIR and use their own task-scoped default.'
 
@@ -57,18 +62,24 @@ build-candidate:
 
 test-browser-prod:
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(POSTGRES_IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: POSTGRES_IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(SOURCE_MANIFEST)" || { printf '%s\n' 'INPUT[64]: SOURCE_MANIFEST is required'; exit 64; }
 	@test -x scripts/qa/test-browser-prod.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 6B owns scripts/qa/test-browser-prod.sh'; exit 78; }
-	IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/test-browser-prod.sh
+	IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/test-browser-prod.sh
 
 verify-local:
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(POSTGRES_IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: POSTGRES_IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(SOURCE_MANIFEST)" || { printf '%s\n' 'INPUT[64]: SOURCE_MANIFEST is required'; exit 64; }
 	@test -x scripts/qa/verify-local.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 7 owns scripts/qa/verify-local.sh'; exit 78; }
-	IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/verify-local.sh
+	IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/verify-local.sh
 
 scan-release:
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(POSTGRES_IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: POSTGRES_IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(SOURCE_MANIFEST)" || { printf '%s\n' 'INPUT[64]: SOURCE_MANIFEST is required'; exit 64; }
 	@test -x scripts/qa/scan-release.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 7 owns scripts/qa/scan-release.sh'; exit 78; }
-	IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/scan-release.sh
+	IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/scan-release.sh
 
 smoke-live:
 	@case "$(MODE)" in one-key|two-key) ;; *) printf '%s\n' 'INPUT[64]: MODE must be one-key or two-key'; exit 64 ;; esac

@@ -2,22 +2,33 @@
 
 import threading
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from nvidia_build_lb.admin.schemas import AdminEventListResponse, AdminOverviewRead, OverviewStatus
-from nvidia_build_lb.attempt_fail_stop import AttemptFailStop
+from nvidia_build_lb.attempt_fail_stop import AttemptFailStop, ReadinessGate
 from nvidia_build_lb.credential_protocols import (
     CredentialRepositorySurface,
     DownstreamCredentialRepository,
     UpstreamCredentialRepository,
 )
 from nvidia_build_lb.service_epoch_monitor import (
+    AnyioSleeper,
     MonitorCancelled,
     MonitorEvent,
     MonitorFatal,
     MonitorFatalClass,
     MonitorFatalLatch,
     MonitorHealthy,
+    Sleeper,
 )
+
+MONITOR_FATAL_GRACE_SECONDS = 2.0
+
+
+class _ReadinessProbe(Protocol):
+    async def is_ready(self) -> bool:
+        """Return current application readiness."""
+        ...
 
 
 @dataclass(slots=True)
@@ -36,6 +47,20 @@ class RuntimeReadinessGate:
         """Return the current lifecycle readiness bit."""
         with self._lock:
             return self._ready
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleReadinessProbe:
+    """Short-circuit health after lifecycle withdrawal without database I/O."""
+
+    lifecycle: RuntimeReadinessGate
+    inner: _ReadinessProbe
+
+    async def is_ready(self) -> bool:
+        """Return false immediately after fail-stop readiness withdrawal."""
+        if not self.lifecycle.is_ready():
+            return False
+        return await self.inner.is_ready()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,7 +96,9 @@ class GatedCredentialRepositories:
 class LifecycleMonitorSubmitter:
     """Turn the first fatal or unclean monitor cancellation into fail-stop."""
 
+    readiness: ReadinessGate
     fail_stop: AttemptFailStop
+    sleeper: Sleeper = field(default_factory=AnyioSleeper)
     fatal_latch: MonitorFatalLatch = field(default_factory=MonitorFatalLatch)
 
     async def submit(self, event: MonitorEvent) -> None:
@@ -84,4 +111,8 @@ class LifecycleMonitorSubmitter:
         elif isinstance(event, MonitorHealthy):
             return
         if fatal is not None and self.fatal_latch.register(fatal):
-            self.fail_stop.trigger()
+            try:
+                self.readiness.set_ready(False)
+                await self.sleeper.sleep(MONITOR_FATAL_GRACE_SECONDS)
+            finally:
+                self.fail_stop.trigger()

@@ -10,6 +10,7 @@ from nvidia_build_lb.attempt_fail_stop import AttemptFailStop
 from nvidia_build_lb.credential_types import Clock
 from nvidia_build_lb.headers import ValidatedUpstreamHeaders
 from nvidia_build_lb.nvidia_types import NvidiaClient, NvidiaResponse
+from nvidia_build_lb.pinned_runtime import PinnedRuntimeDriftError
 from nvidia_build_lb.poll_terminal_types import FailureTerminal, JsonTerminal
 from nvidia_build_lb.representations import MAX_SSE_FRAME_BYTES
 from nvidia_build_lb.response_retirement import (
@@ -17,6 +18,7 @@ from nvidia_build_lb.response_retirement import (
     retire_response,
 )
 from nvidia_build_lb.sse import SSEFrame, SSEFrameParser, SSEProtocolError
+from nvidia_build_lb.transport_common import PinnedTransportDriftError
 
 _POLL_DEADLINE_ERROR = "upstream_poll_deadline"
 
@@ -190,6 +192,8 @@ class NvidiaSSEStream:
                     yield frames[0]
         except BaseException as error:
             primary_error = error
+            if isinstance(error, (PinnedRuntimeDriftError, PinnedTransportDriftError)):
+                self._pending_fail_stop = True
             raise
         finally:
             try:

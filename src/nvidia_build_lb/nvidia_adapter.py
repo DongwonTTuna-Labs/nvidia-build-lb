@@ -3,6 +3,7 @@
 from contextlib import suppress
 from dataclasses import dataclass
 
+import anyio
 from pydantic import SecretStr
 
 from nvidia_build_lb.attempt_fail_stop import AttemptFailStop
@@ -25,6 +26,7 @@ from nvidia_build_lb.outcomes import (
     TransportSignal,
     map_public_outcome,
 )
+from nvidia_build_lb.pinned_runtime import PinnedRuntimeDriftError
 from nvidia_build_lb.polling import (
     FailureTerminal,
     JitterSource,
@@ -42,6 +44,7 @@ from nvidia_build_lb.polling import (
     retire_response_preserving_primary,
 )
 from nvidia_build_lb.request_wire import build_nvidia_request
+from nvidia_build_lb.transport_common import PinnedTransportDriftError
 
 _ORIGIN_TIMEOUT_SECONDS = 120.0
 _POLL_DEADLINE_SECONDS = 60.0
@@ -83,14 +86,23 @@ class NvidiaHostedAdapter:
             )
         try:
             return await _execute_owned(self.dependencies, response, credential)
-        except ResponseRetirementUnresolvedError:
-            self.dependencies.fail_stop.trigger()
+        except (PinnedRuntimeDriftError, PinnedTransportDriftError):
+            # Routing owns the durable CANCELLED terminal and process fail-stop for
+            # drift. Cleanup may itself observe the same drift, but it must never
+            # trigger fail-stop before that terminal is committed.
+            with suppress(BaseException):
+                await retire_response(response)
             raise
-        except BaseException:
+        except ResponseRetirementUnresolvedError:
+            # The routing coordinator owns the reserved attempt. It must commit
+            # CANCELLED before withdrawing readiness and cancelling the root.
+            raise
+        except BaseException as primary:
             try:
                 await retire_response(response)
             except ResponseRetirementUnresolvedError:
-                self.dependencies.fail_stop.trigger()
+                if isinstance(primary, anyio.get_cancelled_exc_class()):
+                    raise
             except BaseException as error:  # noqa: BLE001 - preserve the request primary.
                 del error
             raise

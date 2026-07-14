@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from os import environ
 from pathlib import Path
 from socket import AF_INET, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, socket
 from tempfile import gettempdir
@@ -14,7 +15,18 @@ from .fake_admin_state import FakeAdminState
 
 UI_AUTHORITY = "127.0.0.1:2456"
 UI_ORIGIN = f"http://{UI_AUTHORITY}"
-MANAGED_BROWSERS = Path("/home/dongwonttuna/.cache/ms-playwright")
+
+
+def resolve_managed_browsers(configured: str | None, home: Path) -> Path:
+    """Resolve the one Playwright cache root without accepting a relative path."""
+    root = Path(configured) if configured is not None else home / ".cache" / "ms-playwright"
+    if not root.is_absolute():
+        reason = "PLAYWRIGHT_BROWSERS_PATH must be absolute"
+        raise ValueError(reason)
+    return root.resolve(strict=False)
+
+
+MANAGED_BROWSERS = resolve_managed_browsers(environ.get("PLAYWRIGHT_BROWSERS_PATH"), Path.home())
 _PROCESS_ROOT = Path("/proc")
 _TEMP_ROOT = Path(gettempdir())
 _TEMP_PREFIXES = (
@@ -78,8 +90,8 @@ class BrowserResourceSnapshot:
 
 def _approved_browser_roots() -> tuple[Path, Path]:
     return (
-        MANAGED_BROWSERS / "chromium-1228",
-        MANAGED_BROWSERS / "chromium_headless_shell-1228",
+        (MANAGED_BROWSERS / "chromium-1228").resolve(strict=False),
+        (MANAGED_BROWSERS / "chromium_headless_shell-1228").resolve(strict=False),
     )
 
 
@@ -201,7 +213,13 @@ def start_managed_browser() -> ManagedBrowserSession:
     font_environment = create_browser_font_environment()
     playwright = sync_playwright().start()
     browser = playwright.chromium.launch(headless=True, env=font_environment.variables)
-    executable = Path(playwright.chromium.executable_path)
+    try:
+        executable = Path(playwright.chromium.executable_path).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        browser.close()
+        playwright.stop()
+        reason = "Playwright selected an unavailable browser executable"
+        raise BrowserRuntimeError(reason) from error
     approved_roots = (chromium_dir, headless_dir)
     if not any(executable.is_relative_to(root) for root in approved_roots):
         browser.close()

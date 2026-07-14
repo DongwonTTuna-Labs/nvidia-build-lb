@@ -8,7 +8,9 @@ from typing import ClassVar, Literal, final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-_CHROME = Path("/home/dongwonttuna/.cache/ms-playwright/chromium-1228/chrome-linux64/chrome")
+from .browser_runtime import MANAGED_BROWSERS
+
+CHROME = MANAGED_BROWSERS / "chromium-1228" / "chrome-linux64" / "chrome"
 _LIGHTHOUSE = Path(environ.get("NBLB_LIGHTHOUSE_PATH", "node_modules/.bin/lighthouse"))
 _CATEGORIES = ("performance", "accessibility", "best-practices", "seo")
 _ROUTES: tuple[Literal["admin"], Literal["showcase"]] = ("admin", "showcase")
@@ -92,7 +94,7 @@ def _run_once(
         "--quiet",
         "--output=json",
         f"--output-path={output}",
-        f"--chrome-path={_CHROME}",
+        f"--chrome-path={CHROME}",
         "--chrome-flags=--headless=new --no-sandbox",
         "--only-categories=performance,accessibility,best-practices,seo",
         "--max-wait-for-load=45000",
@@ -120,7 +122,7 @@ def _run_once(
 
 def main() -> int:
     args = _arguments()
-    if not _CHROME.is_file() or not _LIGHTHOUSE.is_file():
+    if not CHROME.is_file() or not _LIGHTHOUSE.is_file():
         reason = "pinned Lighthouse or Chromium runtime is unavailable"
         raise AssertionError(reason)
     audits: list[LighthouseAudit] = []
@@ -158,7 +160,7 @@ def main() -> int:
     receipt = LighthouseReceipt(
         image_digest=args.image_digest,
         chromium_revision=1228,
-        chrome_path=str(_CHROME),
+        chrome_path=str(CHROME),
         chrome_flags=("--headless=new", "--no-sandbox"),
         browser_scope="loopback public UI only",
         lighthouse_version="13.4.0",

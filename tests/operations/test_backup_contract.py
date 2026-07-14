@@ -4,6 +4,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from pydantic import SecretBytes
 
 from nvidia_build_lb.backup_contract import (
     BackupContractError,
@@ -12,16 +13,21 @@ from nvidia_build_lb.backup_contract import (
     state_mismatch_fields,
     verify_manifest,
 )
+from nvidia_build_lb.vault import Vault
 
 _UPSTREAM_ID = UUID("00000000-0000-4000-8000-000000000001")
 _UPSTREAM_FINGERPRINT = f"sha256:{'1' * 64}"
+_VAULT_KEY = b"k" * 32
+_VERIFIER = Vault(SecretBytes(_VAULT_KEY)).build_key_verifier()
 
 
 def _state() -> DatabaseState:
     return DatabaseState.model_validate(
         {
-            "schema_version": 1,
-            "alembic_revision": "0003_nvidia_routing",
+            "schema_version": 2,
+            "alembic_revision": "0004_vault_key_verifier",
+            "vault_verifier_salt": _VERIFIER.salt.hex(),
+            "vault_verifier_digest": _VERIFIER.digest.hex(),
             "upstream_count": 1,
             "upstream_identity_sha256": "2" * 64,
             "upstream_keys": [{"id": str(_UPSTREAM_ID), "fingerprint": _UPSTREAM_FINGERPRINT}],
@@ -42,8 +48,10 @@ def _state_payload(
     }
     identities = [identity, identity.copy()] if duplicate else [identity]
     return {
-        "schema_version": 1,
-        "alembic_revision": "0003_nvidia_routing",
+        "schema_version": 2,
+        "alembic_revision": "0004_vault_key_verifier",
+        "vault_verifier_salt": _VERIFIER.salt.hex(),
+        "vault_verifier_digest": _VERIFIER.digest.hex(),
         "upstream_count": upstream_count,
         "upstream_identity_sha256": "2" * 64,
         "upstream_keys": identities,
@@ -56,7 +64,7 @@ def test_manifest_binds_separate_dump_key_and_safe_database_identity(tmp_path: P
     database_dump = tmp_path / "database.dump"
     vault_key = tmp_path / "vault_master_key"
     _ = database_dump.write_bytes(b"PGDMP\x00fixture")
-    _ = vault_key.write_bytes(b"k" * 32)
+    _ = vault_key.write_bytes(_VAULT_KEY)
 
     manifest = build_manifest(
         backup_id="backup-20260714t000000z",
@@ -79,7 +87,7 @@ def test_manifest_verification_fails_if_either_half_changes(tmp_path: Path) -> N
     database_dump = tmp_path / "database.dump"
     vault_key = tmp_path / "vault_master_key"
     _ = database_dump.write_bytes(b"PGDMP\x00fixture")
-    _ = vault_key.write_bytes(b"k" * 32)
+    _ = vault_key.write_bytes(_VAULT_KEY)
     manifest = build_manifest(
         backup_id="backup-20260714t000000z",
         created_at="2026-07-14T00:00:00Z",
@@ -94,8 +102,26 @@ def test_manifest_verification_fails_if_either_half_changes(tmp_path: Path) -> N
 
     _ = database_dump.write_bytes(b"PGDMP\x00fixture")
     _ = vault_key.write_bytes(b"z" * 32)
-    with pytest.raises(BackupContractError, match="artifact_mismatch"):
+    with pytest.raises(BackupContractError, match="vault_key_database_mismatch"):
         verify_manifest(manifest, database_dump=database_dump, vault_key=vault_key)
+
+
+def test_manifest_creation_rejects_a_swapped_key_for_captured_database_state(
+    tmp_path: Path,
+) -> None:
+    database_dump = tmp_path / "database.dump"
+    swapped_key = tmp_path / "vault_master_key"
+    _ = database_dump.write_bytes(b"PGDMP\x00fixture")
+    _ = swapped_key.write_bytes(b"s" * 32)
+
+    with pytest.raises(BackupContractError, match="vault_key_database_mismatch"):
+        _ = build_manifest(
+            backup_id="backup-20260714t000000z",
+            created_at="2026-07-14T00:00:00Z",
+            database_dump=database_dump,
+            vault_key=swapped_key,
+            state=_state(),
+        )
 
 
 def test_database_state_rejects_count_or_identity_drift() -> None:

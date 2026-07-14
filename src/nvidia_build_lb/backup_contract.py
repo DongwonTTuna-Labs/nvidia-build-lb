@@ -12,7 +12,17 @@ import sys
 from pathlib import Path
 from typing import Annotated, ClassVar, Literal, Self
 
-from pydantic import UUID4, BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    UUID4,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretBytes,
+    StringConstraints,
+    model_validator,
+)
+
+from nvidia_build_lb.vault import Vault, VaultKeyVerifier
 
 _SHA256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _FINGERPRINT = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
@@ -49,8 +59,10 @@ class UpstreamIdentity(_StrictModel):
 class DatabaseState(_StrictModel):
     """Secret-safe exact database identity compared after isolated restore."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     alembic_revision: Annotated[str, StringConstraints(pattern=r"^[0-9a-z_]{1,64}$")]
+    vault_verifier_salt: _SHA256
+    vault_verifier_digest: _SHA256
     upstream_count: int = Field(ge=0)
     upstream_identity_sha256: _SHA256
     upstream_keys: tuple[UpstreamIdentity, ...]
@@ -84,7 +96,7 @@ class ArtifactDigest(_StrictModel):
 class BackupManifest(_StrictModel):
     """Exact two-part backup tuple and safe restored-state oracle."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     backup_id: _BACKUP_ID
     created_at: _UTC_TIMESTAMP
     pair_id: _SHA256
@@ -156,7 +168,9 @@ def build_manifest(
 ) -> BackupManifest:
     """Build a manifest without embedding either artifact payload."""
     database_size, database_sha256 = _digest(database_dump)
-    key_size, key_sha256 = _digest(vault_key)
+    key_material = vault_key.read_bytes()
+    key_size = len(key_material)
+    key_sha256 = hashlib.sha256(key_material).hexdigest()
     if database_size <= len(_PG_DUMP_MAGIC):
         reason = "database_dump_invalid"
         raise BackupContractError(reason)
@@ -167,6 +181,7 @@ def build_manifest(
     if key_size != _VAULT_KEY_BYTES:
         reason = "vault_key_invalid"
         raise BackupContractError(reason)
+    _verify_vault_key_material_against_state(key_material, state)
     database = ArtifactDigest(
         filename="database.dump",
         size_bytes=database_size,
@@ -216,6 +231,8 @@ def state_mismatch_fields(expected: DatabaseState, observed: DatabaseState) -> t
     """Return only safe field names whose restored values differ."""
     fields = (
         "alembic_revision",
+        "vault_verifier_salt",
+        "vault_verifier_digest",
         "upstream_count",
         "upstream_identity_sha256",
         "upstream_keys",
@@ -304,7 +321,7 @@ def _write_manifest(path: Path, manifest: BackupManifest) -> None:
 
 def _safe_receipt(manifest: BackupManifest, *, restored: bool) -> str:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS",
         "pair_id": manifest.pair_id,
         "backup_id": manifest.backup_id,
@@ -315,8 +332,38 @@ def _safe_receipt(manifest: BackupManifest, *, restored: bool) -> str:
         "downstream_count": manifest.state.downstream_count,
         "downstream_digest_sha256": manifest.state.downstream_digest_sha256,
         "vault_key_sha256": manifest.vault_master_key.sha256,
+        "vault_key_matches_database": True,
     }
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+def _verify_vault_key_material_against_state(
+    key_material: bytes,
+    state: DatabaseState,
+) -> None:
+    """Prove one in-memory key snapshot matches the captured DB verifier."""
+    if len(key_material) != _VAULT_KEY_BYTES:
+        reason = "vault_key_invalid"
+        raise BackupContractError(reason)
+    try:
+        verifier = VaultKeyVerifier(
+            salt=bytes.fromhex(state.vault_verifier_salt),
+            digest=bytes.fromhex(state.vault_verifier_digest),
+        )
+        vault = Vault(SecretBytes(key_material))
+    except ValueError:
+        reason = "vault_key_database_mismatch"
+        raise BackupContractError(reason) from None
+    if not vault.matches_key_verifier(verifier):
+        reason = "vault_key_database_mismatch"
+        raise BackupContractError(reason)
+
+
+def _verify_vault_key_against_state(vault_key: Path, state_path: Path) -> None:
+    """Prove a root-only key matches the database verifier without printing it."""
+    _assert_root_regular(vault_key, maximum_bytes=_VAULT_KEY_BYTES)
+    state = _load_state(state_path)
+    _verify_vault_key_material_against_state(vault_key.read_bytes(), state)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -336,6 +383,9 @@ def _parser() -> argparse.ArgumentParser:
     compare = subparsers.add_parser("compare-state")
     _ = compare.add_argument("--state", type=Path, required=True)
     _ = compare.add_argument("--manifest", type=Path, required=True)
+    verify_key = subparsers.add_parser("verify-vault-key")
+    _ = verify_key.add_argument("--vault-key", type=Path, required=True)
+    _ = verify_key.add_argument("--state", type=Path, required=True)
     return parser
 
 
@@ -355,6 +405,18 @@ def _run(arguments: _Arguments) -> str:
         )
         _write_manifest(arguments.manifest, manifest)
         return _safe_receipt(manifest, restored=False)
+    if arguments.command == "verify-vault-key":
+        _verify_vault_key_against_state(arguments.vault_key, arguments.state)
+        return json.dumps(
+            {
+                "schema_version": 2,
+                "status": "PASS",
+                "vault_key_matches_database": True,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     _assert_root_directory(arguments.manifest.parent)
     manifest = _load_manifest(arguments.manifest)
     if arguments.command == "verify":

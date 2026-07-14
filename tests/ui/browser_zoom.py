@@ -110,8 +110,12 @@ def _read_layout_metrics(session: _LayoutMetricSession) -> _LayoutMetrics:
 
 
 def validated_native_executable(playwright: _PlaywrightPath) -> Path:
-    executable_path = Path(playwright.chromium.executable_path)
-    approved_root = MANAGED_BROWSERS / "chromium-1228"
+    try:
+        executable_path = Path(playwright.chromium.executable_path).resolve(strict=True)
+        approved_root = (MANAGED_BROWSERS / "chromium-1228").resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        reason = "native zoom requires full managed Chromium revision 1228"
+        raise BrowserRuntimeError(reason) from error
     if not executable_path.is_relative_to(approved_root):
         reason = "native zoom requires full managed Chromium revision 1228"
         raise BrowserRuntimeError(reason)

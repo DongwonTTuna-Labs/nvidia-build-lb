@@ -74,8 +74,10 @@ def network_observation_is_allowed(item: SafeNetworkObservation) -> bool:
         return (item.method, action, item.status) in {
             ("DELETE", None, 204),
             ("POST", "enable", 204),
+            ("POST", "enable", 401),
             ("POST", "disable", 204),
             ("POST", "probe", 200),
+            ("POST", "probe", 503),
         }
     downstream = fullmatch(rf"/admin/api/v1/downstream-tokens/{uuid}", item.path)
     return downstream is not None and (item.method, item.status) == ("DELETE", 204)

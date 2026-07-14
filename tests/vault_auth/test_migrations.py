@@ -22,6 +22,7 @@ _DOMAIN_TABLES = {
     "upstream_attempt_receipts",
     "upstream_live_pins",
     "upstream_keys",
+    "vault_key_verifier",
 }
 
 
@@ -71,27 +72,27 @@ def test_empty_database_upgrades_to_credential_head(empty_database: SecretStr) -
     # When: every migration through the current head is applied.
     migrate(config, "head")
 
-    # Then: the domain head and all four credential tables exist.
+    # Then: the domain head and all credential and verifier tables exist.
     revision, tables = anyio.run(_schema_snapshot, empty_database)
-    assert revision == "0003_nvidia_routing"
+    assert revision == "0004_vault_key_verifier"
     assert tables >= _DOMAIN_TABLES
 
 
 def test_credential_migration_round_trips_through_baseline(empty_database: SecretStr) -> None:
     # Given: a real PostgreSQL 17 database upgraded to the credential head.
     config: Config = alembic_config(empty_database)
-    migrate(config, "0003_nvidia_routing")
+    migrate(config, "0004_vault_key_verifier")
 
     # When: the domain migration is downgraded and upgraded once.
     downgrade(config, "0001_baseline")
     baseline_revision, baseline_tables = anyio.run(_schema_snapshot, empty_database)
-    migrate(config, "0003_nvidia_routing")
+    migrate(config, "0004_vault_key_verifier")
 
     # Then: downgrade removes only domain state and the upgrade restores the head.
     head_revision, head_tables = anyio.run(_schema_snapshot, empty_database)
     assert baseline_revision == "0001_baseline"
     assert _DOMAIN_TABLES.isdisjoint(baseline_tables)
-    assert head_revision == "0003_nvidia_routing"
+    assert head_revision == "0004_vault_key_verifier"
     assert head_tables >= _DOMAIN_TABLES
 
 
@@ -102,7 +103,7 @@ def test_credential_schema_has_only_encrypted_or_digest_secret_storage(
     config = alembic_config(empty_database)
 
     # When: the credential schema is migrated to its head.
-    migrate(config, "0003_nvidia_routing")
+    migrate(config, "0004_vault_key_verifier")
 
     # Then: secret columns are encrypted or digests and critical identities are unique.
     columns, unique_columns = anyio.run(_storage_contract, empty_database)

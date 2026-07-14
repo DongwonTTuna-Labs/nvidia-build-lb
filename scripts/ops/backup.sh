@@ -82,6 +82,29 @@ backup_source=$(docker inspect \
 app_running=$(docker inspect --format '{{.State.Running}}' "$APP_CONTAINER" 2>/dev/null) \
     || fail source_app_unavailable
 [ "$app_running" = false ] || fail source_app_must_be_stopped
+db_component=$(docker inspect \
+    --format '{{index .Config.Labels "nvidia-build-lb.component"}}' \
+    "$DB_CONTAINER" 2>/dev/null) || fail source_database_unavailable
+app_component=$(docker inspect \
+    --format '{{index .Config.Labels "nvidia-build-lb.component"}}' \
+    "$APP_CONTAINER" 2>/dev/null) || fail source_app_unavailable
+db_service=$(docker inspect \
+    --format '{{index .Config.Labels "com.docker.compose.service"}}' \
+    "$DB_CONTAINER" 2>/dev/null) || fail source_database_unavailable
+app_service=$(docker inspect \
+    --format '{{index .Config.Labels "com.docker.compose.service"}}' \
+    "$APP_CONTAINER" 2>/dev/null) || fail source_app_unavailable
+db_project=$(docker inspect \
+    --format '{{index .Config.Labels "com.docker.compose.project"}}' \
+    "$DB_CONTAINER" 2>/dev/null) || fail source_database_unavailable
+app_project=$(docker inspect \
+    --format '{{index .Config.Labels "com.docker.compose.project"}}' \
+    "$APP_CONTAINER" 2>/dev/null) || fail source_app_unavailable
+[ "$db_component" = database ] && [ "$app_component" = gateway ] \
+    && [ "$db_service" = db ] && [ "$app_service" = app ] \
+    && [ -n "$db_project" ] && [ "$db_project" != '<no value>' ] \
+    && [ "$db_project" = "$app_project" ] \
+    || fail source_compose_identity_mismatch
 
 lock_id=$(printf '%s' "$MANIFEST_ROOT" | sha256sum \
     | awk 'NR == 1 {print $1} END {if (NR != 1) exit 1}') || fail backup_lock_failed
@@ -111,14 +134,6 @@ key_directory=$KEY_ROOT/$BACKUP_ID
 manifest_directory=$MANIFEST_ROOT/$BACKUP_ID
 created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-docker exec --user 70 "$DB_CONTAINER" \
-    pg_dump --username nvidia_build_lb --dbname nvidia_build_lb \
-    --format=custom --compress=9 --no-owner --no-privileges \
-    | root_helper -i --mount "type=bind,source=$database_directory,target=/output" \
-        "$HELPER_IMAGE" \
-        -c 'umask 077; test ! -e /output/database.dump; cat > /output/.database.dump.tmp; test -s /output/.database.dump.tmp; chmod 0600 /output/.database.dump.tmp; chown 0:0 /output/.database.dump.tmp; mv /output/.database.dump.tmp /output/database.dump; sync -f /output/database.dump; sync -f /output' \
-    || fail database_dump_failed
-
 root_helper \
     --mount "type=bind,source=$VAULT_KEY_FILE,target=/source/vault_master_key,readonly" \
     --mount "type=bind,source=$key_directory,target=/output" \
@@ -135,6 +150,24 @@ root_helper \
 docker run --rm --network none --read-only \
     --cap-drop ALL --security-opt no-new-privileges:true \
     --entrypoint /app/.venv/bin/python \
+    --mount "type=bind,source=$key_directory,target=/key,readonly" \
+    --mount "type=bind,source=$manifest_directory/database-state.json,target=/state/database-state.json,readonly" \
+    "$HELPER_IMAGE" -m nvidia_build_lb.backup_contract verify-vault-key \
+    --vault-key /key/vault_master_key \
+    --state /state/database-state.json >/dev/null \
+    || fail vault_key_database_mismatch
+
+docker exec --user 70 "$DB_CONTAINER" \
+    pg_dump --username nvidia_build_lb --dbname nvidia_build_lb \
+    --format=custom --compress=9 --no-owner --no-privileges \
+    | root_helper -i --mount "type=bind,source=$database_directory,target=/output" \
+        "$HELPER_IMAGE" \
+        -c 'umask 077; test ! -e /output/database.dump; cat > /output/.database.dump.tmp; test -s /output/.database.dump.tmp; chmod 0600 /output/.database.dump.tmp; chown 0:0 /output/.database.dump.tmp; mv /output/.database.dump.tmp /output/database.dump; sync -f /output/database.dump; sync -f /output' \
+    || fail database_dump_failed
+
+BACKUP_RECEIPT=$(docker run --rm --network none --read-only \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    --entrypoint /app/.venv/bin/python \
     --mount "type=bind,source=$database_directory,target=/database,readonly" \
     --mount "type=bind,source=$key_directory,target=/key,readonly" \
     --mount "type=bind,source=$manifest_directory,target=/manifest" \
@@ -143,9 +176,11 @@ docker run --rm --network none --read-only \
     --database-dump /database/database.dump \
     --vault-key /key/vault_master_key \
     --state /manifest/database-state.json \
-    --manifest /manifest/manifest.json \
+    --manifest /manifest/manifest.json) \
     || fail backup_manifest_failed
 
 root_helper --mount "type=bind,source=$manifest_directory,target=/output" "$HELPER_IMAGE" \
     -c 'rm -f /output/database-state.json; sync -f /output' \
     || fail backup_state_cleanup_failed
+
+printf '%s\n' "$BACKUP_RECEIPT"

@@ -57,8 +57,11 @@ _REQUIRED_CAPTURES = (
     "admin-dashboard-post-login-cleanup-375",
     "admin-dashboard-post-login-cleanup-768",
     "admin-login-error",
+    "admin-login-offline",
     "admin-initial-503",
     "admin-dashboard-post-login-cleanup",
+    "admin-action-probe-503",
+    "admin-action-enable-401",
     "admin-upstream-post-cleanup",
     "admin-downstream-post-cleanup",
     "admin-cjk-xss-safe",
@@ -67,6 +70,8 @@ _REQUIRED_CAPTURES = (
     "admin-clipboard-failure-post-cleanup",
     "native-showcase-full",
     "native-showcase-focused-control",
+    "native-admin-action-probe-503",
+    "native-admin-action-enable-401",
     "native-admin-upstream-post-cleanup",
     "native-admin-downstream-post-cleanup",
     "native-admin-cjk-xss-safe",
@@ -122,11 +127,26 @@ def _phase_cleanup(
     )
 
 
-def _assert_expected_errors(*audits: PageAudit) -> None:
-    expected = {"auth_wrong_token", "auth_initial_503", "offline_refresh", "native-offline_refresh"}
+def assert_expected_errors(*audits: PageAudit) -> None:
+    expected = {
+        "auth_wrong_token",
+        "auth_initial_offline",
+        "auth_initial_503",
+        "upstream_probe_503",
+        "upstream_enable_401",
+        "offline_refresh",
+        "native-upstream_probe_503",
+        "native-upstream_enable_401",
+        "native-offline_refresh",
+    }
     for audit in audits:
         if audit.runtime_exceptions or audit.page_errors:
-            reason = "production browser observed a runtime or page exception"
+            runtime_phases = tuple(sorted(audit.runtime_exceptions))
+            page_phases = tuple(sorted(audit.page_errors))
+            reason = (
+                "production browser observed a runtime or page exception: "
+                f"runtime_phases={runtime_phases}; page_phases={page_phases}"
+            )
             raise AssertionError(reason)
         page_problems = tuple(
             sorted(
@@ -191,14 +211,25 @@ def _adversarial() -> AdversarialReceipt:
     return AdversarialReceipt(
         probes=(
             AdversarialProbe(
-                probe_class="wrong_realm_and_initial_503",
+                probe_class="wrong_realm_offline_and_initial_503",
                 status="passed",
-                observable="actual 401 plus bounded safe 503 recovered by natural keyboard flow",
+                observable=(
+                    "actual 401, distinct offline state, and bounded safe 503 "
+                    "recovered by natural keyboard flow"
+                ),
             ),
             AdversarialProbe(
                 probe_class="offline_and_empty",
                 status="passed",
                 observable="one aborted overview and one body-free safe empty projection recovered",
+            ),
+            AdversarialProbe(
+                probe_class="management_action_503_and_401",
+                status="passed",
+                observable=(
+                    "probe 503 retained exact safe problem identity and enable 401 "
+                    "cleared custody before reauthentication"
+                ),
             ),
             AdversarialProbe(
                 probe_class="secret_custody",
@@ -274,7 +305,7 @@ def main() -> int:
         ordinary_cleanup = _phase_cleanup(baseline_processes, baseline_drivers, baseline_paths)
         native, native_audit = run_production_native_phase(qa, start_native_headless_context)
         assert session is not None
-        _assert_expected_errors(session.audit, native_audit)
+        assert_expected_errors(session.audit, native_audit)
         projection = network.verified()
         _assert_zero(
             public.axe_serious,

@@ -266,6 +266,8 @@ def run_production_native_phase(
     capture_ids = (
         "native-showcase-full",
         "native-showcase-focused-control",
+        "native-admin-action-probe-503",
+        "native-admin-action-enable-401",
         "native-admin-upstream-post-cleanup",
         "native-admin-downstream-post-cleanup",
         "native-admin-cjk-xss-safe",

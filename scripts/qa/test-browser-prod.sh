@@ -7,13 +7,14 @@ cd "$ROOT"
 
 EVIDENCE_DIR=${EVIDENCE_DIR:-.omo/evidence/task-6b-nvidia-build-lb}
 IMAGE_DIGEST=${IMAGE_DIGEST:-}
+POSTGRES_IMAGE_DIGEST=${POSTGRES_IMAGE_DIGEST:-}
+SOURCE_MANIFEST=${SOURCE_MANIFEST:-}
 QA_PORT=2456
 TASK_LABEL=todo6b-browser-prod
 BASE_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 SECRET_DIR=""
 CLIENT_DIR=""
 NODE_RUNTIME_DIR=""
-POSTGRES_TAG="nvidia-build-lb-postgres:todo6b-${BASE_RUN_ID,,}"
 PROJECT=""
 COMPOSE_STARTED=0
 RESUME_MODE=0
@@ -52,6 +53,16 @@ assert_no_symlink_components "$EVIDENCE_DIR" || {
     printf '%s\n' 'invalid_image_digest' >&2
     exit 64
 }
+[[ "$POSTGRES_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf '%s\n' 'invalid_postgres_image_digest' >&2
+    exit 64
+}
+[ -f "$SOURCE_MANIFEST" ] && [ ! -L "$SOURCE_MANIFEST" ] \
+    && assert_no_symlink_components "$SOURCE_MANIFEST" || {
+    printf '%s\n' 'invalid_source_manifest' >&2
+    exit 64
+}
+SOURCE_MANIFEST=$(realpath -e "$SOURCE_MANIFEST")
 
 for command in awk chmod cmp cp curl docker find flock git id jq mkdir mktemp mv node npm openssl \
     pgrep realpath rm rmdir sha256sum sort ss stat tr wc; do
@@ -64,6 +75,10 @@ done
     printf '%s\n' 'qa_python_unavailable' >&2
     exit 69
 }
+[ "$(docker image inspect --format '{{.Id}}' "$IMAGE_DIGEST" 2>/dev/null)" = "$IMAGE_DIGEST" ] \
+    || exit 64
+[ "$(docker image inspect --format '{{.Id}}' "$POSTGRES_IMAGE_DIGEST" 2>/dev/null)" = "$POSTGRES_IMAGE_DIGEST" ] \
+    || exit 64
 
 mkdir -p "$(dirname "$EVIDENCE_DIR")"
 claim_path="$EVIDENCE_DIR.claim"
@@ -113,12 +128,6 @@ network_count() {
 
 volume_count() {
     docker volume ls -q --filter "label=nvidia-build-lb.task=$TASK_LABEL" | wc -l | tr -d ' '
-}
-
-postgres_image_count() {
-    docker image ls --quiet --no-trunc "$POSTGRES_TAG" \
-        | LC_ALL=C sort -u \
-        | awk 'NF { count += 1 } END { print count + 0 }'
 }
 
 temporary_postgres_image_count() {
@@ -268,11 +277,6 @@ cleanup() {
     if [ "$COMPOSE_STARTED" -eq 1 ]; then
         compose down --volumes --remove-orphans --timeout 20 >/dev/null 2>&1 \
             || cleanup_error=1
-    fi
-    postgres_images=$(postgres_image_count) \
-        || { postgres_images=-1; cleanup_error=1; }
-    if [ "$postgres_images" -gt 0 ]; then
-        docker image rm "$POSTGRES_TAG" >/dev/null 2>&1 || cleanup_error=1
     fi
     if [ -n "$SECRET_DIR" ] && [ -d "$SECRET_DIR" ]; then
         root_secret_helper 'rm -f /secrets/*' >/dev/null 2>&1 || cleanup_error=1
@@ -490,7 +494,7 @@ write_stack_cleanup() {
         && [ "$playwright_drivers" -eq 0 ] \
         && [ "$lighthouse_processes" -eq 0 ]
     [ "$browser_directories" -eq 0 ]
-    [ "$postgres_images" -eq 1 ]
+    [ "$postgres_images" -eq 0 ]
     jq -n \
         --arg run "$run_name" \
         --argjson containers "$containers" \
@@ -540,14 +544,18 @@ if [ -e "$EVIDENCE_DIR" ]; then
     current_source=$(jq -er .source_tree_sha256 "$resume_manifest")
     requested_source=$(jq -er .source_tree_sha256 "$EVIDENCE_DIR/review-request.json")
     requested_image=$(jq -er .image_digest "$EVIDENCE_DIR/review-request.json")
-    [ "$current_source" = "$requested_source" ] && [ "$IMAGE_DIGEST" = "$requested_image" ] \
+    requested_postgres=$(jq -er .postgres_image_digest "$EVIDENCE_DIR/review-request.json")
+    [ "$current_source" = "$requested_source" ] \
+        && [ "$IMAGE_DIGEST" = "$requested_image" ] \
+        && [ "$POSTGRES_IMAGE_DIGEST" = "$requested_postgres" ] \
         || exit 1
     materialize_source_snapshot "$resume_manifest" "$CLIENT_DIR/source-snapshot.json"
     cmp "$EVIDENCE_DIR/source-snapshot.json" "$CLIENT_DIR/source-snapshot.json"
     qa_python -m tests.ui.browser_prod_verify \
         --evidence-dir "$EVIDENCE_DIR" \
         --source-sha "$current_source" \
-        --image-digest "$IMAGE_DIGEST"
+        --image-digest "$IMAGE_DIGEST" \
+        --postgres-image-digest "$POSTGRES_IMAGE_DIGEST"
     assert_source_unchanged
     exit 0
 fi
@@ -578,11 +586,17 @@ CLIENT_DIR=$(mktemp -d /tmp/nblb-browser-prod-client.XXXXXX)
 [ "$(port_count)" -eq 0 ] || exit 1
 
 source_manifest="$EVIDENCE_DIR/source-manifest.json"
-bootstrap_python -m scripts.qa.source_manifest --root "$ROOT" --output "$source_manifest"
+bootstrap_python -m scripts.qa.source_manifest --root "$ROOT" \
+    --output "$CLIENT_DIR/source-manifest-current.json"
+cmp "$SOURCE_MANIFEST" "$CLIENT_DIR/source-manifest-current.json"
+cp "$SOURCE_MANIFEST" "$source_manifest"
+chmod 0444 "$source_manifest"
 source_hash=$(jq -er .source_tree_sha256 "$source_manifest")
 materialize_source_snapshot "$source_manifest" "$EVIDENCE_DIR/source-snapshot.json"
 [ "$(docker image inspect --format '{{.Id}}' "$IMAGE_DIGEST")" = "$IMAGE_DIGEST" ]
 [ "$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$IMAGE_DIGEST")" = "$source_hash" ]
+[ "$(docker image inspect --format '{{.Id}}' "$POSTGRES_IMAGE_DIGEST")" = "$POSTGRES_IMAGE_DIGEST" ]
+[ "$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$POSTGRES_IMAGE_DIGEST")" = "$source_hash" ]
 
 NODE_RUNTIME_DIR="$CLIENT_DIR/node-runtime"
 mkdir "$NODE_RUNTIME_DIR"
@@ -610,17 +624,8 @@ docker run --rm --network none \
     -c 'cp /secrets/admin_token /client/admin_token && chown "$1:$2" /client/admin_token && chmod 0600 /client/admin_token' \
     sh "$(id -u)" "$(id -g)"
 
-docker buildx build --pull --no-cache --provenance=false \
-    --build-arg SOURCE_DATE_EPOCH=0 \
-    --output "type=docker,dest=$CLIENT_DIR/postgres-image.tar,rewrite-timestamp=true" \
-    --file "$QA_SOURCE_DIR/docker/postgres.Dockerfile" \
-    --label "nvidia-build-lb.task=$TASK_LABEL" \
-    --tag "$POSTGRES_TAG" "$QA_SOURCE_DIR" >/dev/null
-docker load --input "$CLIENT_DIR/postgres-image.tar" >/dev/null
-rm -f "$CLIENT_DIR/postgres-image.tar"
-
 export NBLB_CANDIDATE_IMAGE=$IMAGE_DIGEST
-export NBLB_POSTGRES_IMAGE=$POSTGRES_TAG
+export NBLB_POSTGRES_IMAGE=$POSTGRES_IMAGE_DIGEST
 export NBLB_QA_SECRET_DIR=$SECRET_DIR
 export NBLB_QA_PORT=$QA_PORT
 export NBLB_QA_TASK_LABEL=todo6b-browser-prod
@@ -658,7 +663,8 @@ set +e
 qa_python -m tests.ui.browser_prod_verify \
     --evidence-dir "$EVIDENCE_DIR" \
     --source-sha "$source_hash" \
-    --image-digest "$IMAGE_DIGEST"
+    --image-digest "$IMAGE_DIGEST" \
+    --postgres-image-digest "$POSTGRES_IMAGE_DIGEST"
 verify_status=$?
 set -e
 [ "$verify_status" -eq 75 ] || exit 1

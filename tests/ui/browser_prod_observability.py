@@ -1,3 +1,4 @@
+from re import fullmatch
 from typing import Protocol, final
 from urllib.parse import urlsplit
 
@@ -27,6 +28,25 @@ class _ResponseLike(Protocol):
 
     @property
     def url(self) -> str: ...
+
+
+def _verify_action_problem_projection(items: tuple[BrowserNetworkProjection, ...]) -> None:
+    uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    pattern = rf"/admin/api/v1/upstream-keys/{uuid}/(enable|probe)"
+    observed: list[tuple[str, str, str, int]] = []
+    for item in items:
+        match = fullmatch(pattern, item.path)
+        if match is not None and item.status in {401, 503}:
+            observed.append((item.phase, item.method, match.group(1), item.status))
+    expected = {
+        ("upstream_probe_503", "POST", "probe", 503),
+        ("upstream_enable_401", "POST", "enable", 401),
+        ("native-upstream_probe_503", "POST", "probe", 503),
+        ("native-upstream_enable_401", "POST", "enable", 401),
+    }
+    if len(observed) != len(expected) or set(observed) != expected:
+        reason = f"browser QA action problem projection changed: {tuple(sorted(observed))}"
+        raise AssertionError(reason)
 
 
 @final
@@ -100,6 +120,7 @@ class ProductionNetworkAudit:
             raise AssertionError(reason)
         failed = [item for item in items if item.failed]
         expected_failures = {
+            ("auth_initial_offline", "GET", "/admin/api/v1/overview"),
             ("offline_refresh", "GET", "/admin/api/v1/overview"),
             ("native-offline_refresh", "GET", "/admin/api/v1/overview"),
         }
@@ -108,6 +129,7 @@ class ProductionNetworkAudit:
             projection = tuple(sorted((item.phase, item.method, item.path) for item in failed))
             reason = f"browser QA failed-request projection changed: {projection}"
             raise AssertionError(reason)
+        _verify_action_problem_projection(items)
         for item in items:
             if item.failed:
                 continue

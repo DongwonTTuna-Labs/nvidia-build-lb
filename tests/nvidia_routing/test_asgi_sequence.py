@@ -22,6 +22,7 @@ from nvidia_build_lb.attempt_types import (
 from nvidia_build_lb.headers import MediaType, ValidatedUpstreamHeaders
 from nvidia_build_lb.nvidia_types import NvidiaTransportError
 from nvidia_build_lb.outcomes import TransportErrorCode
+from nvidia_build_lb.pinned_runtime import PinnedRuntimeDriftError
 from nvidia_build_lb.polling import (
     JsonTerminal,
     NvidiaSSEStream,
@@ -51,6 +52,7 @@ from nvidia_build_lb.terminal import (
     TerminalKind,
     TerminalProposal,
 )
+from nvidia_build_lb.transport_common import PinnedTransportDriftError
 
 pytestmark = [pytest.mark.nvidia_routing, pytest.mark.anyio]
 
@@ -205,6 +207,18 @@ class _UnresolvedCloseResponse(_Response):
 
 
 class _PrimaryFailureUnresolvedCloseResponse(_UnresolvedCloseResponse):
+    error: Exception
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(())
+        self.error = error
+
+    @override
+    def aiter_raw(self) -> AsyncIterator[bytes]:
+        return _PrimaryFailureIterator(self.error)
+
+
+class _PrimaryFailureResponse(_Response):
     error: Exception
 
     def __init__(self, error: Exception) -> None:
@@ -1009,6 +1023,47 @@ async def test_real_fail_stop_waits_for_stream_terminal_persistence(
     response.release.set()
     with anyio.fail_after(1):
         await response.close_finished.wait()
+
+
+@pytest.mark.parametrize(
+    "drift_error",
+    [
+        pytest.param(PinnedRuntimeDriftError(), id="runtime_drift"),
+        pytest.param(PinnedTransportDriftError(), id="transport_drift"),
+    ],
+)
+async def test_stream_drift_persists_terminal_before_process_fail_stop(
+    drift_error: Exception,
+) -> None:
+    events: list[str] = []
+    attempts = _Attempts(events)
+    supervisor = ChatSupervisor(
+        ChatSupervisorDependencies(attempts=attempts, clock=_Clock(), monotonic_clock=_Clock())
+    )
+    response = _PrimaryFailureResponse(drift_error)
+    root_scope = anyio.CancelScope()
+    fail_stop = LifecycleAttemptFailStop(_Readiness(events), root_scope)
+
+    async def send(_message: dict[str, object]) -> None:
+        return
+
+    with pytest.raises(ResponseRetirementUnresolvedError), root_scope:
+        await ChatStreamResponder(supervisor).run_stream(
+            routed=RoutedStream(
+                _stream_terminal(response, fail_stop),
+                _lease(),
+                1,
+                1.0,
+            ),
+            receive=_receive_forever,
+            send=send,
+        )
+
+    assert events == ["terminal_persist", "ready:false"]
+    assert attempts.commands[0].status_class is LastStatusClass.UPSTREAM_PROTOCOL_ERROR
+    assert response.close_count == 1
+    assert root_scope.cancel_called is True
+    assert fail_stop.triggered is True
 
 
 async def test_live_sse_protocol_failure_emits_one_request_correlated_error_event() -> None:

@@ -16,6 +16,17 @@ database passwords. Its downstream aggregate proves exact equality without
 publishing token digests. Store the database and key roots in separate custody
 domains. Losing either half makes recovery impossible.
 
+The three parent roots must already exist as distinct, non-nested,
+`root:root` mode-`0700` directories. The backup script deliberately will not
+create or repair these custody roots:
+
+```console
+sudo install -d -o root -g root -m 0700 \
+  /srv/nvidia-build-lb-backup/database \
+  /srv/nvidia-build-lb-key-backup/key \
+  /srv/nvidia-build-lb-manifest/manifest
+```
+
 ## Quiesced backup
 
 The backup contract is deliberately quiesced: stop the application first so
@@ -26,19 +37,20 @@ script refuses a running source app and refuses a database without the
 ```console
 set +x
 export BACKUP_ID="backup-$(date -u +%Y%m%dt%H%M%Sz)"
-export APP_CONTAINER="$(docker compose ps -q app)"
-export DB_CONTAINER="$(docker compose ps -q db)"
-docker compose stop app
+export APP_CONTAINER="$(scripts/ops/production-compose.sh ps -q app)"
+export DB_CONTAINER="$(scripts/ops/production-compose.sh ps -q db)"
+export NBLB_HELPER_IMAGE="$(docker image inspect --format '{{.Id}}' "ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_APP_REGISTRY_DIGEST}")"
+scripts/ops/production-compose.sh stop app
 sudo scripts/ops/backup.sh \
   --db-container "$DB_CONTAINER" \
   --app-container "$APP_CONTAINER" \
-  --helper-image "$NBLB_APP_IMAGE" \
+  --helper-image "$NBLB_HELPER_IMAGE" \
   --vault-key-file /opt/nvidia-build-lb/secrets/vault_master_key \
   --database-root /srv/nvidia-build-lb-backup/database \
   --key-root /srv/nvidia-build-lb-key-backup/key \
   --manifest-root /srv/nvidia-build-lb-manifest/manifest \
   --backup-id "$BACKUP_ID"
-docker compose start app
+scripts/ops/production-compose.sh start app
 curl --fail --header 'Host: 127.0.0.1:2456' http://127.0.0.1:2456/health
 ```
 
@@ -64,30 +76,40 @@ export NBLB_SECRET_DIR=/opt/nvidia-build-lb/restore-secrets
 export NBLB_RESTORE_ISOLATED=true
 export NBLB_BACKUP_SOURCE=false
 export NBLB_PORT=32458
-docker compose -p nvidia-build-lb-restore-drill up -d db
-export RESTORE_DB="$(docker compose -p nvidia-build-lb-restore-drill ps -q db)"
+scripts/ops/production-compose.sh -p nvidia-build-lb-restore-drill up -d db
+export RESTORE_DB="$(scripts/ops/production-compose.sh -p nvidia-build-lb-restore-drill ps -q db)"
 sudo scripts/ops/restore.sh \
   --db-container "$RESTORE_DB" \
-  --helper-image "$NBLB_APP_IMAGE" \
+  --helper-image "$NBLB_HELPER_IMAGE" \
   --database-directory "/srv/nvidia-build-lb-backup/database/$BACKUP_ID" \
   --key-directory "/srv/nvidia-build-lb-key-backup/key/$BACKUP_ID" \
   --manifest "/srv/nvidia-build-lb-manifest/manifest/$BACKUP_ID/manifest.json" \
   --target-secret-dir /opt/nvidia-build-lb/restore-secrets
-docker compose -p nvidia-build-lb-restore-drill up -d migrate app
+scripts/ops/production-compose.sh -p nvidia-build-lb-restore-drill up -d migrate app
 curl --fail --header 'Host: 127.0.0.1:2456' http://127.0.0.1:32458/health
 ```
 
 Restore refuses a nonempty target database, a non-isolated label, mismatched
 artifact hash, wrong key length, unsafe root artifact, unknown manifest field,
-or any safe-state mismatch. The PASS receipt proves the same Alembic revision,
-upstream key IDs/fingerprints, downstream digest aggregate, and vault key
-fingerprint. The network-disabled one-shot key installer receives only
-`DAC_OVERRIDE` so a Docker-group operator can atomically create the root-owned
-mode-0600 file in the prepared directory; it has no database or network access.
+or any safe-state mismatch. Empty means no user-created schema, relation,
+function, or type outside PostgreSQL's built-in objects. The PASS receipt binds
+the same Alembic revision, upstream key IDs/fingerprints, downstream digest
+aggregate, database vault-key verifier, and vault-key artifact fingerprint.
+Before verification, restore copies all three source artifacts into one fresh,
+root-only private staging directory. Verification, key installation, `pg_restore`,
+and state comparison use only that immutable staged tuple, so replacement of a
+custody-root path after snapshot creation cannot change the restored bytes. The
+network-disabled one-shot key installer receives only `DAC_OVERRIDE` and copies
+the staged key into a root-owned mode-0600 file; it has no database or network
+access. Restore verifies that installed file against both the staged manifest
+and the verifier captured from the restored database before emitting PASS. A
+failed restore removes any installed vault key and the entire staging tuple;
+an attempt-owned marker prevents cleanup from deleting a key that predated the
+restore attempt. Discard the isolated database volume after any failure.
 After the drill:
 
 ```console
-docker compose -p nvidia-build-lb-restore-drill down --volumes --remove-orphans
+scripts/ops/production-compose.sh -p nvidia-build-lb-restore-drill down --volumes --remove-orphans
 sudo rm -rf -- /opt/nvidia-build-lb/restore-secrets
 ```
 

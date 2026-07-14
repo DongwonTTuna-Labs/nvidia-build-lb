@@ -64,8 +64,8 @@ async function responseProblem(response) {
 }
 function showProblem(problem) {
   const message = `${problem.code} · ${problem.message} · Request ${problem.request_id}`;
-  if (hasSafeData) { byId("stale-warning").hidden = false; announce("Safe data is stale because refresh failed."); return; }
-  setText("global-error-message", message); byId("global-error").hidden = false; byId("global-error").focus();
+  setText("global-error-message", message); byId("global-error").hidden = false; byId("stale-warning").hidden = !hasSafeData; byId("global-error").focus();
+  announce(hasSafeData ? `Safe data is stale. ${message}` : message);
 }
 function setDashboardBusy(busy) {
   for (const id of ["overview", "upstream-keys", "downstream-tokens", "events"]) byId(id).setAttribute("aria-busy", String(busy));
@@ -74,12 +74,17 @@ function setDashboardBusy(busy) {
 function resetRequestController() { requestGeneration += 1; requestController.abort(); requestController = new AbortController(); }
 function requestIsCurrent(generation) { return generation === requestGeneration; }
 function setControlBusy(id, busy) { const control = byId(id); control.disabled = busy; control.setAttribute("aria-busy", String(busy)); }
-function mountLogin(authFailed = false) {
-  adminBearer = null; oneTimeToken = null; copiedCredential = false; hasSafeData = false;
-  byId("one-time-token").textContent = ""; byId("clipboard-recovery").hidden = true; byId("dashboard").hidden = true; byId("logout").hidden = true; byId("auth-view").hidden = false;
+function clearSensitiveUi() {
+  resetRequestController(); adminBearer = null; oneTimeToken = null; copiedCredential = false; hasSafeData = false; clipboardWritePending = false; clipboardWritePromise = null; pendingAction = null; lastInvoker = null;
+  byId("one-time-token").textContent = ""; byId("clipboard-recovery").hidden = true; byId("global-error").hidden = true; byId("stale-warning").hidden = true;
+  for (const dialog of document.querySelectorAll("dialog")) { dialog.querySelector("form")?.reset(); for (const control of dialog.querySelectorAll('[aria-busy="true"]')) { control.disabled = false; control.setAttribute("aria-busy", "false"); } if (dialog.open) dialog.close(); }
+}
+function mountLogin(authFailed = false, serviceOffline = false) {
+  clearSensitiveUi(); byId("dashboard").hidden = true; byId("logout").hidden = true; byId("auth-view").hidden = false;
   byId("login-slot").replaceChildren(byId("login-template").content.cloneNode(true));
   const field = byId("admin-bearer");
   if (authFailed) { byId("login-error").hidden = false; field.setAttribute("aria-invalid", "true"); field.setAttribute("aria-describedby", "admin-bearer-help login-error"); byId("login-error").focus(); }
+  else if (serviceOffline) { byId("login-offline").hidden = false; field.setAttribute("aria-describedby", "admin-bearer-help login-offline"); byId("login-offline").focus(); }
   else field.focus();
   byId("login-form").addEventListener("submit", login);
 }
@@ -94,7 +99,7 @@ async function login(event) {
     parseAdminDto("overview", parseJson(await response.text())); await refreshDashboard();
   } catch (error) {
     if (!(error instanceof TypeError)) throw error;
-    mountLogin(false); byId("login-error").hidden = false; byId("login-error").focus();
+    mountLogin(false, true);
   }
 }
 function renderOverview(overview) {
@@ -176,6 +181,7 @@ function closeDialog(id, focusId = null, cancelRequest = true) {
 async function runKeyAction(item, action, button) { const generation = requestGeneration; button.disabled = true; button.setAttribute("aria-busy", "true"); try {
     const response = await api(`/upstream-keys/${item.id}/${action}`, {method: "POST"});
     if (!requestIsCurrent(generation)) return;
+    if (response.status === 401) { mountLogin(true); return; }
     if (!response.ok) { showProblem(await responseProblem(response)); return; }
     if (action === "probe") { const result = parseAdminDto("probe", parseJson(await response.text())); announce(`Probe result ${result.probe_status}.`); }
     await refreshDashboard(`key-${item.id}-${action === "enable" ? "toggle" : "probe"}`);
@@ -194,6 +200,7 @@ async function confirmPendingAction() {
   const generation = requestGeneration; const {kind, item} = pendingAction; const path = kind === "revoke" ? `/downstream-tokens/${item.id}` : kind === "delete" ? `/upstream-keys/${item.id}` : `/upstream-keys/${item.id}/disable`;
   setControlBusy("confirm-action", true);
   try { const response = await api(path, {method: kind === "disable" ? "POST" : "DELETE"}); if (!requestIsCurrent(generation)) return;
+    if (response.status === 401) { mountLogin(true); return; }
     if (!response.ok) { setText("confirm-error", `${(await responseProblem(response)).code} · Safe action failed.`); byId("confirm-error").hidden = false; byId("confirm-error").focus(); return; }
     let focusId = kind === "revoke" ? `token-${item.id}-revoke` : `key-${item.id}-toggle`;
     if (kind === "delete") { const index = upstreamItems.findIndex((candidate) => candidate.id === item.id); const neighbor = upstreamItems[index + 1] ?? upstreamItems[index - 1]; focusId = neighbor ? `key-${neighbor.id}-toggle` : "upstream-heading"; }
@@ -204,6 +211,7 @@ async function confirmPendingAction() {
 async function submitUpstream(event) {
   event.preventDefault(); const generation = requestGeneration; let opaqueKey = byId("upstream-key").value; byId("upstream-key").value = ""; let body = JSON.stringify({key: opaqueKey}); setControlBusy("submit-upstream", true);
   try { const response = await api("/upstream-keys", {method: "POST", headers: {"Content-Type": "application/json"}, body}); if (!requestIsCurrent(generation)) return;
+    if (response.status === 401) { mountLogin(true); return; }
     if (!response.ok) { setText("upstream-error", `${(await responseProblem(response)).code} · Safe add failed.`); byId("upstream-error").hidden = false; byId("upstream-error").focus(); return; }
     parseAdminDto("upstream", parseJson(await response.text())); closeDialog("upstream-dialog", "add-upstream", false); await refreshDashboard("add-upstream");
   } catch (error) { if (!(error instanceof TypeError || error instanceof DOMException)) throw error; if (requestIsCurrent(generation) && byId("upstream-dialog").open) { setText("upstream-error", "offline · Safe add failed."); byId("upstream-error").hidden = false; byId("upstream-error").focus(); } }
@@ -212,6 +220,7 @@ async function submitUpstream(event) {
 async function submitDownstream(event) {
   event.preventDefault(); const generation = requestGeneration; const scopes = [...document.querySelectorAll("input[name='scope']:checked")].map((input) => input.value); let body = JSON.stringify({label: byId("downstream-label").value, scopes}); setControlBusy("submit-downstream", true);
   try { const response = await api("/downstream-tokens", {method: "POST", headers: {"Content-Type": "application/json"}, body}); if (!requestIsCurrent(generation)) return;
+    if (response.status === 401) { mountLogin(true); return; }
     if (!response.ok) { setText("downstream-error", `${(await responseProblem(response)).code} · Safe issue failed.`); byId("downstream-error").hidden = false; byId("downstream-error").focus(); return; }
     const issued = parseAdminDto("issued", parseJson(await response.text())); oneTimeToken = issued.token; byId("one-time-token").textContent = oneTimeToken; byId("downstream-form").reset();
     closeDialog("downstream-dialog", null, false); openDialog("credential-dialog", byId("issue-downstream"), "credential-title");
@@ -242,8 +251,6 @@ export function credentialState() { return {admin_bearer_present: Boolean(adminB
 function openUpstreamDialog(event) { byId("upstream-form").reset(); byId("upstream-error").hidden = true; openDialog("upstream-dialog", event.currentTarget, "upstream-key"); }
 function openDownstreamDialog(event) { byId("downstream-form").reset(); byId("downstream-error").hidden = true; byId("clipboard-recovery").hidden = true; openDialog("downstream-dialog", event.currentTarget, "downstream-label"); }
 function logout() {
-  resetRequestController(); clipboardWritePending = false; clipboardWritePromise = null; oneTimeToken = null; copiedCredential = false; byId("one-time-token").textContent = "";
-  for (const dialog of document.querySelectorAll("dialog")) { dialog.querySelector("form")?.reset(); for (const control of dialog.querySelectorAll('[aria-busy="true"]')) { control.disabled = false; control.setAttribute("aria-busy", "false"); } if (dialog.open) dialog.close(); }
   mountLogin(false);
 }
 byId("add-upstream").addEventListener("click", openUpstreamDialog); byId("issue-downstream").addEventListener("click", openDownstreamDialog);

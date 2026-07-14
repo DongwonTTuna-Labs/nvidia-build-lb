@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 from enum import StrEnum, unique
+from hashlib import sha256
+from hmac import compare_digest, digest
 from os import urandom
 from typing import ClassVar, Final, override
 from uuid import UUID
@@ -14,6 +16,9 @@ _MASTER_KEY_BYTES: Final = 32
 _NONCE_BYTES: Final = 12
 _VERSION: Final = 1
 _AAD_PREFIX: Final = b"nvidia-build-lb:vault:v1\x00"
+_VERIFIER_CONTEXT: Final = b"nvidia-build-lb:vault-key-verifier:v1\x00"
+_VERIFIER_BYTES: Final = 32
+_VERIFIER_INVALID: Final = "vault_key_verifier_invalid"
 
 
 @unique
@@ -53,6 +58,19 @@ class VaultEnvelope:
     ciphertext: bytes = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class VaultKeyVerifier:
+    """A secret-safe salted HMAC binding for one master key."""
+
+    salt: bytes
+    digest: bytes
+
+    def __post_init__(self) -> None:
+        """Reject malformed verifier values before comparison or persistence."""
+        if len(self.salt) != _VERIFIER_BYTES or len(self.digest) != sha256().digest_size:
+            raise ValueError(_VERIFIER_INVALID)
+
+
 class Vault:
     """Hold a masked master key for row-bound envelope operations."""
 
@@ -90,3 +108,21 @@ class Vault:
             return SecretStr(plaintext.decode())
         except (InvalidTag, UnicodeDecodeError, ValueError):
             raise VaultDecryptionError(code=VaultFailureCode.AUTHENTICATION_FAILED) from None
+
+    def build_key_verifier(self) -> VaultKeyVerifier:
+        """Create a fresh salted verifier without exposing the master key."""
+        salt = urandom(_VERIFIER_BYTES)
+        return VaultKeyVerifier(salt=salt, digest=self._key_verifier_digest(salt))
+
+    def matches_key_verifier(self, verifier: VaultKeyVerifier) -> bool:
+        """Compare one database verifier in constant time."""
+        return compare_digest(self._key_verifier_digest(verifier.salt), verifier.digest)
+
+    def _key_verifier_digest(self, salt: bytes) -> bytes:
+        if len(salt) != _VERIFIER_BYTES:
+            raise ValueError(_VERIFIER_INVALID)
+        return digest(
+            self._master_key.get_secret_value(),
+            _VERIFIER_CONTEXT + salt,
+            "sha256",
+        )

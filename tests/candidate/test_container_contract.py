@@ -22,7 +22,7 @@ def test_candidate_dockerfile_is_multistage_and_has_a_nonroot_runtime_handoff() 
     assert 'ENTRYPOINT ["/usr/local/bin/nblb-app-entrypoint"]' in dockerfile
     assert "HEALTHCHECK" in dockerfile
     assert "65532" in dockerfile
-    assert dockerfile.count("python:3.13.14-slim-bookworm@sha256:") == 2
+    assert dockerfile.count("python:3.13.14-alpine3.23@sha256:") == 2
     assert "ghcr.io/astral-sh/uv:0.11.24@sha256:" in dockerfile
     assert dockerfile.startswith("# syntax=docker/dockerfile:1.18@sha256:")
     assert "apt-get" not in dockerfile
@@ -34,7 +34,9 @@ def test_candidate_dockerfile_is_multistage_and_has_a_nonroot_runtime_handoff() 
     assert "-name '*.pyc' -o -name '*.pyo'" in dockerfile
     assert 'rm "$dist_info/uv_cache.json"' in dockerfile
     assert "sed -i '\\#/uv_cache.json,#d'" in dockerfile
-    assert '"/usr/bin/setpriv", "--reuid=65532"' in dockerfile
+    assert "libcap-ng=0.8.5-r0 setpriv=2.41.4-r0" in dockerfile
+    assert "/sbin/apk add --no-cache" in dockerfile
+    assert '"/bin/setpriv", "--reuid=65532"' in dockerfile
     assert '"/usr/local/bin/nblb-healthcheck", "65532", "65532", "app"' in dockerfile
     # Dockerfile frontend 1.18 serializes EXPOSE with a process-local pointer in
     # image history, making an otherwise identical local candidate ID drift.
@@ -71,7 +73,16 @@ def test_app_and_postgres_prestarts_copy_only_fixed_secret_names() -> None:
     assert "70:70:700" in database
     assert "0:0:444" in fake_upstream
     assert database_dockerfile.startswith("# syntax=docker/dockerfile:1.18@sha256:")
-    assert "libcap-ng=0.8.5-r0 setpriv=2.41.4-r0" in database_dockerfile
+    for package in (
+        "libcrypto3=3.5.7-r0",
+        "libssl3=3.5.7-r0",
+        "libxml2=2.13.9-r1",
+        "libcap-ng=0.8.5-r0",
+        "setpriv=2.41.4-r0",
+    ):
+        assert package in database_dockerfile
+    assert "rm /usr/local/bin/gosu" in database_dockerfile
+    assert "test ! -e /usr/local/bin/gosu" in database_dockerfile
     assert "util-linux" not in database_dockerfile
     assert "/bin/busybox" in database_dockerfile
     assert fake_upstream.index('chmod 0400 "$destination"') < fake_upstream.index(
@@ -101,7 +112,7 @@ def test_qa_compose_is_labelled_bounded_and_does_not_publish_production_port() -
     assert "nblb-loopback-entrypoint" in compose
     assert "--clear-groups" in _text("scripts/qa/loopback-entrypoint.sh")
     assert '"/bin/setpriv", "--reuid=70"' in compose
-    assert compose.count('"/usr/bin/setpriv", "--reuid=65532"') == 2
+    assert compose.count('"/bin/setpriv", "--reuid=65532"') == 2
     assert '"65532", "65532", "fake"' in compose
     assert '"65532", "65532", "loopback"' in compose
     assert '"70", "70", "postgres"' in compose
@@ -126,6 +137,8 @@ def test_build_candidate_recipe_owns_evidence_and_cleanup() -> None:
     assert script.index("trap cleanup EXIT") < script.index("SECRET_DIR=$(mktemp")
     assert 'SECRET_DIR=""' in script
     assert 'CLIENT_DIR=""' in script
+    assert 'chmod -R u+w -- "$CLIENT_DIR"' in script
+    assert script.index('chmod -R u+w -- "$CLIENT_DIR"') < script.index('rm -rf -- "$CLIENT_DIR"')
     assert "trigger_exit_status" in script
     assert "final_exit_status" in script
     assert "temp_secret_directories:$secret_directories" in script
@@ -135,10 +148,8 @@ def test_build_candidate_recipe_owns_evidence_and_cleanup() -> None:
     assert "if ! flock -n 9; then" in script
     assert 'if [ -e "$EVIDENCE_DIR" ] || ! mkdir "$EVIDENCE_DIR" 2>/dev/null; then' in script
     assert 'mkdir -p "$EVIDENCE_DIR"' not in script
-    assert "postgres_image_count()" in script
-    assert 'docker image ls --quiet --no-trunc "$POSTGRES_TAG"' in script
-    assert 'docker image inspect "$POSTGRES_TAG"' not in script
-    assert "postgres_images=-1; cleanup_error=1" in script
+    assert "candidate_postgres_image_digest" in script
+    assert 'docker image rm "$POSTGRES_TAG"' not in script
     assert "curl sha256sum ss uv" in script
     assert "NBLB_QA_PORT" in script
     assert '--argjson qa_port "$QA_PORT"' in script
@@ -155,8 +166,12 @@ def test_build_candidate_recipe_owns_deterministic_runtime_gate() -> None:
     assert script.count("--build-arg SOURCE_DATE_EPOCH=0") == 2
     assert script.count("rewrite-timestamp=true") == 2
     assert script.count("docker load --input") == 2
-    assert "scripts/qa/source_manifest.py" in script
+    assert "uv run python -m scripts.qa.source_manifest" in script
+    assert "uv run python -m scripts.qa.source_snapshot" in script
+    assert '"$CLIENT_DIR/source-snapshot"' in script
+    assert 'build_context:"manifest-bound-read-only-snapshot"' in script
     assert 'cmp "$CLIENT_DIR/source-manifest-before.json"' in script
+    assert "postgres_image_digest" in script
     assert 'assert_image_metadata_secret_free "$IMAGE_TAG"' in script
     assert "docker image inspect --format '{{json .Config}}'" in script
     assert "docker history --no-trunc" in script
@@ -197,7 +212,13 @@ def test_build_candidate_recipe_owns_deterministic_runtime_gate() -> None:
     assert "missing_app_database_secret_exit" in script
     assert "missing_postgres_database_secret_exit" in script
     assert script.count("--cap-add SETPCAP") == 2
-    assert script.count("assert_healthcheck_identity") == 5
+    assert (
+        script.count("assert_healthcheck_identity"),
+        script.count('assert_healthcheck_identity "$app_container" /bin/setpriv'),
+        script.count('assert_healthcheck_identity "$fake_container" /bin/setpriv'),
+        script.count('assert_healthcheck_identity "$proxy_container" /bin/setpriv'),
+        "/usr/bin/setpriv" in script,
+    ) == (5, 1, 1, 1, False)
     assert "2455" not in script
 
 

@@ -83,6 +83,7 @@
       <h1 id="login-title">Authenticate locally</h1>
       <p>The admin bearer stays only in this tab's JavaScript memory. Reload and logout erase it.</p>
       <div class="error-panel" hidden="hidden" id="login-error" role="alert" tabindex="-1"><p>Authentication failed. Enter the current admin bearer and try again.</p></div>
+      <div class="error-panel" hidden="hidden" id="login-offline" role="alert" tabindex="-1"><p>Service unavailable. The local administration service could not be reached. Your entered bearer was cleared; try again when the service is available.</p></div>
       <label for="admin-bearer">Admin bearer</label>
       <input aria-describedby="admin-bearer-help" autocomplete="off" id="admin-bearer" name="admin-bearer" required="required" spellcheck="false" type="password" />
       <p class="helper" id="admin-bearer-help">Never place this value in a URL, cookie, or saved browser storage.</p>

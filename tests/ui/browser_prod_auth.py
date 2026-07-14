@@ -132,6 +132,10 @@ def _initial_503(route: Route) -> None:
     )
 
 
+def _initial_offline(route: Route) -> None:
+    route.abort("connectionrefused")
+
+
 def _exercise_auth_failures(
     page: Page,
     qa: ProductionQaContext,
@@ -148,6 +152,27 @@ def _exercise_auth_failures(
     qa.recorder.capture(
         page,
         CaptureSpec(name="admin-login-error", state="safe production 401", viewport="1280x900"),
+    )
+    page.keyboard.press("Tab")
+    assert focused_id(page) == "admin-bearer"
+    _ = page.route(_OVERVIEW_PATTERN, _initial_offline, times=1)
+    _set_phase(audit, qa, "auth_initial_offline")
+    qa.recorder.begin_blackout("admin bearer entered before bounded offline injection")
+    page.keyboard.insert_text(qa.client.admin_bearer)
+    page.keyboard.press("Enter")
+    page.locator("#login-offline").wait_for(state="visible")
+    assert focused_id(page) == "login-offline"
+    assert "Service unavailable" in page.locator("#login-offline").inner_text()
+    assert page.locator("#login-error").is_hidden()
+    assert_secret_absent(page, qa.client.admin_bearer)
+    qa.recorder.end_blackout()
+    qa.recorder.capture(
+        page,
+        CaptureSpec(
+            name="admin-login-offline",
+            state="distinct initial service outage after credential cleanup",
+            viewport="1280x900",
+        ),
     )
     page.keyboard.press("Tab")
     assert focused_id(page) == "admin-bearer"
@@ -208,8 +233,18 @@ def open_production_session(
     qa.recorder.add_scenario(
         ManualScenario(
             name="production authentication and natural 503 recovery",
-            actions=("Wrong realm login", "Bounded overview 503", "Natural Tab and Enter retry"),
-            observables=("Credentials erased", "Safe errors only", "Dashboard focus restored"),
+            actions=(
+                "Wrong realm login",
+                "Bounded initial service outage",
+                "Bounded overview 503",
+                "Natural Tab and Enter retry",
+            ),
+            observables=(
+                "Credentials erased",
+                "Outage is not mislabeled as authentication failure",
+                "Safe errors only",
+                "Dashboard focus restored",
+            ),
         )
     )
     return AuthenticatedSession(

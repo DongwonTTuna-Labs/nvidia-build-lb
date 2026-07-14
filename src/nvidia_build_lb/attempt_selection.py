@@ -67,7 +67,7 @@ def _classify_no_eligible(
         if row.cooldown_kind == CooldownKind.RATE_LIMIT.value and row.cooldown_until is not None
     )
     if rate_deadlines:
-        earliest = min(rate_deadlines)
+        earliest = min(row.cooldown_until for row in cooling if row.cooldown_until is not None)
         retry_after = max(1, ceil((earliest - now).total_seconds()))
         return NoEligibleUpstreamKeyError(NoEligibleReason.RATE_COOLDOWN, retry_after)
     if cooling:

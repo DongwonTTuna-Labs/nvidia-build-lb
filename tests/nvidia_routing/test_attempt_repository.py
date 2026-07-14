@@ -851,7 +851,7 @@ async def test_scheduler_singleton_missing_is_database_unavailable_not_no_keys(
         _ = await repository.reserve_attempt(_start(fixed_clock, request_id="missing-scheduler"))
 
 
-async def test_locked_no_eligible_snapshot_prefers_earliest_rate_cooldown(
+async def test_locked_no_eligible_snapshot_uses_earliest_mixed_cooldown(
     routing_session_factory: async_sessionmaker[AsyncSession],
     vault: Vault,
     fixed_clock: Clock,
@@ -882,7 +882,7 @@ async def test_locked_no_eligible_snapshot_prefers_earliest_rate_cooldown(
         _ = await repository.reserve_attempt(_start(fixed_clock, request_id="cooldown-rate"))
 
     assert captured.value.reason is NoEligibleReason.RATE_COOLDOWN
-    assert captured.value.retry_after_seconds == 10
+    assert captured.value.retry_after_seconds == 5
 
 
 async def test_locked_no_eligible_snapshot_classifies_transient_cooldown(

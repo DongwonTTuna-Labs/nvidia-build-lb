@@ -14,7 +14,9 @@ from . import (
     browser_evidence,
     browser_png,
     browser_public,
+    browser_runtime,
     browser_zoom,
+    lighthouse_gate,
     test_browser_journeys,
 )
 from .browser_evidence import CaptureRecord, EvidenceRecorder
@@ -104,6 +106,64 @@ def test_authenticated_viewports_do_not_resize_a_shared_page() -> None:
 
     # When/Then: the authenticated browser path has no post-launch viewport resize.
     assert "set_viewport_size" not in source
+
+
+def test_managed_browser_cache_is_portable_but_absolute_and_revision_pinned(
+    tmp_path: Path,
+) -> None:
+    real_cache = tmp_path / "real-cache"
+    real_cache.mkdir()
+    cache_alias = tmp_path / "cache-alias"
+    cache_alias.symlink_to(real_cache, target_is_directory=True)
+    default = browser_runtime.resolve_managed_browsers(None, tmp_path)
+    configured = browser_runtime.resolve_managed_browsers(
+        str(tmp_path / "managed"), Path("/ignored")
+    )
+    configured_alias = browser_runtime.resolve_managed_browsers(str(cache_alias), Path("/ignored"))
+
+    assert default == tmp_path / ".cache" / "ms-playwright"
+    assert configured == tmp_path / "managed"
+    assert configured_alias == real_cache
+    with pytest.raises(ValueError, match="must be absolute"):
+        _ = browser_runtime.resolve_managed_browsers("relative/cache", tmp_path)
+    assert "/home/dongwonttuna" not in getsource(browser_runtime)
+    assert lighthouse_gate.CHROME == (
+        MANAGED_BROWSERS / "chromium-1228" / "chrome-linux64" / "chrome"
+    )
+
+
+def test_browser_provenance_canonicalizes_a_symlinked_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_cache = tmp_path / "real-cache"
+    executable = real_cache / "chromium-1228" / "chrome-linux64" / "chrome"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    headless = real_cache / "chromium_headless_shell-1228" / "chrome-linux" / "headless_shell"
+    headless.parent.mkdir(parents=True)
+    headless.touch()
+    cache_alias = tmp_path / "cache-alias"
+    cache_alias.symlink_to(real_cache, target_is_directory=True)
+
+    process_root = tmp_path / "proc"
+    process = process_root / "123"
+    process.mkdir(parents=True)
+    (process / "exe").symlink_to(executable)
+    _ = (process / "cmdline").write_bytes(b"")
+    temporary_root = tmp_path / "tmp"
+    temporary_root.mkdir()
+    monkeypatch.setattr(browser_runtime, "MANAGED_BROWSERS", cache_alias)
+    monkeypatch.setattr(browser_runtime, "_PROCESS_ROOT", process_root)
+    monkeypatch.setattr(browser_runtime, "_TEMP_ROOT", temporary_root)
+    monkeypatch.setattr(browser_zoom, "MANAGED_BROWSERS", cache_alias)
+
+    snapshot = browser_runtime.browser_resource_snapshot()
+    native_executable = browser_zoom.validated_native_executable(
+        _PlaywrightDouble(cache_alias / executable.relative_to(real_cache))
+    )
+
+    assert snapshot.processes == ((123, executable.resolve()),)
+    assert native_executable == executable.resolve()
 
 
 def test_native_launch_rejects_the_headless_shell_before_starting() -> None:

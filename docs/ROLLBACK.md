@@ -11,7 +11,8 @@ Never use a mutable tag as a rollback target.
 
 If the prior application image is compatible with the current Alembic head:
 
-1. Set `NBLB_APP_IMAGE` to the reviewed prior `@sha256:` reference.
+1. Set `NBLB_APP_REGISTRY_DIGEST` to only the reviewed prior registry digest's
+   64 lowercase hex characters after `@sha256:`.
 2. Render Compose and confirm the database image, secret directory, volume, port,
    and project name are unchanged.
 3. Run the migration job; it is idempotent and serialized.
@@ -20,9 +21,9 @@ If the prior application image is compatible with the current Alembic head:
    and secret-safe logs. Verify `codex-lb` port 2455 before and after.
 
 ```console
-docker compose config --quiet
-docker compose run --rm migrate
-docker compose up -d --force-recreate --no-deps app
+scripts/ops/production-compose.sh config --quiet
+scripts/ops/production-compose.sh run --rm migrate
+scripts/ops/production-compose.sh up -d --force-recreate --no-deps app
 curl --fail --header 'Host: 127.0.0.1:2456' http://127.0.0.1:2456/health
 curl --fail http://127.0.0.1:2455/health
 ```

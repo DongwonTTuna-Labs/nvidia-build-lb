@@ -24,6 +24,7 @@ async def close_response_with_deadline(
         AsyncCleanupUnresolvedError,
         PinnedRuntimeDriftError,
         PinnedTransportDriftError,
+        anyio.get_cancelled_exc_class(),
     ):
         raise ResponseRetirementUnresolvedError from None
     _ = deadline.remaining()

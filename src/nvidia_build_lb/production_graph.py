@@ -47,6 +47,7 @@ from nvidia_build_lb.runtime_primitives import (
 from nvidia_build_lb.runtime_readiness import (
     GatedCredentialRepositories,
     LifecycleMonitorSubmitter,
+    LifecycleReadinessProbe,
     RuntimeReadinessGate,
 )
 from nvidia_build_lb.server_error_boundary import SafeServerErrorFastAPI
@@ -62,6 +63,7 @@ from nvidia_build_lb.service_epoch_connection import PsycopgEpochConnectionFacto
 from nvidia_build_lb.transport_adapter import SanitizedAsyncClient
 from nvidia_build_lb.upstream_keys import UpstreamKeyDependencies, UpstreamKeyRepository
 from nvidia_build_lb.vault import Vault
+from nvidia_build_lb.vault_key_binding import ensure_vault_key_binding
 
 _CLEANUP_TIMEOUT_SECONDS = 5.0
 _PRODUCTION_CLEANUP_FAILED = "production_cleanup_failed"
@@ -121,6 +123,7 @@ async def build_production_resources(
     )
     client: SanitizedAsyncClient | None = None
     try:
+        _ = await ensure_vault_key_binding(sessions, vault)
         client = SanitizedAsyncClient.create()
         adapter = NvidiaHostedAdapter(
             NvidiaAdapterDependencies(
@@ -140,7 +143,7 @@ async def build_production_resources(
                 publisher=_EpochPublisher(),
                 readiness=readiness,
             )
-        ).start(tasks, LifecycleMonitorSubmitter(fail_stop))
+        ).start(tasks, LifecycleMonitorSubmitter(readiness, fail_stop))
     except BaseException:
         if client is not None:
             _ = await _bounded(client.aclose)
@@ -172,7 +175,7 @@ async def build_production_resources(
         credentials=credentials,
         routing=routing,
         responders=responders,
-        readiness=RepositoryReadinessProbe(gated),
+        readiness=LifecycleReadinessProbe(readiness, RepositoryReadinessProbe(gated)),
         logger=logger,
     )
     application = create_app(services)

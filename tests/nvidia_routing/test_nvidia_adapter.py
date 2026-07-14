@@ -293,6 +293,22 @@ class _HangingBodyResponse(_Response):
         yield b""
 
 
+class _HangingBodyAndCloseResponse(_HangingCloseResponse):
+    iterator_calls: int
+    read_started: anyio.Event
+
+    def __init__(self) -> None:
+        super().__init__(headers=((b"Content-Type", b"application/json"),))
+        self.read_started = anyio.Event()
+
+    @override
+    async def aiter_raw(self) -> AsyncIterator[bytes]:
+        self.iterator_calls += 1
+        self.read_started.set()
+        await anyio.sleep_forever()
+        yield b""
+
+
 class _BodyTransportFailureIterator:
     def __aiter__(self) -> Self:
         return self
@@ -417,7 +433,41 @@ async def test_202_close_transport_failure_never_recloses_owned_response(
     assert len(client.requests) == (2 if polled else 1)
 
 
-async def test_cancelled_origin_202_close_marks_unresolved_and_fail_stops(
+@pytest.mark.parametrize(
+    "drift_error",
+    [
+        pytest.param(PinnedRuntimeDriftError(), id="runtime_drift"),
+        pytest.param(PinnedTransportDriftError(), id="transport_drift"),
+    ],
+)
+@pytest.mark.parametrize("polled", [False, True], ids=("origin_202", "poll_202"))
+async def test_202_close_drift_is_deferred_to_routing(
+    drift_error: Exception,
+    polled: bool,
+) -> None:
+    failing = _DriftCloseResponse(
+        drift_error,
+        status_code=202,
+        headers=((b"NVCF-REQID", b"request-202"),),
+    )
+    responses = (
+        (_Response(202, headers=((b"NVCF-REQID", b"request-202"),)), failing)
+        if polled
+        else (failing,)
+    )
+    fail_stop = _FailStop()
+
+    with pytest.raises(ResponseRetirementUnresolvedError):
+        _ = await _adapter(_Client(responses), _Clock(), fail_stop).execute(
+            credential=SecretStr("same-secret"),
+            body=b"{}",
+        )
+
+    assert failing.close_count == 1
+    assert fail_stop.calls == 0
+
+
+async def test_cancelled_origin_202_close_marks_unresolved_for_routing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -436,7 +486,7 @@ async def test_cancelled_origin_202_close_marks_unresolved_and_fail_stops(
     async def execute() -> None:
         try:
             _ = await adapter.execute(credential=SecretStr("same-secret"), body=b"{}")
-        except (ResponseRetirementUnresolvedError, anyio.get_cancelled_exc_class()) as error:
+        except ResponseRetirementUnresolvedError as error:
             observed.append(type(error))
 
     async with anyio.create_task_group() as tasks:
@@ -444,8 +494,8 @@ async def test_cancelled_origin_202_close_marks_unresolved_and_fail_stops(
         await response.close_started.wait()
         tasks.cancel_scope.cancel()
 
-    assert len(observed) == 1
-    assert fail_stop.calls == 1
+    assert observed == [ResponseRetirementUnresolvedError]
+    assert fail_stop.calls == 0
     assert response.close_count == 1
     assert not response.close_finished.is_set()
     response.release.set()
@@ -713,7 +763,7 @@ async def test_primary_adapter_error_is_preserved_when_cleanup_is_unresolved(
     assert captured.value is primary
     assert response.close_started.is_set()
     assert not response.close_finished.is_set()
-    assert fail_stop.calls == 1
+    assert fail_stop.calls == 0
     response.release.set()
     with anyio.fail_after(1):
         await response.close_finished.wait()
@@ -908,3 +958,48 @@ async def test_direct_body_cancellation_retires_owned_response_once() -> None:
 
     assert response.close_count == 1
     assert response.iterator_calls == 1
+
+
+@pytest.mark.parametrize("polled", [False, True], ids=("direct", "poll"))
+async def test_body_cancellation_surfaces_unresolved_close_to_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    polled: bool,
+) -> None:
+    monkeypatch.setattr(
+        response_retirement_module,
+        "_RESPONSE_RETIRE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    response = _HangingBodyAndCloseResponse()
+    origin = _Response(202, headers=((b"NVCF-REQID", b"request-202"),))
+    responses = (origin, response) if polled else (response,)
+    fail_stop = _FailStop()
+    scopes: list[anyio.CancelScope] = []
+    observed: list[type[BaseException]] = []
+
+    async def execute() -> None:
+        try:
+            with anyio.CancelScope() as scope:
+                scopes.append(scope)
+                _ = await _adapter(_Client(responses), _Clock(), fail_stop).execute(
+                    credential=SecretStr("cancel-secret"),
+                    body=b"{}",
+                )
+        except ResponseRetirementUnresolvedError as error:
+            observed.append(type(error))
+
+    async with anyio.create_task_group() as tasks:
+        _ = tasks.start_soon(execute)
+        await response.read_started.wait()
+        scopes[0].cancel()
+
+    assert observed == [ResponseRetirementUnresolvedError]
+    assert response.close_count == 1
+    assert response.close_started.is_set()
+    assert not response.close_finished.is_set()
+    assert fail_stop.calls == 0
+    assert origin.close_count == (1 if polled else 0)
+
+    response.release.set()
+    with anyio.fail_after(1):
+        await response.close_finished.wait()

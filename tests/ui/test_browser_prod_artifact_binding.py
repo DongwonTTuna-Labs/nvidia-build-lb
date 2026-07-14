@@ -3,7 +3,6 @@
 import hashlib
 import json
 from pathlib import Path
-from typing import Literal
 
 import pytest
 
@@ -11,6 +10,8 @@ from .browser_evidence import CaptureIndex, CaptureRecord
 from .browser_prod_verify import (
     _fresh_cleanup_binding,  # pyright: ignore[reportPrivateUsage]
     _review_is_valid,  # pyright: ignore[reportPrivateUsage]
+    _RunArtifactBinding,  # pyright: ignore[reportPrivateUsage]
+    _RunArtifactHashes,  # pyright: ignore[reportPrivateUsage]
     _verified_capture_index,  # pyright: ignore[reportPrivateUsage]
     _VisualReview,  # pyright: ignore[reportPrivateUsage]
 )
@@ -141,18 +142,33 @@ def test_verifier_rejects_symlinked_capture_directory_or_run(tmp_path: Path) -> 
 
 
 def test_visual_review_is_bound_to_both_capture_index_hashes(tmp_path: Path) -> None:
-    binding: dict[Literal["run-a", "run-b"], str] = {
-        "run-a": "a" * 64,
-        "run-b": "b" * 64,
+    binding: _RunArtifactBinding = {
+        "run-a": _RunArtifactHashes(
+            adversarial="a" * 64,
+            candidate="b" * 64,
+            capture_index="c" * 64,
+            lighthouse="d" * 64,
+            manual_qa="e" * 64,
+            stack_cleanup="f" * 64,
+        ),
+        "run-b": _RunArtifactHashes(
+            adversarial="1" * 64,
+            candidate="2" * 64,
+            capture_index="3" * 64,
+            lighthouse="4" * 64,
+            manual_qa="5" * 64,
+            stack_cleanup="6" * 64,
+        ),
     }
     review = _VisualReview(
         blocking_findings=(),
         fresh_cleanup_sha256="0" * 64,
         image_digest="sha256:" + "c" * 64,
+        postgres_image_digest="sha256:" + "7" * 64,
         lane="objective-visual",
         process_baseline_sha256="f" * 64,
-        run_capture_index_sha256=binding,
-        schema_version=1,
+        run_artifact_sha256=binding,
+        schema_version=2,
         source_tree_sha256="d" * 64,
         status="PASS",
     )
@@ -160,9 +176,11 @@ def test_visual_review_is_bound_to_both_capture_index_hashes(tmp_path: Path) -> 
     _ = path.write_text(review.model_dump_json(indent=2) + "\n", encoding="utf-8")
     assert _review_is_valid(path, review)
 
-    changed = review.model_copy(
-        update={"run_capture_index_sha256": {"run-a": "e" * 64, "run-b": "b" * 64}}
-    )
+    changed_binding: _RunArtifactBinding = {
+        **binding,
+        "run-a": binding["run-a"].model_copy(update={"manual_qa": "0" * 64}),
+    }
+    changed = review.model_copy(update={"run_artifact_sha256": changed_binding})
     assert not _review_is_valid(path, changed)
     changed_baseline = review.model_copy(update={"process_baseline_sha256": "e" * 64})
     assert not _review_is_valid(path, changed_baseline)
@@ -170,23 +188,31 @@ def test_visual_review_is_bound_to_both_capture_index_hashes(tmp_path: Path) -> 
     assert not _review_is_valid(path, changed_cleanup)
 
     for stale_binding in (
-        {"run-a": "a" * 64},
-        {"run-a": "a" * 64, "run-b": "b" * 64, "run-c": "c" * 64},
-        {"run-a": "b" * 64, "run-b": "a" * 64},
+        {"run-a": binding["run-a"]},
+        {"run-a": binding["run-b"], "run-b": binding["run-a"]},
     ):
-        stale = review.model_copy(update={"run_capture_index_sha256": stale_binding})
+        stale = review.model_copy(update={"run_artifact_sha256": stale_binding})
         assert not _review_is_valid(path, stale)
 
 
 def test_visual_review_symlink_is_never_accepted(tmp_path: Path) -> None:
+    run_hashes = _RunArtifactHashes(
+        adversarial="a" * 64,
+        candidate="b" * 64,
+        capture_index="c" * 64,
+        lighthouse="d" * 64,
+        manual_qa="e" * 64,
+        stack_cleanup="f" * 64,
+    )
     review = _VisualReview(
         blocking_findings=(),
         fresh_cleanup_sha256="0" * 64,
         image_digest="sha256:" + "c" * 64,
+        postgres_image_digest="sha256:" + "7" * 64,
         lane="objective-visual",
         process_baseline_sha256="f" * 64,
-        run_capture_index_sha256={"run-a": "a" * 64, "run-b": "b" * 64},
-        schema_version=1,
+        run_artifact_sha256={"run-a": run_hashes, "run-b": run_hashes},
+        schema_version=2,
         source_tree_sha256="d" * 64,
         status="PASS",
     )
