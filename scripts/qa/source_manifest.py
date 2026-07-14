@@ -15,6 +15,7 @@ from typing import TypedDict
 
 _CHUNK_BYTES = 1024 * 1024
 _GIT_UNAVAILABLE = "git unavailable"
+_SPECIAL_MODE_BITS = 0o7000
 
 
 class ManifestEntry(TypedDict):
@@ -48,6 +49,20 @@ class CandidatePayload:
 class _Arguments(argparse.Namespace):
     root: Path = Path.cwd()
     output: Path = Path()
+
+
+def canonical_source_mode(kind: str, observed: str) -> str:
+    """Project host permissions onto the mode bits Git preserves."""
+    mode = int(observed, 8)
+    if kind == "regular":
+        if mode & _SPECIAL_MODE_BITS:
+            reason = "candidate regular file has unsupported special mode bits"
+            raise ValueError(reason)
+        return "0755" if mode & 0o111 else "0644"
+    if kind == "symlink":
+        return "0777"
+    reason = f"unsupported candidate path type: {kind!r}"
+    raise ValueError(reason)
 
 
 def _open_directory_no_follow(path: Path) -> int:
@@ -139,7 +154,7 @@ def read_candidate_entry(root: Path, relative_text: str) -> CandidatePayload:
 
 
 def build_manifest(root: Path) -> SourceManifest:
-    """Hash the Git candidate surface including path type and exact mode."""
+    """Hash the Git candidate surface with Git-reproducible mode semantics."""
     root_descriptor = _open_directory_no_follow(root)
     os.close(root_descriptor)
     git = shutil.which("git")
@@ -160,10 +175,11 @@ def build_manifest(root: Path) -> SourceManifest:
         relative_text = os.fsdecode(relative)
         payload = read_candidate_entry(root, relative_text)
         payload_digest = hashlib.sha256(payload.payload).hexdigest()
+        canonical_mode = canonical_source_mode(payload.kind, payload.mode)
 
         for field in (
             payload.kind.encode(),
-            payload.mode.encode(),
+            canonical_mode.encode(),
             relative,
             payload_digest.encode(),
         ):
@@ -173,14 +189,14 @@ def build_manifest(root: Path) -> SourceManifest:
             {
                 "path": relative_text,
                 "type": payload.kind,
-                "mode": payload.mode,
+                "mode": canonical_mode,
                 "payload_sha256": payload_digest,
             }
         )
 
     return {
         "schema_version": 1,
-        "algorithm": "git-files-type-mode-path-payload-sha256-v1",
+        "algorithm": "git-files-type-canonical-mode-path-payload-sha256-v2",
         "source_tree_sha256": source_digest.hexdigest(),
         "entry_count": len(entries),
         "entries": entries,

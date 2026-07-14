@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 from scripts.qa.source_manifest import build_manifest
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -224,9 +225,20 @@ def test_source_manifest_uses_git_surface_and_observes_mode_type_and_payload(
     _ = (tmp_path / ".coverage").write_text("changed runtime output", encoding="utf-8")
     assert build_manifest(tmp_path)["source_tree_sha256"] == baseline["source_tree_sha256"]
 
+    candidate.chmod(0o600)
+    assert build_manifest(tmp_path)["source_tree_sha256"] == baseline["source_tree_sha256"]
+
     candidate.chmod(0o755)
     executable = build_manifest(tmp_path)
     assert executable["source_tree_sha256"] != baseline["source_tree_sha256"]
+
+    candidate.chmod(0o700)
+    assert build_manifest(tmp_path)["source_tree_sha256"] == executable["source_tree_sha256"]
+
+    candidate.chmod(0o4755)
+    with pytest.raises(ValueError, match="special mode bits"):
+        _ = build_manifest(tmp_path)
+    candidate.chmod(0o755)
 
     _ = (tmp_path / "candidate-link").symlink_to("candidate.sh")
     linked = build_manifest(tmp_path)

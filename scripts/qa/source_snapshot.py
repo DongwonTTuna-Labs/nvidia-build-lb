@@ -13,7 +13,12 @@ from typing import ClassVar, Literal, final
 
 from pydantic import BaseModel, ConfigDict
 
-from scripts.qa.source_manifest import CandidatePayload, build_manifest, read_candidate_entry
+from scripts.qa.source_manifest import (
+    CandidatePayload,
+    build_manifest,
+    canonical_source_mode,
+    read_candidate_entry,
+)
 
 _MODE_DIGITS = 4
 _SHA256_HEX_LENGTH = 64
@@ -35,7 +40,7 @@ class SnapshotEntry(_StrictModel):
 class SnapshotManifest(_StrictModel):
     """The exact source-manifest schema consumed by the snapshotter."""
 
-    algorithm: Literal["git-files-type-mode-path-payload-sha256-v1"]
+    algorithm: Literal["git-files-type-canonical-mode-path-payload-sha256-v2"]
     entries: tuple[SnapshotEntry, ...]
     entry_count: int
     schema_version: Literal[1]
@@ -128,7 +133,8 @@ def _validated_entries(manifest: SnapshotManifest) -> tuple[tuple[SnapshotEntry,
 
 def _assert_candidate_payload(entry: SnapshotEntry, payload: CandidatePayload) -> None:
     digest = hashlib.sha256(payload.payload).hexdigest()
-    if payload.kind != entry.type or payload.mode != entry.mode or digest != entry.payload_sha256:
+    mode = canonical_source_mode(payload.kind, payload.mode)
+    if payload.kind != entry.type or mode != entry.mode or digest != entry.payload_sha256:
         reason = "source entry changed during snapshot materialization"
         raise ValueError(reason)
 

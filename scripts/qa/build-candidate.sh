@@ -619,7 +619,7 @@ jq -n \
     --arg source_sha256 "$before_hash" \
     --arg image_digest "$image_digest" \
     --argjson source_entry_count "$source_entry_count" \
-    '{schema_version:1,status:"PASS",source_tree_sha256:$source_sha256,source_manifest_algorithm:"git-files-type-mode-path-payload-sha256-v1",source_manifest_entry_count:$source_entry_count,build_cache_disabled:true,source_date_epoch:0,layer_timestamps_rewritten:true,deterministic_archive_loaded:true,image_digest:$image_digest,image_reference_kind:"local immutable image id",metadata_filtered:true,secrets_in_metadata:false}' \
+    '{schema_version:1,status:"PASS",source_tree_sha256:$source_sha256,source_manifest_algorithm:"git-files-type-canonical-mode-path-payload-sha256-v2",source_manifest_entry_count:$source_entry_count,build_cache_disabled:true,source_date_epoch:0,layer_timestamps_rewritten:true,deterministic_archive_loaded:true,image_digest:$image_digest,image_reference_kind:"local immutable image id",metadata_filtered:true,secrets_in_metadata:false}' \
     > "$EVIDENCE_DIR/candidate.json"
 jq -n \
     --arg source_sha256 "$before_hash" \
