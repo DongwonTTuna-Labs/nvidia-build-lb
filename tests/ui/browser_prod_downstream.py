@@ -84,6 +84,7 @@ def run_production_downstream_journey(journey: ProductionJourney) -> None:
     page.keyboard.press("Tab")
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_hidden()
+    expect(page.locator("#clipboard-recovery")).to_be_hidden()
     expect(page.locator("#refresh-dashboard")).to_be_enabled()
     expect(page.locator("#issue-downstream")).to_be_focused()
     assert clipboard_is_empty(page)
@@ -165,6 +166,10 @@ readText: () => Promise.reject(new DOMException("synthetic denial"))}})"""
     page.locator("#dismiss-token").focus()
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_hidden()
+    expect(page.locator("#clipboard-recovery")).to_be_visible()
+    expect(page.locator("#clipboard-recovery")).to_contain_text(
+        "RECOVERED · Clipboard custody restored."
+    )
     expect(page.locator("#refresh-dashboard")).to_be_enabled()
     expect(page.locator("#issue-downstream")).to_be_focused()
     assert clipboard_is_empty(page)
@@ -176,6 +181,7 @@ readText: () => Promise.reject(new DOMException("synthetic denial"))}})"""
     page.locator("#refresh-dashboard").focus()
     page.keyboard.press("Enter")
     expect(page.locator(f"#token-{issued.id}-revoke")).to_contain_text("REVOKED")
+    expect(page.locator("#clipboard-recovery")).to_be_visible()
     journey.qa.recorder.capture(
         page,
         CaptureSpec(

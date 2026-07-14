@@ -22,6 +22,18 @@ def _issue(page: Page, label: str) -> None:
     expect(page.locator("#credential-dialog")).to_be_visible()
 
 
+def _expect_recovery_notice(page: Page) -> None:
+    expect(page.locator("#clipboard-recovery")).to_be_visible()
+    expect(page.locator("#clipboard-recovery")).to_contain_text(
+        "RECOVERED · Clipboard custody restored."
+    )
+
+
+def _issue_without_recovery_notice(page: Page, label: str) -> None:
+    _issue(page, label)
+    expect(page.locator("#clipboard-recovery")).to_be_hidden()
+
+
 def test_clipboard_absence_held_write_dismiss_and_keyboard_copy_are_safe() -> None:
     server = start_fake_server()
     managed = start_managed_browser()
@@ -47,8 +59,9 @@ navigator, "clipboard", {configurable:true, value:undefined})""",
         execute_script(page, "() => delete navigator.clipboard")
         page.locator("#dismiss-token").click()
         expect(page.locator("#credential-dialog")).to_be_hidden()
+        _expect_recovery_notice(page)
 
-        _issue(page, "Held clipboard write")
+        _issue_without_recovery_notice(page, "Held clipboard write")
         execute_script(
             page,
             """() => {
@@ -83,7 +96,7 @@ Object.defineProperty(navigator, "clipboard", {configurable:true, value:{
             page, "() => { delete navigator.clipboard; delete globalThis.__resolveHeldClipboard; }"
         )
 
-        _issue(page, "Natural keyboard clipboard")
+        _issue_without_recovery_notice(page, "Natural keyboard clipboard")
         page.locator("#one-time-token").select_text()
         page.keyboard.press("Control+C")
         copied_length = int(

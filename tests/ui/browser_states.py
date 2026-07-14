@@ -161,6 +161,10 @@ delete globalThis.__nblbClipboardDescriptor;
     dismiss.focus()
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_hidden()
+    expect(page.locator("#clipboard-recovery")).to_be_visible()
+    expect(page.locator("#clipboard-recovery")).to_contain_text(
+        "RECOVERED · Clipboard custody restored."
+    )
     assert_secret_absent(page, state.issued_bearer)
     assert clipboard_is_empty(page)
     expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
@@ -187,6 +191,7 @@ delete globalThis.__nblbClipboardDescriptor;
                 "Clipboard denial produces a safe non-echoing message",
                 "Failed cleanup keeps the credential dialog and screenshot blackout active",
                 "No credential remains in rendered text or form controls",
+                "A non-secret recovery notice remains after safe cleanup",
                 "Screenshot blackout remains active until dismissal absence proof",
             ),
         )

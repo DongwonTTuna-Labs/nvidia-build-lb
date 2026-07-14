@@ -76,7 +76,7 @@ function requestIsCurrent(generation) { return generation === requestGeneration;
 function setControlBusy(id, busy) { const control = byId(id); control.disabled = busy; control.setAttribute("aria-busy", String(busy)); }
 function mountLogin(authFailed = false) {
   adminBearer = null; oneTimeToken = null; copiedCredential = false; hasSafeData = false;
-  byId("one-time-token").textContent = ""; byId("dashboard").hidden = true; byId("logout").hidden = true; byId("auth-view").hidden = false;
+  byId("one-time-token").textContent = ""; byId("clipboard-recovery").hidden = true; byId("dashboard").hidden = true; byId("logout").hidden = true; byId("auth-view").hidden = false;
   byId("login-slot").replaceChildren(byId("login-template").content.cloneNode(true));
   const field = byId("admin-bearer");
   if (authFailed) { byId("login-error").hidden = false; field.setAttribute("aria-invalid", "true"); field.setAttribute("aria-describedby", "admin-bearer-help login-error"); byId("login-error").focus(); }
@@ -227,7 +227,7 @@ async function copyToken() {
   finally { clipboardWritePromise = null; clipboardWritePending = false; if (requestIsCurrent(generation)) setControlBusy("copy-token", false); }
 }
 async function dismissToken() {
-  const generation = requestGeneration; const control = byId("dismiss-token"); if (control.disabled) return; setControlBusy("dismiss-token", true);
+  const generation = requestGeneration; const control = byId("dismiss-token"); const recoveredClipboardFailure = !byId("clipboard-error").hidden; if (control.disabled) return; setControlBusy("dismiss-token", true);
   try {
     if (!navigator.clipboard) { byId("clipboard-error").hidden = false; byId("clipboard-error").focus(); return; }
     if (clipboardWritePending) { await Promise.race([clipboardWritePromise, new Promise((resolve) => setTimeout(resolve, 500))]); if (clipboardWritePending) { byId("clipboard-error").hidden = false; byId("clipboard-error").focus(); return; } }
@@ -235,11 +235,12 @@ async function dismissToken() {
     catch (error) { if (!(error instanceof DOMException)) throw error; byId("clipboard-error").hidden = false; byId("clipboard-error").focus(); return; }
     oneTimeToken = null; copiedCredential = false; byId("one-time-token").textContent = ""; byId("clipboard-error").hidden = true;
     closeDialog("credential-dialog", "issue-downstream"); await refreshDashboard("issue-downstream");
+    if (recoveredClipboardFailure && requestIsCurrent(generation)) { byId("clipboard-recovery").hidden = false; announce("Clipboard custody recovered and the one-time credential was removed."); }
   } finally { if (requestIsCurrent(generation) && control.isConnected) setControlBusy("dismiss-token", false); }
 }
 export function credentialState() { return {admin_bearer_present: Boolean(adminBearer), one_time_token_present: Boolean(oneTimeToken), copied_credential: copiedCredential}; }
 function openUpstreamDialog(event) { byId("upstream-form").reset(); byId("upstream-error").hidden = true; openDialog("upstream-dialog", event.currentTarget, "upstream-key"); }
-function openDownstreamDialog(event) { byId("downstream-form").reset(); byId("downstream-error").hidden = true; openDialog("downstream-dialog", event.currentTarget, "downstream-label"); }
+function openDownstreamDialog(event) { byId("downstream-form").reset(); byId("downstream-error").hidden = true; byId("clipboard-recovery").hidden = true; openDialog("downstream-dialog", event.currentTarget, "downstream-label"); }
 function logout() {
   resetRequestController(); clipboardWritePending = false; clipboardWritePromise = null; oneTimeToken = null; copiedCredential = false; byId("one-time-token").textContent = "";
   for (const dialog of document.querySelectorAll("dialog")) { dialog.querySelector("form")?.reset(); for (const control of dialog.querySelectorAll('[aria-busy="true"]')) { control.disabled = false; control.setAttribute("aria-busy", "false"); } if (dialog.open) dialog.close(); }

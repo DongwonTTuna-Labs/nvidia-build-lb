@@ -132,6 +132,15 @@ def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
     assert any(path[-2:] == ("fieldset", "legend") for path, _ in parsed.elements)
     button_ids = {attrs.get("id") for path, attrs in parsed.elements if path[-1] == "button"}
     assert {"logout", "refresh-dashboard"} <= button_ids
+    recovery = [attrs for _, attrs in parsed.elements if attrs.get("id") == "clipboard-recovery"]
+    assert recovery == [
+        {
+            "class": "recovery-panel",
+            "hidden": "hidden",
+            "id": "clipboard-recovery",
+            "role": "status",
+        }
+    ]
 
 
 def test_admin_static_sources_have_no_embedded_secret_or_unsafe_sink() -> None:
