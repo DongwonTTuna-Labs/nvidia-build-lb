@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -41,6 +42,7 @@ _FAKE_BACKUP_DOCKER = r"""#!/usr/bin/env python3
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 ARGS = sys.argv[1:]
@@ -111,7 +113,20 @@ if ARGS[0] != "run":
 bound = mounts()
 shell_command = ARGS[ARGS.index("-c") + 1] if "-c" in ARGS else ""
 
+if os.environ.get("NBLB_FAKE_FAIL_AT") == "after-lock":
+    raise SystemExit(42)
+
 if 'mkdir "/output/$1"' in shell_command:
+    if signal_name := os.environ.get("NBLB_FAKE_HOLD_SIGNAL"):
+        signal = Path(signal_name)
+        if not signal.exists():
+            signal.touch()
+            release = Path(os.environ["NBLB_FAKE_HOLD_RELEASE"])
+            deadline = time.monotonic() + 10
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not release.exists():
+                fail("synthetic_hold_timeout")
     destination = bound["/output"] / ARGS[-1]
     destination.mkdir(mode=0o700)
     raise SystemExit(0)
@@ -162,6 +177,7 @@ import hashlib
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 ARGS = sys.argv[1:]
@@ -247,6 +263,9 @@ if ARGS[0] != "run":
 bound = mounts()
 shell_command = ARGS[ARGS.index("-c") + 1] if "-c" in ARGS else ""
 
+if os.environ.get("NBLB_FAKE_FAIL_AT") == "after-lock":
+    raise SystemExit(42)
+
 if "rm -f /target/.vault_master_key.tmp /target/vault_master_key" in shell_command:
     marker = bound["/target"] / ".nblb-restore-install"
     if marker.is_file() and marker.read_text(encoding="utf-8").strip() == ARGS[-1]:
@@ -274,6 +293,16 @@ if "rm -f /stage/database.dump" in shell_command:
 
 source_targets = {"/database-root", "/key-root", "/manifest-root", "/stage"}
 if source_targets <= bound.keys():
+    if signal_name := os.environ.get("NBLB_FAKE_HOLD_SIGNAL"):
+        signal = Path(signal_name)
+        if not signal.exists():
+            signal.touch()
+            release = Path(os.environ["NBLB_FAKE_HOLD_RELEASE"])
+            deadline = time.monotonic() + 10
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not release.exists():
+                fail("synthetic_hold_timeout")
     backup_id = os.environ["NBLB_FAKE_BACKUP_ID"]
     database = bound["/database-root"] / backup_id / "database.dump"
     key = bound["/key-root"] / backup_id / "vault_master_key"
@@ -399,12 +428,15 @@ def _run_backup_with_cleanup_failure(tmp_path: Path) -> _BackupExecution:
     _ = vault_key.write_bytes(_RESTORE_KEY)
     vault_key.chmod(0o600)
     backup_id = "backup-20260714t000000z"
+    runtime_directory = tmp_path / "runtime"
+    runtime_directory.mkdir(mode=0o700)
 
     environment = os.environ.copy()
     environment.update(
         {
             "PATH": f"{fake_bin}{os.pathsep}{environment['PATH']}",
             "NBLB_FAKE_FAIL_AT": "state-cleanup",
+            "NBLB_OPERATION_LOCK_DIR": str(runtime_directory),
         }
     )
     completed = subprocess.run(  # noqa: S603 - fixed repository backup entrypoint.
@@ -473,6 +505,8 @@ def _run_restore_with_source_swap(
         _ = target_key.write_bytes(preexisting_key)
         target_key.chmod(0o600)
     stage_path_file = tmp_path / "stage-path"
+    runtime_directory = tmp_path / "runtime"
+    runtime_directory.mkdir(mode=0o700)
     environment = os.environ.copy()
     environment.update(
         {
@@ -483,6 +517,7 @@ def _run_restore_with_source_swap(
             "NBLB_FAKE_MANIFEST_SHA256": sha256(_RESTORE_MANIFEST).hexdigest(),
             "NBLB_FAKE_STAGE_PATH_FILE": str(stage_path_file),
             "NBLB_FAKE_FAIL_AT": fail_at,
+            "NBLB_OPERATION_LOCK_DIR": str(runtime_directory),
         }
     )
     completed = subprocess.run(  # noqa: S603 - fixed repository restore entrypoint.
@@ -516,6 +551,13 @@ def _run_restore_with_source_swap(
     )
 
 
+def _wait_for_path(path: Path) -> None:
+    deadline = time.monotonic() + 5
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists(), f"timed out waiting for {path.name}"
+
+
 def test_migrations_take_and_release_a_dedicated_session_advisory_lock() -> None:
     environment = _text("migrations/env.py")
     locked_runner = environment[
@@ -545,6 +587,11 @@ def test_backup_and_restore_scripts_fail_closed_on_custody_or_target_drift() -> 
         assert "docker inspect" in script
 
     assert "flock -n" in backup
+    for script in (backup, restore):
+        assert "${NBLB_OPERATION_LOCK_DIR:-/run/lock/nvidia-build-lb}" in script
+        assert 'exec 9>>"$lock_file"' in script
+        assert 'rm -f -- "$lock_file"' not in script
+        assert 'rm -f -- "$LOCK_FILE"' not in script
     assert "source_app_must_be_stopped" in backup
     assert "vault_master_key" in backup
     assert "database.dump" in backup
@@ -595,6 +642,94 @@ def test_backup_cleanup_failure_never_publishes_a_pass_receipt(tmp_path: Path) -
     assert execution.completed.stderr.endswith("backup_state_cleanup_failed\n")
     assert execution.manifest.is_file()
     assert execution.database_state.is_file()
+
+
+def test_backup_lock_inode_survives_two_failed_contenders(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_jq = fake_bin / "jq"
+    _ = fake_docker.write_text(_FAKE_BACKUP_DOCKER, encoding="utf-8")
+    _ = fake_jq.write_text(_FAKE_RESTORE_JQ, encoding="utf-8")
+    fake_docker.chmod(0o755)
+    fake_jq.chmod(0o755)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    database_root = tmp_path / "database"
+    key_root = tmp_path / "key"
+    manifest_root = tmp_path / "manifest"
+    for root in (database_root, key_root, manifest_root):
+        root.mkdir(mode=0o700)
+    vault_key = tmp_path / "vault_master_key"
+    _ = vault_key.write_bytes(_RESTORE_KEY)
+    vault_key.chmod(0o600)
+    command = [
+        str(_ROOT / "scripts/ops/backup.sh"),
+        "--db-container",
+        "b" * 64,
+        "--app-container",
+        "c" * 64,
+        "--helper-image",
+        f"sha256:{'a' * 64}",
+        "--vault-key-file",
+        str(vault_key),
+        "--database-root",
+        str(database_root),
+        "--key-root",
+        str(key_root),
+        "--manifest-root",
+        str(manifest_root),
+        "--backup-id",
+        "backup-contention",
+    ]
+    signal = tmp_path / "holder-ready"
+    release = tmp_path / "holder-release"
+    base_environment = os.environ.copy()
+    base_environment.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{base_environment['PATH']}",
+            "NBLB_OPERATION_LOCK_DIR": str(runtime),
+        }
+    )
+    holder_environment = base_environment | {
+        "NBLB_FAKE_HOLD_SIGNAL": str(signal),
+        "NBLB_FAKE_HOLD_RELEASE": str(release),
+    }
+    holder = subprocess.Popen(  # noqa: S603 - fixed repository backup entrypoint.
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=holder_environment,
+    )
+    holder_stdout = ""
+    holder_stderr = ""
+    try:
+        _wait_for_path(signal)
+        lock_files = tuple(runtime.glob("backup-*.lock"))
+        assert len(lock_files) == 1
+        lock_inode = lock_files[0].stat().st_ino
+        contender_environment = base_environment | {"NBLB_FAKE_FAIL_AT": "after-lock"}
+        contenders = tuple(
+            subprocess.run(  # noqa: S603 - fixed repository backup entrypoint.
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=contender_environment,
+            )
+            for _ in range(2)
+        )
+        assert all(result.returncode != 0 for result in contenders)
+        assert all(result.stdout == "" for result in contenders)
+        assert all(result.stderr.endswith("backup_lock_busy\n") for result in contenders)
+        assert lock_files[0].stat().st_ino == lock_inode
+    finally:
+        release.touch()
+        holder_stdout, holder_stderr = holder.communicate(timeout=15)
+    assert holder.returncode == 0, holder_stderr
+    assert holder_stdout == '{"schema_version":2,"status":"PASS"}\n'
+    assert tuple(runtime.glob("backup-*.lock"))
 
 
 def test_restore_snapshots_the_pair_then_rechecks_the_installed_key() -> None:
@@ -686,6 +821,101 @@ def test_restore_does_not_emit_pass_before_marker_commit(tmp_path: Path) -> None
     assert not execution.stage_path.exists()
 
 
+def test_restore_lock_inode_survives_two_failed_contenders(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_jq = fake_bin / "jq"
+    _ = fake_docker.write_text(_FAKE_RESTORE_DOCKER, encoding="utf-8")
+    _ = fake_jq.write_text(_FAKE_RESTORE_JQ, encoding="utf-8")
+    fake_docker.chmod(0o755)
+    fake_jq.chmod(0o755)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    backup_id = "restore-contention"
+    database_source = tmp_path / "database" / backup_id / "database.dump"
+    key_source = tmp_path / "key" / backup_id / "vault_master_key"
+    manifest_source = tmp_path / "manifest" / backup_id / "manifest.json"
+    for source in (database_source, key_source, manifest_source):
+        source.parent.mkdir(parents=True)
+    _ = database_source.write_bytes(_RESTORE_DATABASE)
+    _ = key_source.write_bytes(_RESTORE_KEY)
+    _ = manifest_source.write_bytes(_RESTORE_MANIFEST)
+    for source in (database_source, key_source, manifest_source):
+        source.chmod(0o600)
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    stage_path_file = tmp_path / "stage-path"
+    command = [
+        str(_ROOT / "scripts/ops/restore.sh"),
+        "--db-container",
+        "b" * 64,
+        "--helper-image",
+        f"sha256:{'a' * 64}",
+        "--database-directory",
+        str(database_source.parent),
+        "--key-directory",
+        str(key_source.parent),
+        "--manifest",
+        str(manifest_source),
+        "--target-secret-dir",
+        str(target),
+    ]
+    signal = tmp_path / "holder-ready"
+    release = tmp_path / "holder-release"
+    base_environment = os.environ.copy()
+    base_environment.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{base_environment['PATH']}",
+            "NBLB_FAKE_BACKUP_ID": backup_id,
+            "NBLB_FAKE_DATABASE_SHA256": sha256(_RESTORE_DATABASE).hexdigest(),
+            "NBLB_FAKE_KEY_SHA256": sha256(_RESTORE_KEY).hexdigest(),
+            "NBLB_FAKE_MANIFEST_SHA256": sha256(_RESTORE_MANIFEST).hexdigest(),
+            "NBLB_FAKE_STAGE_PATH_FILE": str(stage_path_file),
+            "NBLB_OPERATION_LOCK_DIR": str(runtime),
+        }
+    )
+    holder_environment = base_environment | {
+        "NBLB_FAKE_HOLD_SIGNAL": str(signal),
+        "NBLB_FAKE_HOLD_RELEASE": str(release),
+    }
+    holder = subprocess.Popen(  # noqa: S603 - fixed repository restore entrypoint.
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=holder_environment,
+    )
+    holder_stdout = ""
+    holder_stderr = ""
+    try:
+        _wait_for_path(signal)
+        lock_files = tuple(runtime.glob("restore-*.lock"))
+        assert len(lock_files) == 1
+        lock_inode = lock_files[0].stat().st_ino
+        contender_environment = base_environment | {"NBLB_FAKE_FAIL_AT": "after-lock"}
+        contenders = tuple(
+            subprocess.run(  # noqa: S603 - fixed repository restore entrypoint.
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=contender_environment,
+            )
+            for _ in range(2)
+        )
+        assert all(result.returncode != 0 for result in contenders)
+        assert all(result.stdout == "" for result in contenders)
+        assert all(result.stderr.endswith("restore_lock_busy\n") for result in contenders)
+        assert lock_files[0].stat().st_ino == lock_inode
+    finally:
+        release.touch()
+        holder_stdout, holder_stderr = holder.communicate(timeout=15)
+    assert holder.returncode == 0, holder_stderr
+    assert holder_stdout == '{"schema_version":2,"status":"PASS"}\n'
+    assert tuple(runtime.glob("restore-*.lock"))
+
+
 def test_local_verifier_and_release_scanner_own_evidence_and_cleanup() -> None:
     verify = _text("scripts/qa/verify-local.sh")
     scan = _text("scripts/qa/scan-release.sh")
@@ -703,6 +933,7 @@ def test_local_verifier_and_release_scanner_own_evidence_and_cleanup() -> None:
     assert "127.0.0.1:2455/health" in verify
     assert "scripts/ops/backup.sh" in verify
     assert "scripts/ops/restore.sh" in verify
+    assert verify.count('NBLB_OPERATION_LOCK_DIR="$OPERATION_LOCK_DIR"') == 2
     assert "POSTGRES_IMAGE_DIGEST" in verify
     assert "SOURCE_MANIFEST" in verify
     assert "uv run python -m scripts.qa.source_manifest" in verify

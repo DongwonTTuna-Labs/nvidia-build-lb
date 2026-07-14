@@ -15,7 +15,6 @@ KEY_DIRECTORY=""
 MANIFEST_FILE=""
 TARGET_SECRET_DIR=""
 STATE_DIR=""
-LOCK_FILE=""
 RESTORE_STAGE_DIR=""
 HOST_UID=""
 HOST_GID=""
@@ -54,9 +53,6 @@ cleanup() {
             helper "$HOST_UID" "$HOST_GID" >/dev/null 2>&1 || cleanup_error=1
         rmdir "$RESTORE_STAGE_DIR" >/dev/null 2>&1 || cleanup_error=1
     fi
-    if [ -n "$LOCK_FILE" ]; then
-        rm -f -- "$LOCK_FILE" >/dev/null 2>&1 || cleanup_error=1
-    fi
     [ "$cleanup_error" -eq 0 ] || status=1
     exit "$status"
 }
@@ -77,7 +73,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for command in docker flock id mktemp realpath rmdir sha256sum; do
+for command in docker flock id mkdir mktemp realpath rmdir sha256sum stat; do
     command -v "$command" >/dev/null 2>&1 || fail required_command_unavailable
 done
 [[ "$DB_CONTAINER" =~ ^[0-9a-f]{64}$ ]] || fail restore_input_invalid
@@ -129,8 +125,28 @@ compose_project=$(docker inspect \
 
 lock_id=$(printf '%s' "$MANIFEST_FILE" | sha256sum \
     | awk 'NR == 1 {print $1} END {if (NR != 1) exit 1}') || fail restore_lock_failed
-LOCK_FILE=/tmp/nblb-restore-$lock_id.lock
-exec 9>"$LOCK_FILE"
+lock_uid=$(id -u) || fail restore_lock_failed
+lock_gid=$(id -g) || fail restore_lock_failed
+lock_directory=${NBLB_OPERATION_LOCK_DIR:-/run/lock/nvidia-build-lb}
+case "$lock_directory" in /*) ;; *) fail restore_lock_root_invalid ;; esac
+if [ ! -e "$lock_directory" ]; then
+    mkdir -m 0700 -- "$lock_directory" 2>/dev/null \
+        || [ -d "$lock_directory" ] || fail restore_lock_root_invalid
+fi
+[ -d "$lock_directory" ] && [ ! -L "$lock_directory" ] \
+    || fail restore_lock_root_invalid
+lock_directory=$(realpath -e "$lock_directory") || fail restore_lock_root_invalid
+[ "$(stat -c '%u:%g:%a' "$lock_directory")" = "$lock_uid:$lock_gid:700" ] \
+    || fail restore_lock_root_invalid
+lock_file=$lock_directory/restore-$lock_id.lock
+if [ ! -e "$lock_file" ]; then
+    (umask 077; set -C; : > "$lock_file") 2>/dev/null \
+        || [ -e "$lock_file" ] || fail restore_lock_failed
+fi
+[ -f "$lock_file" ] && [ ! -L "$lock_file" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' "$lock_file")" = "$lock_uid:$lock_gid:600:1" ] \
+    || fail restore_lock_failed
+exec 9>>"$lock_file"
 flock -n 9 || fail restore_lock_busy
 
 HOST_UID=$(id -u)

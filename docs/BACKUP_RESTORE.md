@@ -27,6 +27,13 @@ sudo install -d -o root -g root -m 0700 \
   /srv/nvidia-build-lb-manifest/manifest
 ```
 
+Backup and restore each hold an exclusive FD-backed lock in the persistent
+root-owned mode-`0700` directory `/run/lock/nvidia-build-lb`. Lock files are
+mode `0600` and deliberately remain in place after the process exits; unlinking
+a contended lock pathname would allow a new inode to bypass the active lock.
+`NBLB_OPERATION_LOCK_DIR` is reserved for isolated QA and must name an absolute
+mode-`0700` directory owned by the invoking UID/GID.
+
 ## Quiesced backup
 
 The backup contract is deliberately quiesced: stop the application first so

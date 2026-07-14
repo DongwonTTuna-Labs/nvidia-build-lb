@@ -20,6 +20,7 @@ PRIMARY_SECRET_DIR=""
 RESTORE_SECRET_DIR=""
 BAD_SECRET_DIR=""
 CLIENT_DIR=""
+OPERATION_LOCK_DIR=""
 BACKUP_BASE=""
 PRIMARY_STARTED=0
 RESTORE_STARTED=0
@@ -326,6 +327,8 @@ PRIMARY_SECRET_DIR=$(mktemp -d /tmp/nblb-todo7-primary-secrets.XXXXXX)
 RESTORE_SECRET_DIR=$(mktemp -d /tmp/nblb-todo7-restore-secrets.XXXXXX)
 BAD_SECRET_DIR=$(mktemp -d /tmp/nblb-todo7-bad-secrets.XXXXXX)
 CLIENT_DIR=$(mktemp -d /tmp/nblb-todo7-client.XXXXXX)
+OPERATION_LOCK_DIR=$CLIENT_DIR/operation-locks
+mkdir -m 0700 "$OPERATION_LOCK_DIR"
 BACKUP_BASE=$(mktemp -d /tmp/nblb-todo7-backup.XXXXXX)
 mkdir "$BACKUP_BASE/database" "$BACKUP_BASE/key" "$BACKUP_BASE/manifest"
 root_helper --mount "type=bind,source=$BACKUP_BASE,target=/backup" \
@@ -567,7 +570,7 @@ primary_compose stop app >/dev/null
 primary_app=$(primary_compose ps -a -q app)
 primary_db=$(primary_compose ps -q db)
 backup_id="todo7-${RUN_ID,,}"
-"$ROOT/scripts/ops/backup.sh" \
+NBLB_OPERATION_LOCK_DIR="$OPERATION_LOCK_DIR" "$ROOT/scripts/ops/backup.sh" \
     --db-container "$primary_db" --app-container "$primary_app" \
     --helper-image "$IMAGE_DIGEST" \
     --vault-key-file "$PRIMARY_SECRET_DIR/vault_master_key" \
@@ -588,7 +591,7 @@ RESTORE_STARTED=1
 restore_compose up --detach db
 wait_healthy restore db
 restore_db=$(restore_compose ps -q db)
-"$ROOT/scripts/ops/restore.sh" \
+NBLB_OPERATION_LOCK_DIR="$OPERATION_LOCK_DIR" "$ROOT/scripts/ops/restore.sh" \
     --db-container "$restore_db" --helper-image "$IMAGE_DIGEST" \
     --database-directory "$BACKUP_BASE/database/$backup_id" \
     --key-directory "$BACKUP_BASE/key/$backup_id" \
