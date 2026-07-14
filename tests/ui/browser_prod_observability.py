@@ -33,8 +33,8 @@ class _ResponseLike(Protocol):
 class ProductionNetworkAudit:
     def __init__(self) -> None:
         self._phase: str = "unclassified"
-        self._items: list[tuple[int, BrowserNetworkProjection]] = []
-        self._response_request_ids: set[int] = set()
+        self._items: list[tuple[_RequestLike, BrowserNetworkProjection]] = []
+        self._response_requests: list[_RequestLike] = []
 
     def set_phase(self, phase: str) -> None:
         self._phase = phase
@@ -56,11 +56,11 @@ class ProductionNetworkAudit:
 
     def observe_response(self, response: _ResponseLike) -> None:
         path, query_present = self._safe_path(response.url)
-        request_id = id(response.request)
-        self._response_request_ids.add(request_id)
+        request = response.request
+        self._response_requests.append(request)
         self._items.append(
             (
-                request_id,
+                request,
                 BrowserNetworkProjection(
                     phase=self._phase,
                     method=response.request.method,
@@ -76,7 +76,7 @@ class ProductionNetworkAudit:
         path, query_present = self._safe_path(request.url)
         self._items.append(
             (
-                id(request),
+                request,
                 BrowserNetworkProjection(
                     phase=self._phase,
                     method=request.method,
@@ -91,8 +91,9 @@ class ProductionNetworkAudit:
     def verified(self) -> tuple[BrowserNetworkProjection, ...]:
         items = tuple(
             item
-            for request_id, item in self._items
-            if not item.failed or request_id not in self._response_request_ids
+            for request, item in self._items
+            if not item.failed
+            or not any(request is response_request for response_request in self._response_requests)
         )
         if any(item.query_present for item in items):
             reason = "browser QA observed a query-bearing request"

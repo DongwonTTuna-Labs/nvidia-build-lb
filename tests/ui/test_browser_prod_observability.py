@@ -1,3 +1,5 @@
+import gc
+import weakref
 from dataclasses import dataclass
 
 from .browser_prod_observability import ProductionNetworkAudit
@@ -19,6 +21,34 @@ class _Response:
     @property
     def url(self) -> str:
         return self.request.url
+
+
+@dataclass(frozen=True)
+class _WeakRequest:
+    method: str
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
+class _WeakResponse:
+    request: _WeakRequest
+    status: int
+
+    @property
+    def url(self) -> str:
+        return self.request.url
+
+
+def test_answered_request_identity_is_retained_until_projection_verification() -> None:
+    audit = ProductionNetworkAudit()
+    answered = _WeakRequest(method="GET", url="http://127.0.0.1:2456/health")
+    answered_reference = weakref.ref(answered)
+
+    audit.observe_response(_WeakResponse(request=answered, status=200))
+    del answered
+    _ = gc.collect()
+
+    assert answered_reference() is not None
 
 
 def test_answered_request_failure_is_removed_from_verified_projection() -> None:

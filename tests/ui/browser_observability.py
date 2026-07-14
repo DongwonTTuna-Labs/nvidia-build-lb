@@ -70,8 +70,8 @@ def _enable_cdp_domain(session: _CdpSender, domain: str) -> None:
 class PageAudit:
     __slots__ = (
         "_cdp",
-        "_request_failures_with_ids",
-        "_response_request_ids",
+        "_request_failures_with_requests",
+        "_response_requests",
         "browser_logs",
         "page_console_calls",
         "page_errors",
@@ -85,8 +85,10 @@ class PageAudit:
 
     def __init__(self) -> None:
         self._cdp: CDPSession | None = None
-        self._request_failures_with_ids: list[tuple[int, RequestFailureObservation]] = []
-        self._response_request_ids: set[int] = set()
+        self._request_failures_with_requests: list[
+            tuple[_RequestMethod, RequestFailureObservation]
+        ] = []
+        self._response_requests: list[_RequestMethod] = []
         self.browser_logs: list[BrowserLogObservation] = []
         self.page_console_calls: list[PhaseKind] = []
         self.page_errors: list[str] = []
@@ -107,8 +109,8 @@ class PageAudit:
     def unanswered_request_failures(self) -> tuple[RequestFailureObservation, ...]:
         return tuple(
             observation
-            for request_id, observation in self._request_failures_with_ids
-            if request_id not in self._response_request_ids
+            for request, observation in self._request_failures_with_requests
+            if not any(request is response_request for response_request in self._response_requests)
         )
 
     def attach(self, page: Page) -> None:
@@ -162,7 +164,7 @@ class PageAudit:
         self.page_errors.append(self.phase)
 
     def observe_response(self, response: _ResponseRequest) -> None:
-        self._response_request_ids.add(id(response.request))
+        self._response_requests.append(response.request)
         self.response_count += 1
 
     def observe_request(self, request: _RequestMethod) -> None:
@@ -175,7 +177,7 @@ class PageAudit:
             method=request.method,
         )
         self.request_failures.append(observation)
-        self._request_failures_with_ids.append((id(request), observation))
+        self._request_failures_with_requests.append((request, observation))
 
     def observe_runtime_console(self, payload: _CdpValue) -> None:
         event = _RuntimeConsolePayload.model_validate(payload)

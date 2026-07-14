@@ -1,3 +1,5 @@
+import gc
+import weakref
 from dataclasses import dataclass
 from typing import Never, final
 
@@ -196,3 +198,15 @@ def test_page_audit_never_reads_console_content_or_full_failed_request_url() -> 
         RequestFailureObservation(phase="offline_refresh", method="GET")
     ]
     assert audit.unanswered_request_failures() == ()
+
+
+def test_page_audit_retains_answered_request_identity_until_evaluation() -> None:
+    audit = PageAudit()
+    request = _UrlPoisonedRequest()
+    request_reference = weakref.ref(request)
+
+    audit.observe_response(_ContentPoisonedResponse(request=request))
+    del request
+    _ = gc.collect()
+
+    assert request_reference() is not None
