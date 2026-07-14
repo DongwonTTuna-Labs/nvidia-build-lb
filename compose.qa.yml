@@ -1,0 +1,253 @@
+services:
+  db:
+    image: ${NBLB_POSTGRES_IMAGE:?candidate postgres image required}
+    environment:
+      POSTGRES_DB: nvidia_build_lb
+      POSTGRES_USER: nvidia_build_lb
+      PGDATA: /var/lib/postgresql/data/pgdata
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
+      nvidia-build-lb.backup-source: ${NBLB_BACKUP_SOURCE:-true}
+      nvidia-build-lb.restore-isolated: ${NBLB_RESTORE_ISOLATED:-false}
+    secrets:
+      - source: db_password
+        target: /run/canonical-secrets/db_password
+        mode: 0400
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    tmpfs:
+      - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m,mode=0775,uid=70,gid=70
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - SETPCAP
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/bin/setpriv", "--reuid=70", "--regid=70", "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "--no-new-privs", "/usr/local/bin/nblb-healthcheck", "70", "70", "postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks:
+      - qa
+    restart: "no"
+    stop_grace_period: 30s
+
+  migrate:
+    image: ${NBLB_CANDIDATE_IMAGE:?candidate image required}
+    environment:
+      NVIDIA_BUILD_LB_MODE: migrate
+      NVIDIA_BUILD_LB_DATABASE_URL: postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb
+      NVIDIA_BUILD_LB_DATABASE_PASSWORD_FILE: /run/nvidia-build-lb/secrets/db_password
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
+    secrets:
+      - source: db_password
+        target: /run/canonical-secrets/db_password
+        mode: 0400
+    tmpfs:
+      - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - SETPCAP
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - qa
+    restart: "no"
+    stop_grace_period: 30s
+
+  fake-nvidia:
+    image: ${NBLB_CANDIDATE_IMAGE:?candidate image required}
+    entrypoint: ["/usr/local/bin/nblb-fake-entrypoint"]
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
+    secrets:
+      - source: qa_server_cert
+        target: /run/qa-canonical/server_cert
+        mode: 0400
+      - source: qa_server_key
+        target: /run/qa-canonical/server_key
+        mode: 0400
+    configs:
+      - source: fake_entrypoint
+        target: /usr/local/bin/nblb-fake-entrypoint
+        mode: 0555
+      - source: fake_server
+        target: /qa/fake_nvidia_tls.py
+        mode: 0444
+    tmpfs:
+      - /run/nvidia-build-lb/qa-tls:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - SETPCAP
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    healthcheck:
+      test: ["CMD", "/usr/bin/setpriv", "--reuid=65532", "--regid=65532", "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "--no-new-privs", "/usr/local/bin/nblb-healthcheck", "65532", "65532", "fake"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    networks:
+      qa:
+        aliases:
+          - integrate.api.nvidia.com
+    restart: "no"
+
+  app:
+    image: ${NBLB_CANDIDATE_IMAGE:?candidate image required}
+    environment:
+      NVIDIA_BUILD_LB_MODE: app
+      NVIDIA_BUILD_LB_DATABASE_URL: postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb
+      NVIDIA_BUILD_LB_DATABASE_PASSWORD_FILE: /run/nvidia-build-lb/secrets/db_password
+      NVIDIA_BUILD_LB_ADMIN_TOKEN_FILE: /run/nvidia-build-lb/secrets/admin_token
+      NVIDIA_BUILD_LB_VAULT_KEY_FILE: /run/nvidia-build-lb/secrets/vault_master_key
+      SSL_CERT_FILE: /run/qa-ca/ca_cert
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
+    secrets:
+      - source: admin_token
+        target: /run/canonical-secrets/admin_token
+        mode: 0400
+      - source: vault_master_key
+        target: /run/canonical-secrets/vault_master_key
+        mode: 0400
+      - source: db_password
+        target: /run/canonical-secrets/db_password
+        mode: 0400
+    configs:
+      - source: qa_ca_cert
+        target: /run/qa-ca/ca_cert
+        mode: 0444
+    tmpfs:
+      - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - SETPCAP
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      fake-nvidia:
+        condition: service_healthy
+    networks:
+      - qa
+    restart: "no"
+    stop_grace_period: 30s
+
+  loopback:
+    image: ${NBLB_CANDIDATE_IMAGE:?candidate image required}
+    entrypoint: ["/usr/local/bin/nblb-loopback-entrypoint"]
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
+    configs:
+      - source: loopback_entrypoint
+        target: /usr/local/bin/nblb-loopback-entrypoint
+        mode: 0555
+      - source: loopback_proxy
+        target: /qa/loopback_proxy.py
+        mode: 0444
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+      - SETPCAP
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=8m,mode=1777
+    healthcheck:
+      test: ["CMD", "/usr/bin/setpriv", "--reuid=65532", "--regid=65532", "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "--no-new-privs", "/usr/local/bin/nblb-healthcheck", "65532", "65532", "loopback"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    depends_on:
+      app:
+        condition: service_started
+    ports:
+      - 127.0.0.1:${NBLB_QA_PORT:-32456}:2456
+    networks:
+      - qa
+      - edge
+    restart: "no"
+    stop_grace_period: 5s
+
+secrets:
+  admin_token:
+    file: ${NBLB_QA_SECRET_DIR:?secret directory required}/admin_token
+  vault_master_key:
+    file: ${NBLB_QA_SECRET_DIR:?secret directory required}/vault_master_key
+  db_password:
+    file: ${NBLB_QA_SECRET_DIR:?secret directory required}/db_password
+  qa_server_cert:
+    file: ${NBLB_QA_SECRET_DIR:?secret directory required}/server_cert
+  qa_server_key:
+    file: ${NBLB_QA_SECRET_DIR:?secret directory required}/server_key
+
+configs:
+  fake_entrypoint:
+    file: ./scripts/qa/fake-entrypoint.sh
+  fake_server:
+    file: ./scripts/qa/fake_nvidia_tls.py
+  loopback_entrypoint:
+    file: ./scripts/qa/loopback-entrypoint.sh
+  loopback_proxy:
+    file: ./scripts/qa/loopback_proxy.py
+  qa_ca_cert:
+    file: ${NBLB_QA_SECRET_DIR:?secret directory required}/ca_cert
+
+networks:
+  qa:
+    internal: true
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
+  edge:
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
+
+volumes:
+  db-data:
+    labels:
+      nvidia-build-lb.task: ${NBLB_QA_TASK_LABEL:-todo6a-candidate}
+      nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}

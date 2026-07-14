@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Owner administration for NVIDIA Build LB." />
+  <title>NVIDIA Build LB administration</title>
+  <link href="/admin" rel="icon" />
+  <link href="/assets/admin.css" rel="stylesheet" />
+  <script defer="defer" src="/assets/admin.js" type="module"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to administration</a>
+  <div class="shell">
+    <aside class="rail">
+      <header class="identity">
+        <p class="product-name">NVIDIA Build LB</p>
+        <p class="notice">NVIDIA Build LB is an independent operations tool. It is not affiliated with, endorsed by, or sponsored by NVIDIA.</p>
+      </header>
+      <details class="navigation-disclosure" open="open">
+        <summary>Administration sections</summary>
+        <nav aria-label="Administration sections">
+          <a aria-current="page" href="#overview">Overview</a>
+          <a href="#upstream-keys">Upstream keys</a>
+          <a href="#downstream-tokens">Downstream tokens</a>
+          <a href="#events">Events</a>
+          <a href="/showcase">Primitive showcase</a>
+          <button class="control quiet" hidden="hidden" id="logout" type="button">Log out</button>
+        </nav>
+      </details>
+    </aside>
+    <main id="main-content" tabindex="-1">
+      <section id="auth-view" aria-labelledby="login-title">
+        <div id="login-slot"></div>
+      </section>
+      <section hidden="hidden" id="dashboard" aria-labelledby="dashboard-title">
+        <header class="page-heading">
+          <p class="metadata">Owner-only loopback administration</p>
+          <h1 id="dashboard-title" tabindex="-1">Gateway operations</h1>
+          <p>Inspect safe state, then take the smallest reversible action.</p>
+        </header>
+        <div class="error-panel" hidden="hidden" id="global-error" role="alert" tabindex="-1">
+          <p class="state-label">ERR · Request failed</p>
+          <p id="global-error-message"></p>
+          <button class="control destructive" id="retry-dashboard" type="button">Retry safe request</button>
+        </div>
+        <div class="stale-panel" hidden="hidden" id="stale-warning" role="status">
+          <p><strong>STALE · Prior safe data.</strong> The refresh failed; values below are not current.</p>
+        </div>
+        <section class="summary" id="overview" aria-labelledby="overview-heading" aria-busy="true">
+          <div class="section-heading"><div><p class="metadata">Current state</p><h2 id="overview-heading">Overview</h2><p id="generated-at">Loading safe summary…</p></div><button class="control secondary" id="refresh-dashboard" type="button">Refresh safe state</button></div>
+          <dl class="summary-grid">
+            <div><dt>Gateway readiness</dt><dd id="gateway-status">Loading</dd></div>
+            <div><dt>Eligible keys</dt><dd id="eligible-count">Not available</dd></div>
+            <div><dt>Cooling keys</dt><dd id="cooling-count">Not available</dd></div>
+            <div><dt>Logical attempts</dt><dd id="request-count">Not available</dd></div>
+            <div><dt>Last event/freshness</dt><dd id="last-event-at">Not available</dd></div>
+          </dl>
+        </section>
+        <section id="upstream-keys" aria-labelledby="upstream-heading" aria-busy="true">
+          <div class="section-heading"><div><p class="metadata">Encrypted upstream vault</p><h2 id="upstream-heading" tabindex="-1">Upstream keys</h2></div><div><p>Plaintext is accepted once and never rendered after submission.</p><button class="control primary" id="add-upstream" type="button">Add upstream key</button></div></div>
+          <table><caption>Upstream keys</caption><thead><tr><th scope="col">Key</th><th scope="col">Routing</th><th scope="col">Health</th><th scope="col">Counters</th><th scope="col">Last observation</th><th scope="col">Actions</th></tr></thead><tbody id="upstream-body"><tr><td colspan="6">Loading upstream keys…</td></tr></tbody></table>
+        </section>
+        <section id="downstream-tokens" aria-labelledby="downstream-heading" aria-busy="true">
+          <div class="section-heading"><div><p class="metadata">Scoped local clients</p><h2 id="downstream-heading" tabindex="-1">Downstream tokens</h2><p>Active clients: <strong id="active-token-count">Not available</strong></p></div><div><p>Issued credentials are shown once; lists remain digest-free.</p><button class="control primary" id="issue-downstream" type="button">Issue downstream token</button></div></div>
+          <table><caption>Downstream tokens</caption><thead><tr><th scope="col">Client</th><th scope="col">Scopes</th><th scope="col">State</th><th scope="col">Usage</th><th scope="col">Actions</th></tr></thead><tbody id="downstream-body"><tr><td colspan="5">Loading downstream tokens…</td></tr></tbody></table>
+        </section>
+        <section id="events" aria-labelledby="events-heading" aria-busy="true">
+          <div class="section-heading"><div><p class="metadata">Newest 100</p><h2 id="events-heading">Events</h2></div><p>Only opaque IDs, internal resource IDs, safe classes, latency, and time are shown.</p></div>
+          <table><caption>Recent events</caption><thead><tr><th scope="col">Event</th><th scope="col">Request</th><th scope="col">Resource</th><th scope="col">Outcome</th><th scope="col">Observed</th></tr></thead><tbody id="events-body"><tr><td colspan="5">Loading recent events…</td></tr></tbody></table>
+        </section>
+      </section>
+    </main>
+  </div>
+  <footer><p>Copyright 2026 DongwonTTuna-Labs. Independent implementation; third-party names remain the property of their respective owners.</p></footer>
+
+  <template id="login-template">
+    <form class="login-form" id="login-form" novalidate="novalidate">
+      <p class="metadata">Per-tab credential custody</p>
+      <h1 id="login-title">Authenticate locally</h1>
+      <p>The admin bearer stays only in this tab's JavaScript memory. Reload and logout erase it.</p>
+      <div class="error-panel" hidden="hidden" id="login-error" role="alert" tabindex="-1"><p>Authentication failed. Enter the current admin bearer and try again.</p></div>
+      <label for="admin-bearer">Admin bearer</label>
+      <input aria-describedby="admin-bearer-help" autocomplete="off" id="admin-bearer" name="admin-bearer" required="required" spellcheck="false" type="password" />
+      <p class="helper" id="admin-bearer-help">Never place this value in a URL, cookie, or saved browser storage.</p>
+      <button class="control primary" id="login-submit" type="submit">Open administration</button>
+    </form>
+  </template>
+
+  <dialog aria-describedby="upstream-description" aria-labelledby="upstream-title" id="upstream-dialog">
+    <form id="upstream-form" method="dialog" novalidate="novalidate">
+      <h2 id="upstream-title">Add upstream key</h2>
+      <p id="upstream-description">The key is encrypted and created disabled. It will not be shown again.</p>
+      <div class="error-panel" hidden="hidden" id="upstream-error" role="alert" tabindex="-1"></div>
+      <label for="upstream-key">NVIDIA hosted API key</label>
+      <input aria-describedby="upstream-key-help" autocomplete="off" id="upstream-key" name="upstream-key" required="required" spellcheck="false" type="password" />
+      <p class="helper" id="upstream-key-help">Probe the disabled key before enabling routing.</p>
+      <div class="dialog-actions"><button class="control secondary" data-close="upstream-dialog" type="button">Cancel</button><button class="control primary" id="submit-upstream" type="submit">Add disabled key</button></div>
+    </form>
+  </dialog>
+
+  <dialog aria-describedby="confirm-description" aria-labelledby="confirm-title" id="confirm-dialog">
+    <h2 id="confirm-title" tabindex="-1">Confirm action</h2><p id="confirm-description"></p>
+    <div class="error-panel" hidden="hidden" id="confirm-error" role="alert" tabindex="-1"></div>
+    <div class="dialog-actions"><button class="control secondary" data-close="confirm-dialog" type="button">Cancel</button><button class="control destructive" id="confirm-action" type="button">Confirm action</button></div>
+  </dialog>
+
+  <dialog aria-describedby="downstream-description" aria-labelledby="downstream-title" id="downstream-dialog">
+    <form id="downstream-form" method="dialog" novalidate="novalidate">
+      <h2 id="downstream-title">Issue downstream token</h2><p id="downstream-description">Choose the minimum exact scopes. The bearer is available once.</p>
+      <div class="error-panel" hidden="hidden" id="downstream-error" role="alert" tabindex="-1"></div>
+      <label for="downstream-label">Unique client label</label><input autocomplete="off" id="downstream-label" maxlength="128" required="required" spellcheck="false" type="text" />
+      <fieldset><legend>Exact scopes</legend><label><input name="scope" type="checkbox" value="models:read" /> Read models</label><label><input name="scope" type="checkbox" value="chat:write" /> Write chat</label></fieldset>
+      <div class="dialog-actions"><button class="control secondary" data-close="downstream-dialog" type="button">Cancel</button><button class="control primary" id="submit-downstream" type="submit">Issue once</button></div>
+    </form>
+  </dialog>
+
+  <dialog aria-describedby="credential-description" aria-labelledby="credential-title" id="credential-dialog">
+    <h2 id="credential-title" tabindex="-1">Store this credential now</h2><p id="credential-description">It cannot be recovered after dismissal.</p>
+    <code class="credential" id="one-time-token"></code>
+    <div class="error-panel" hidden="hidden" id="clipboard-error" role="alert" tabindex="-1"><p>Clipboard cleanup failed. Clear the clipboard before visual capture or logout.</p></div>
+    <div class="dialog-actions"><button class="control secondary" id="copy-token" type="button">Copy credential</button><button class="control primary" id="dismiss-token" type="button">Dismiss and clear</button></div>
+  </dialog>
+  <p aria-live="polite" class="visually-hidden" id="live-region"></p>
+</body>
+</html>

@@ -1,0 +1,131 @@
+[project]
+name = "nvidia-build-lb"
+version = "0.1.0"
+description = "NVIDIA Build hosted API load balancer"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = "MIT"
+authors = [{ name = "DongwonTTuna-Labs" }]
+dependencies = [
+    "alembic>=1.16,<2",
+    "anyio>=4.10,<5",
+    "asyncpg>=0.30,<1",
+    "cryptography>=48.0.1,<49",
+    "fastapi>=0.116,<1",
+    "httpx2[brotli,http2,zstd]>=2.5,<3",
+    "orjson>=3.10,<4",
+    "psycopg[binary]>=3.2,<4",
+    "pydantic>=2.11,<3",
+    "pydantic-settings>=2.10,<3",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "uvicorn[standard]>=0.35,<1",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.24,<0.12"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.31,<2",
+    "openai>=1.99,<3",
+    "pip-audit==2.9.0",
+    "playwright==1.61.0",
+    "pytest>=8.4,<10",
+    "pytest-cov>=6,<8",
+    "ruff>=0.12,<1",
+    "testcontainers[postgres]>=4.12,<5",
+]
+
+[tool.uv]
+package = true
+
+[tool.basedpyright]
+typeCheckingMode = "all"
+pythonVersion = "3.13"
+pythonPlatform = "All"
+include = ["src", "tests", "migrations"]
+exclude = ["**/__pycache__", "**/.venv", "**/build", "**/dist"]
+reportAny = "error"
+reportExplicitAny = "error"
+reportMissingParameterType = "error"
+reportPrivateUsage = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportUnusedCallResult = "error"
+reportUnusedVariable = "error"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests", "migrations"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "CPY001",
+    "D203",
+    "D213",
+    "FBT001",
+    "FBT002",
+    "FIX002",
+    "ISC001",
+    "TD002",
+    "TD003",
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ARG", "D", "PLR2004", "S101", "SLF001"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Cookie",
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Query",
+]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"asyncio".msg = "Use AnyIO structured concurrency."
+"typing.Any".msg = "Use a precise type instead of Any."
+"typing.cast".msg = "Redesign the types instead of casting."
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+filterwarnings = ["error"]
+markers = [
+    "vault_auth: PostgreSQL vault and authentication contracts",
+    "nvidia_routing: NVIDIA wire, polling, streaming, and routing contracts",
+    "ui_fake: deterministic fake-contract browser journeys",
+    "api: composed public and administration API contracts",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]

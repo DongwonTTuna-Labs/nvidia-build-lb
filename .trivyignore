@@ -1,0 +1,3 @@
+# DS-0002 is intentionally limited to the two bounded root prestarts. Runtime QA
+# proves the steady-state UID, groups, capabilities, and NoNewPrivs contract.
+DS-0002

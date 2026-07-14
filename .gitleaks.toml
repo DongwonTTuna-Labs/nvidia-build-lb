@@ -1,0 +1,13 @@
+title = "nvidia-build-lb release scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated and local-only paths never enter the publication surface"
+paths = [
+  '''(^|/)\.omo/''',
+  '''(^|/)\.venv/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.git/''',
+]

@@ -1,0 +1,82 @@
+"""Injected dependencies for the composed public and administration API."""
+
+from dataclasses import dataclass
+from typing import Protocol
+from uuid import UUID
+
+from sqlalchemy.exc import SQLAlchemyError
+
+from nvidia_build_lb.admin_credentials import CredentialServices
+from nvidia_build_lb.credential_protocols import CredentialRepositorySurface
+from nvidia_build_lb.logging import ServiceLogger
+from nvidia_build_lb.routing import RoutedResult
+from nvidia_build_lb.streaming import ChatStreamResponder
+
+
+class ReadinessProbe(Protocol):
+    """Report current database-backed request readiness."""
+
+    async def is_ready(self) -> bool:
+        """Return true only when new requests may be accepted."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryReadinessProbe:
+    """Project health readiness from the same repository overview as admin."""
+
+    repositories: CredentialRepositorySurface
+
+    async def is_ready(self) -> bool:
+        """Return the current repository-backed overview readiness."""
+        try:
+            return (await self.repositories.overview()).ready
+        except (OSError, SQLAlchemyError):
+            return False
+
+
+class PublicChatRouter(Protocol):
+    """Route one validated public chat request."""
+
+    async def execute(
+        self,
+        *,
+        request_id: str,
+        body: bytes,
+        requested_stream: bool = False,
+        explicit_probe_key_id: UUID | None = None,
+    ) -> RoutedResult:
+        """Return one fully classified routed result."""
+        ...
+
+
+class ChatResponderFactory(Protocol):
+    """Create request-scoped terminal arbitration state."""
+
+    def create(self, stream_log: "StreamLogContext | None" = None) -> ChatStreamResponder:
+        """Return a fresh responder for one routed result."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class StreamLogContext:
+    """Safe routed identity needed to log a durable live-stream terminal."""
+
+    key_id: UUID
+    attempt_ordinal: int
+
+    def __post_init__(self) -> None:
+        """Reject a context that cannot identify a real routed attempt."""
+        if self.attempt_ordinal < 1:
+            raise ValueError
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicationServices:
+    """Complete injected service graph used by HTTP composition."""
+
+    credentials: CredentialServices
+    routing: PublicChatRouter
+    responders: ChatResponderFactory
+    readiness: ReadinessProbe
+    logger: ServiceLogger

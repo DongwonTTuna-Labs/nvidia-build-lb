@@ -1,0 +1,7 @@
+{
+  "name": "nvidia-build-lb-qa",
+  "private": true,
+  "devDependencies": {
+    "lighthouse": "13.4.0"
+  }
+}

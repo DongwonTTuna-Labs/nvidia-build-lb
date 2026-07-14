@@ -1,0 +1,10 @@
+.git
+.omo
+.pytest_cache
+.ruff_cache
+.venv
+**/__pycache__
+**/*.pyc
+tests
+docs
+DESIGN.md
