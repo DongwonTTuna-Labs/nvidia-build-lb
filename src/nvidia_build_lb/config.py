@@ -137,6 +137,8 @@ class Settings(BaseModel):
 
     def safe_metadata(self) -> SettingsMetadata:
         """Return the only settings representation permitted in evidence."""
+        maintenance_interval = self.admin_ledger_maintenance_interval_seconds
+        reconciliation_grace = self.admin_attempt_reconciliation_grace_seconds
         return SettingsMetadata(
             base_url=NVIDIA_BASE_URL,
             model=NVIDIA_MODEL,
@@ -150,12 +152,8 @@ class Settings(BaseModel):
             admin_event_max_rows=self.admin_event_max_rows,
             admin_attempt_max_rows=self.admin_attempt_max_rows,
             admin_ledger_prune_batch_size=self.admin_ledger_prune_batch_size,
-            admin_ledger_maintenance_interval_seconds=(
-                self.admin_ledger_maintenance_interval_seconds
-            ),
-            admin_attempt_reconciliation_grace_seconds=(
-                self.admin_attempt_reconciliation_grace_seconds
-            ),
+            admin_ledger_maintenance_interval_seconds=maintenance_interval,
+            admin_attempt_reconciliation_grace_seconds=reconciliation_grace,
         )
 
 
@@ -202,6 +200,8 @@ def load_settings(source: SettingsSource | None = None) -> Settings:
     ):
         raise ConfigurationError(code=ConfigurationErrorCode.ADMIN_TOKEN_INVALID)
 
+    maintenance_interval = boundary.admin_ledger_maintenance_interval_seconds
+    reconciliation_grace = boundary.admin_attempt_reconciliation_grace_seconds
     return Settings(
         database_url=database_url,
         vault_key=SecretBytes(vault_key),
@@ -215,12 +215,8 @@ def load_settings(source: SettingsSource | None = None) -> Settings:
         admin_event_max_rows=boundary.admin_event_max_rows,
         admin_attempt_max_rows=boundary.admin_attempt_max_rows,
         admin_ledger_prune_batch_size=boundary.admin_ledger_prune_batch_size,
-        admin_ledger_maintenance_interval_seconds=(
-            boundary.admin_ledger_maintenance_interval_seconds
-        ),
-        admin_attempt_reconciliation_grace_seconds=(
-            boundary.admin_attempt_reconciliation_grace_seconds
-        ),
+        admin_ledger_maintenance_interval_seconds=maintenance_interval,
+        admin_attempt_reconciliation_grace_seconds=reconciliation_grace,
     )
 
 
