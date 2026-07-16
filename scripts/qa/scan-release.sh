@@ -148,6 +148,8 @@ mapfile -t python_base_images < <(
     && [ "${python_base_images[0]}" = "${python_base_images[1]}" ] \
     || fail python_base_image_contract_invalid
 PYTHON_BASE_IMAGE=${python_base_images[0]}
+docker pull "$PYTHON_BASE_IMAGE" >/dev/null \
+    || fail python_base_image_unavailable
 docker image inspect --format '{{json .Config}}' "$PYTHON_BASE_IMAGE" \
     > "$TEMP_DIR/metadata-raw/base-image-config.json" \
     || fail python_base_image_unavailable

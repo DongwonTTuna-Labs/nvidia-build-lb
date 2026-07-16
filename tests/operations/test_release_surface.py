@@ -1115,6 +1115,15 @@ def test_local_verifier_and_release_scanner_own_evidence_and_cleanup() -> None:
     assert "uses:" in scan
 
 
+def test_release_scanner_materializes_pinned_python_base_before_inspection() -> None:
+    scan = _text("scripts/qa/scan-release.sh")
+    pull = 'docker pull "$PYTHON_BASE_IMAGE"'
+    inspect = "docker image inspect --format '{{json .Config}}' \"$PYTHON_BASE_IMAGE\""
+
+    assert pull in scan
+    assert scan.index(pull) < scan.index(inspect)
+
+
 def test_local_verifier_probes_before_enable_and_persists_stage_contracts() -> None:
     verify = _text("scripts/qa/verify-local.sh")
     stage_evidence = _text("scripts/qa/admin-stage-evidence.sh")
