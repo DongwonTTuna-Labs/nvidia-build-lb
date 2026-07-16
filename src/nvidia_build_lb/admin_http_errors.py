@@ -13,11 +13,13 @@ from nvidia_build_lb.admin_ledger import (
     LedgerCapacityExhaustedError,
     LedgerStateUnavailableError,
 )
+from nvidia_build_lb.api_errors import routed_failure
 from nvidia_build_lb.credential_types import (
     InvalidAdminRequestError,
     ResourceConflictError,
     ResourceNotFoundError,
 )
+from nvidia_build_lb.probe_errors import ProbeNotExecutedError
 from nvidia_build_lb.request_id import request_id_from
 from nvidia_build_lb.schemas import ErrorEnvelope
 from nvidia_build_lb.server_error_boundary import (
@@ -82,6 +84,10 @@ def register_credential_error_handlers(app: FastAPI) -> None:
             request_id_from(request),
         )
 
+    @app.exception_handler(ProbeNotExecutedError)
+    async def _probe_not_executed(request: Request, error: ProbeNotExecutedError) -> Response:
+        return routed_failure(error.terminal, request_id_from(request))
+
     @app.exception_handler(Exception)
     async def _internal_server_error(request: Request, error: Exception) -> Response:
         del error
@@ -97,6 +103,7 @@ def register_credential_error_handlers(app: FastAPI) -> None:
         _invalid_body,
         _database_unavailable,
         _database_connect_unavailable,
+        _probe_not_executed,
         _internal_server_error,
     )
 

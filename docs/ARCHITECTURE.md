@@ -69,7 +69,7 @@ Every route in this table requires the distinct admin bearer.
 | `POST /admin/api/v1/upstream-keys` | `201 application/json`; new key is disabled |
 | `POST /admin/api/v1/upstream-keys/{id}/enable` | Idempotent `204` after current successful verification |
 | `POST /admin/api/v1/upstream-keys/{id}/disable` | Idempotent `204`, empty body |
-| `POST /admin/api/v1/upstream-keys/{id}/probe` | `200 application/json` single-key probe result |
+| `POST /admin/api/v1/upstream-keys/{id}/probe` | `200 application/json` single-key result only after a durable probe terminal |
 | `DELETE /admin/api/v1/upstream-keys/{id}` | `204` only while disabled |
 | `GET /admin/api/v1/downstream-tokens` | `200 application/json` digest-free token list |
 | `POST /admin/api/v1/downstream-tokens` | `201 application/json`; plaintext bearer appears once |
@@ -90,6 +90,11 @@ only `id`, `enabled`, `probe_status`, and `observed_at`, where `probe_status` is
 one of `valid`, `invalid_credential`, `rate_limited`, or
 `upstream_unavailable`. A valid probe clears health failures and cooldown. A
 negative probe applies the same-key transition in section 6.
+Only a durably reserved probe with a committed terminal returns that four-field
+`200` projection. A reservation or admission failure before any durable attempt
+returns its mapped safe `503` error envelope (`ledger_capacity_exhausted` or
+`database_unavailable`) and records neither a probe result nor a same-key
+transition.
 
 Admin list fields are closed allowlists:
 

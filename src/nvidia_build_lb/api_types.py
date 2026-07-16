@@ -9,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from nvidia_build_lb.active_routed_requests import ActiveRoutedRequestRegistry
 from nvidia_build_lb.admin_credentials import CredentialServices
+from nvidia_build_lb.admin_ledger import LedgerStateUnavailableError
 from nvidia_build_lb.credential_protocols import CredentialRepositorySurface
 from nvidia_build_lb.logging import ServiceLogger
 from nvidia_build_lb.routing import RoutedResult, RoutedStream
@@ -35,7 +36,7 @@ class RepositoryReadinessProbe:
         try:
             with anyio.fail_after(self.deadline_seconds):
                 return (await self.repositories.overview()).ready
-        except (OSError, SQLAlchemyError, TimeoutError):
+        except (LedgerStateUnavailableError, OSError, SQLAlchemyError, TimeoutError):
             return False
 
 

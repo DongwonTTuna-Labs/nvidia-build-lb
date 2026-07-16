@@ -1,6 +1,7 @@
 """Production API behavior, safe mapping, correlation, and redaction tests."""
 
 from dataclasses import dataclass, replace
+from uuid import UUID
 
 import anyio
 import pytest
@@ -12,13 +13,16 @@ from nvidia_build_lb.admin.schemas import (
     AdminOverviewRead,
     LastStatusClass,
     OverviewStatus,
+    UpstreamProbeResponse,
 )
+from nvidia_build_lb.admin_ledger import LedgerStateUnavailableError
 from nvidia_build_lb.api_types import RepositoryReadinessProbe
 from nvidia_build_lb.logging import StructuredLogLine
 from nvidia_build_lb.main import create_app
 from nvidia_build_lb.outcome_types import SourceSignal
 from nvidia_build_lb.outcomes import (
     HttpStatusSignal,
+    LedgerCapacityExhausted,
     NoEligibleKey,
     PollDeadline,
     ProtocolFailure,
@@ -27,6 +31,8 @@ from nvidia_build_lb.outcomes import (
     TransportSignal,
     map_public_outcome,
 )
+from nvidia_build_lb.polling import FailureTerminal
+from nvidia_build_lb.probe_errors import ProbeNotExecutedError
 from nvidia_build_lb.scheduler_state import TerminalOutcome
 from tests.contracts._support import (
     ADMIN_TOKEN,
@@ -66,6 +72,15 @@ class _FailureCase:
     code: str
     retry_after: int | None = None
     keyed: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _RejectedProbe:
+    terminal: FailureTerminal
+
+    async def probe(self, key_id: UUID, request_id: str) -> UpstreamProbeResponse:
+        del key_id, request_id
+        raise ProbeNotExecutedError(self.terminal)
 
 
 def test_health_and_static_admin_are_composed(api_client: ContractClient) -> None:
@@ -158,12 +173,16 @@ def test_repository_readiness_probe_uses_admin_overview_repository(
 
 @pytest.mark.parametrize(
     "failure",
-    [pytest.param(OSError(), id="connect"), pytest.param(SQLAlchemyError(), id="sqlalchemy")],
+    [
+        pytest.param(OSError(), id="connect"),
+        pytest.param(SQLAlchemyError(), id="sqlalchemy"),
+        pytest.param(LedgerStateUnavailableError(), id="ledger-state"),
+    ],
 )
 def test_health_database_failure_is_exact_minimal_degraded_body(
     api_harness: ApiHarness,
     monkeypatch: pytest.MonkeyPatch,
-    failure: OSError | SQLAlchemyError,
+    failure: LedgerStateUnavailableError | OSError | SQLAlchemyError,
 ) -> None:
     repositories = api_harness.services.credentials.repositories
 
@@ -184,6 +203,39 @@ def test_health_database_failure_is_exact_minimal_degraded_body(
 
     assert response.status_code == 503
     assert response.content == b'{"status":"degraded","ready":false}'
+
+
+@pytest.mark.parametrize(
+    ("signal", "code"),
+    [
+        pytest.param(
+            LedgerCapacityExhausted(),
+            "ledger_capacity_exhausted",
+            id="ledger-capacity",
+        ),
+        pytest.param(ReservationFailure(), "database_unavailable", id="reservation"),
+    ],
+)
+def test_admin_probe_without_a_durable_attempt_is_safe_503(
+    api_harness: ApiHarness,
+    signal: SourceSignal,
+    code: str,
+) -> None:
+    terminal = FailureTerminal(map_public_outcome(signal), None)
+    credentials = replace(
+        api_harness.services.credentials,
+        probe=_RejectedProbe(terminal),
+    )
+    services = replace(api_harness.services, credentials=credentials)
+
+    with TestClient(create_app(services), base_url="http://127.0.0.1:2456") as client:
+        response = client.post(
+            f"/admin/api/v1/upstream-keys/{ENABLED_KEY_ID}/probe",
+            headers=bearer(ADMIN_TOKEN),
+        )
+
+    assert_error(response, status_code=503, code=code)
+    assert_security_headers(response)
 
 
 @pytest.mark.parametrize(

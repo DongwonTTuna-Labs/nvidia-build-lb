@@ -1245,6 +1245,15 @@ def test_operations_docs_keep_the_release_boundary_closed() -> None:
     assert trivy_exceptions == ["DS-0002"]
 
 
+def test_architecture_distinguishes_unadmitted_probe_from_terminal_projection() -> None:
+    architecture = _text("docs/ARCHITECTURE.md")
+    normalized = " ".join(architecture.split())
+
+    assert "only after a durable probe terminal" in normalized
+    assert "A reservation or admission failure before any durable attempt" in normalized
+    assert "records neither a probe result nor a same-key transition" in normalized
+
+
 def test_operator_probe_docs_name_evidence_and_withdraw_failed_rollback() -> None:
     backup = _text("docs/BACKUP_RESTORE.md")
     design = _text("DESIGN.md")

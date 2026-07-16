@@ -77,9 +77,13 @@ def test_chat_invalid_boundary_is_safe_422(contract_client: ContractClient) -> N
         pytest.param("max_tokens", "1", id="max-tokens-string"),
         pytest.param("max_tokens", True, id="max-tokens-boolean"),
         pytest.param("temperature", "0.5", id="temperature-string"),
+        pytest.param("temperature", True, id="temperature-boolean"),
         pytest.param("top_p", "0.5", id="top-p-string"),
+        pytest.param("top_p", False, id="top-p-boolean"),
         pytest.param("frequency_penalty", "0", id="frequency-penalty-string"),
+        pytest.param("frequency_penalty", True, id="frequency-penalty-boolean"),
         pytest.param("presence_penalty", "0", id="presence-penalty-string"),
+        pytest.param("presence_penalty", False, id="presence-penalty-boolean"),
         pytest.param("seed", "7", id="seed-string"),
         pytest.param("seed", False, id="seed-boolean"),
     ],
@@ -100,6 +104,33 @@ def test_chat_rejects_each_wrong_type_scalar_at_composed_boundary(
     )
 
     assert_error(response, status_code=422, code="invalid_request")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("temperature", 1, id="temperature-integer"),
+        pytest.param("top_p", 1, id="top-p-integer"),
+        pytest.param("frequency_penalty", 0, id="frequency-penalty-integer"),
+        pytest.param("presence_penalty", 0, id="presence-penalty-integer"),
+    ],
+)
+def test_chat_accepts_integer_json_numbers_for_float_parameters(
+    contract_client: ContractClient,
+    field: str,
+    value: int,
+) -> None:
+    body = _chat_body(stream=False)
+    body[field] = value
+
+    response = contract_client.request(
+        "POST",
+        "/v1/chat/completions",
+        headers=bearer(CHAT_TOKEN),
+        json_body=body,
+    )
+
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize(

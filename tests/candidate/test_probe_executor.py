@@ -14,9 +14,16 @@ from nvidia_build_lb.api_types import StreamLogContext
 from nvidia_build_lb.asgi_response import AsgiReceive, AsgiSend
 from nvidia_build_lb.attempt_types import AttemptIdentity, AttemptLease
 from nvidia_build_lb.header_types import MediaType, ValidatedUpstreamHeaders
-from nvidia_build_lb.outcomes import HttpStatusSignal, map_public_outcome
+from nvidia_build_lb.outcome_types import SourceSignal
+from nvidia_build_lb.outcomes import (
+    HttpStatusSignal,
+    LedgerCapacityExhausted,
+    ReservationFailure,
+    map_public_outcome,
+)
 from nvidia_build_lb.polling import FailureTerminal, NvidiaSSEStream, StreamTerminal
 from nvidia_build_lb.polling_types import PrimedSSEState
+from nvidia_build_lb.probe_errors import ProbeNotExecutedError
 from nvidia_build_lb.production_probe import RoutingProbeExecutor
 from nvidia_build_lb.routing import RoutedFailure, RoutedStream
 from nvidia_build_lb.sse import SSEFrameParser
@@ -64,6 +71,29 @@ class _FailureRouter:
         return RoutedFailure(
             FailureTerminal(map_public_outcome(HttpStatusSignal(self.status_code)), None),
             1,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _UnadmittedRouter:
+    signal: SourceSignal
+
+    async def cancel_unhanded_stream(self, routed: RoutedStream) -> None:
+        await routed.terminal.stream.aclose()
+
+    async def execute(
+        self,
+        *,
+        request_id: str,
+        body: bytes,
+        requested_stream: bool = False,
+        explicit_probe_key_id: UUID | None = None,
+    ) -> RoutedFailure:
+        del request_id, body, requested_stream
+        assert explicit_probe_key_id == _KEY_ID
+        return RoutedFailure(
+            FailureTerminal(map_public_outcome(self.signal), None),
+            0,
         )
 
 
@@ -204,6 +234,28 @@ async def test_probe_failure_uses_closed_safe_status(
 
     assert result.probe_status is expected
     assert upstream.observed == [expected]
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [
+        pytest.param(LedgerCapacityExhausted(), id="ledger-capacity"),
+        pytest.param(ReservationFailure(), id="reservation"),
+    ],
+)
+async def test_probe_without_a_durable_attempt_is_not_success_shaped(
+    signal: SourceSignal,
+) -> None:
+    upstream = _Upstream([])
+
+    with pytest.raises(ProbeNotExecutedError) as captured:
+        _ = await RoutingProbeExecutor(_UnadmittedRouter(signal), upstream).probe(
+            _KEY_ID,
+            "probe-not-admitted",
+        )
+
+    assert captured.value.terminal.outcome == map_public_outcome(signal)
+    assert upstream.observed == []
 
 
 @pytest.mark.parametrize(

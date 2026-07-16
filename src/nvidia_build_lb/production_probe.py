@@ -10,6 +10,7 @@ import orjson
 
 from nvidia_build_lb.admin.schemas import LastStatusClass, ProbeStatus, UpstreamProbeResponse
 from nvidia_build_lb.api_types import ChatResponderFactory, PublicChatRouter, StreamLogContext
+from nvidia_build_lb.probe_errors import ProbeNotExecutedError
 from nvidia_build_lb.routing import RoutedFailure, RoutedJson, RoutedStream
 
 _PROBE_BODY = orjson.dumps(
@@ -80,7 +81,10 @@ class RoutingProbeExecutor:
                 send=send,
             )
             return self._probe_status(persisted)
-        return self._probe_status(routed.terminal.outcome.persisted_status)
+        persisted = routed.terminal.outcome.persisted_status
+        if persisted is None:
+            raise ProbeNotExecutedError(routed.terminal)
+        return self._probe_status(persisted)
 
     @staticmethod
     def _probe_status(persisted: LastStatusClass | None) -> ProbeStatus:
