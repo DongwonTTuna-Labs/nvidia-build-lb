@@ -24,7 +24,7 @@ def _valid_database_password() -> bool:
 
 
 def _valid_admin_token() -> bool:
-    value = (_CANONICAL / "admin_token").read_bytes()
+    value = (_CANONICAL / "admin_token").read_bytes().removesuffix(b"\n")
     prefix = b"nblb_admin_"
     suffix = value.removeprefix(prefix)
     return (

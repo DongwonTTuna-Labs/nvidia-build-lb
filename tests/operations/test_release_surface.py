@@ -1468,6 +1468,79 @@ printf '%s\n' \
     ]
 
 
+def test_production_compose_gates_secret_override_to_isolated_restore(
+    tmp_path: Path,
+) -> None:
+    wrapper = _ROOT / "scripts/ops/production-compose.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    _ = fake_docker.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$NBLB_SECRET_DIR\"\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    canonical_directory = tmp_path / "canonical"
+    ambient_directory = tmp_path / "ambient"
+    restore_directory = tmp_path / "restore"
+    runtime_config = tmp_path / "runtime.env"
+    _ = runtime_config.write_text(
+        _runtime_config_text().replace(
+            "/opt/nvidia-build-lb/secrets",
+            str(canonical_directory),
+        ),
+        encoding="utf-8",
+    )
+    runtime_config.chmod(0o644)
+    runtime_lock = tmp_path / "runtime.env.lock"
+    _ = runtime_lock.write_text("", encoding="utf-8")
+    runtime_lock.chmod(0o644)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "NBLB_RUNTIME_CONFIG_FILE": str(runtime_config),
+            "NBLB_RESTORE_ISOLATED": "false",
+            "NBLB_SECRET_DIR": str(ambient_directory),
+        }
+    )
+
+    def run_wrapper() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - fixed local wrapper under test.
+            [wrapper, "config", "--quiet"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+    ordinary = run_wrapper()
+    assert ordinary.returncode == 0, ordinary.stderr
+    assert ordinary.stdout == f"{canonical_directory}\n"
+
+    environment["NBLB_RESTORE_ISOLATED"] = "true"
+    _ = environment.pop("NBLB_SECRET_DIR")
+    missing = run_wrapper()
+    assert missing.returncode != 0
+    assert missing.stderr == "restore_secret_dir_invalid\n"
+
+    relative_directory = Path("relative") / "restore"
+    environment["NBLB_SECRET_DIR"] = str(relative_directory)
+    relative = run_wrapper()
+    assert relative.returncode != 0
+    assert relative.stderr == "restore_secret_dir_invalid\n"
+
+    environment["NBLB_SECRET_DIR"] = str(restore_directory)
+    isolated = run_wrapper()
+    assert isolated.returncode == 0, isolated.stderr
+    assert isolated.stdout == f"{restore_directory}\n"
+
+    environment["NBLB_RESTORE_ISOLATED"] = "invalid"
+    invalid = run_wrapper()
+    assert invalid.returncode != 0
+    assert invalid.stderr == "restore_isolation_flag_invalid\n"
+
+
 @dataclass(frozen=True, slots=True)
 class _RuntimeRecoveryHarness:
     wrapper: Path

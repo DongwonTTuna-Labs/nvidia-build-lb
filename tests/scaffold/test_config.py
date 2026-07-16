@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from nvidia_build_lb.config import (
     NVIDIA_BASE_URL,
@@ -48,6 +48,46 @@ def test_settings_return_only_safe_metadata_when_secret_files_are_valid(
     serialized = metadata.model_dump_json()
     assert "nblb_admin_" not in serialized
     assert str(tmp_path) not in serialized
+
+
+def test_settings_source_accepts_compose_decimal_environment_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = {
+        "ADMIN_EVENT_MAX_ROWS": 200_000,
+        "ADMIN_ATTEMPT_MAX_ROWS": 80_000,
+        "ADMIN_LEDGER_PRUNE_BATCH_SIZE": 2_000,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(f"NVIDIA_BUILD_LB_{name}", str(value))
+
+    source = SettingsSource()
+
+    assert source.admin_event_max_rows == values["ADMIN_EVENT_MAX_ROWS"]
+    assert source.admin_attempt_max_rows == values["ADMIN_ATTEMPT_MAX_ROWS"]
+    assert source.admin_ledger_prune_batch_size == values["ADMIN_LEDGER_PRUNE_BATCH_SIZE"]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ADMIN_EVENT_MAX_ROWS", "01000"),
+        ("ADMIN_ATTEMPT_MAX_ROWS", "0100"),
+        ("ADMIN_LEDGER_PRUNE_BATCH_SIZE", "06"),
+        ("ADMIN_EVENT_MAX_ROWS", "+1000"),
+        ("ADMIN_EVENT_MAX_ROWS", " 1000"),
+        ("ADMIN_EVENT_MAX_ROWS", "\uff11\uff10\uff10\uff10"),
+    ],
+)
+def test_settings_source_rejects_noncanonical_compose_integers(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(f"NVIDIA_BUILD_LB_{name}", value)
+
+    with pytest.raises(ValidationError):
+        _ = SettingsSource()
 
 
 def test_settings_reject_a_missing_vault_file_without_its_path(tmp_path: Path) -> None:

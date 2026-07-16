@@ -195,12 +195,22 @@ update_app_digest() {
 }
 
 export_runtime_config() {
+    local restore_isolated=${NBLB_RESTORE_ISOLATED:-false}
     export NBLB_APP_REGISTRY_DIGEST=${RUNTIME_VALUES[NBLB_APP_REGISTRY_DIGEST]}
     export NBLB_POSTGRES_REGISTRY_DIGEST=${RUNTIME_VALUES[NBLB_POSTGRES_REGISTRY_DIGEST]}
     export NBLB_ADMIN_EVENT_MAX_ROWS=${RUNTIME_VALUES[NBLB_ADMIN_EVENT_MAX_ROWS]}
     export NBLB_ADMIN_ATTEMPT_MAX_ROWS=${RUNTIME_VALUES[NBLB_ADMIN_ATTEMPT_MAX_ROWS]}
     export NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE=${RUNTIME_VALUES[NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE]}
-    export NBLB_SECRET_DIR=${NBLB_SECRET_DIR:-${RUNTIME_VALUES[NBLB_SECRET_DIR]}}
+    case "$restore_isolated" in
+        true)
+            case "${NBLB_SECRET_DIR:-}" in
+                /*) export NBLB_SECRET_DIR ;;
+                *) fail restore_secret_dir_invalid ;;
+            esac
+            ;;
+        false) export NBLB_SECRET_DIR=${RUNTIME_VALUES[NBLB_SECRET_DIR]} ;;
+        *) fail restore_isolation_flag_invalid ;;
+    esac
 }
 
 compose() {

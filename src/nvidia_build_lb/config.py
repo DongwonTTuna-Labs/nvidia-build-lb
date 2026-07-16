@@ -4,7 +4,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, ClassVar, Final
 
-from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
@@ -19,6 +19,7 @@ _ADMIN_TOKEN_PREFIX: Final = b"nblb_admin_"
 _ADMIN_TOKEN_HEX_BYTES: Final = 64
 _ADMIN_TOKEN_BYTES: Final = len(_ADMIN_TOKEN_PREFIX) + _ADMIN_TOKEN_HEX_BYTES
 _DATABASE_PASSWORD_MAX_BYTES: Final = 1024
+_MAX_DECIMAL_SETTING_DIGITS: Final = 10
 
 type AdminReadDeadlineSeconds = Annotated[int, Field(ge=1, le=5, strict=True)]
 type AdminMutationDeadlineSeconds = Annotated[int, Field(ge=5, le=125, strict=True)]
@@ -26,10 +27,7 @@ type AdminEventRetentionDays = Annotated[int, Field(ge=1, le=365, strict=True)]
 type AdminEventMaxRows = Annotated[int, Field(ge=1_000, le=1_000_000, strict=True)]
 type AdminAttemptMaxRows = Annotated[int, Field(ge=100, le=400_000, strict=True)]
 type AdminLedgerPruneBatchSize = Annotated[int, Field(ge=6, le=5_000, strict=True)]
-type AdminLedgerMaintenanceIntervalSeconds = Annotated[
-    int,
-    Field(ge=10, le=3_600, strict=True),
-]
+type AdminLedgerMaintenanceIntervalSeconds = Annotated[int, Field(ge=10, le=3_600, strict=True)]
 type AdminAttemptReconciliationGraceSeconds = Annotated[
     int,
     Field(ge=300, le=3_600, strict=True),
@@ -75,6 +73,25 @@ class SettingsSource(BaseSettings):
     admin_ledger_prune_batch_size: AdminLedgerPruneBatchSize = 1_000
     admin_ledger_maintenance_interval_seconds: AdminLedgerMaintenanceIntervalSeconds = 300
     admin_attempt_reconciliation_grace_seconds: AdminAttemptReconciliationGraceSeconds = 300
+
+    @field_validator(
+        "admin_event_max_rows",
+        "admin_attempt_max_rows",
+        "admin_ledger_prune_batch_size",
+        mode="before",
+    )
+    @classmethod
+    def _parse_compose_integer(cls, value: object) -> object:
+        """Parse canonical decimal strings emitted by Compose."""
+        if (
+            isinstance(value, str)
+            and len(value) <= _MAX_DECIMAL_SETTING_DIGITS
+            and not value.startswith("0")
+            and value.isascii()
+            and value.isdecimal()
+        ):
+            return int(value)
+        return value
 
 
 class SettingsMetadata(BaseModel):

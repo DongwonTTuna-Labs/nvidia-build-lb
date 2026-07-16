@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
+from nvidia_build_lb import prestart_validate
 from nvidia_build_lb.config import SettingsSource, load_settings
 from nvidia_build_lb.errors import ConfigurationError, ConfigurationErrorCode
 
@@ -17,6 +18,21 @@ def _source(tmp_path: Path, password_file: Path | None) -> SettingsSource:
     return SettingsSource(
         database_url=SecretStr("postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb"),
         database_password_file=password_file,
+        vault_key_file=vault,
+        admin_token_file=admin,
+    )
+
+
+def _prestart_source(tmp_path: Path, ending: bytes) -> SettingsSource:
+    password = tmp_path / "db_password"
+    vault = tmp_path / "vault_master_key"
+    admin = tmp_path / "admin_token"
+    _ = password.write_bytes(b"synthetic-db-password")
+    _ = vault.write_bytes(b"v" * 32)
+    _ = admin.write_bytes(b"nblb_admin_" + (b"a" * 64) + ending)
+    return SettingsSource(
+        database_url=SecretStr("postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb"),
+        database_password_file=password,
         vault_key_file=vault,
         admin_token_file=admin,
     )
@@ -56,3 +72,31 @@ def test_database_password_file_must_exist_without_leaking_its_path(tmp_path: Pa
 
     assert captured.value.code is ConfigurationErrorCode.DATABASE_URL_INVALID
     assert str(missing) not in str(captured.value)
+
+
+@pytest.mark.parametrize("ending", [b"", b"\n"])
+def test_app_prestart_matches_runtime_admin_token_newline_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ending: bytes,
+) -> None:
+    source = _prestart_source(tmp_path, ending)
+    monkeypatch.setattr(prestart_validate, "_CANONICAL", tmp_path)
+
+    assert prestart_validate.validate("app")
+    _ = load_settings(source)
+
+
+@pytest.mark.parametrize("ending", [b"\n\n", b"\r\n", b" "])
+def test_prestart_and_runtime_reject_invalid_admin_token_suffixes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ending: bytes,
+) -> None:
+    source = _prestart_source(tmp_path, ending)
+    monkeypatch.setattr(prestart_validate, "_CANONICAL", tmp_path)
+
+    assert not prestart_validate.validate("app")
+    with pytest.raises(ConfigurationError) as captured:
+        _ = load_settings(source)
+    assert captured.value.code is ConfigurationErrorCode.ADMIN_TOKEN_INVALID
