@@ -154,7 +154,10 @@ def test_global_error_reads_action_before_result_and_then_evidence() -> None:
     ]
 
     assert error.index('id="global-error-state"') < error.index('id="global-error-message"')
-    assert error.index('id="global-error-message"') < error.index('id="retry-dashboard"')
+    assert error.index('id="global-error-message"') < error.index(
+        'id="global-unconfirmed-operation"'
+    )
+    assert error.index('id="global-unconfirmed-operation"') < error.index('id="retry-dashboard"')
     assert error.index('id="retry-dashboard"') < error.index('id="global-confirmed-result"')
     assert error.index('id="global-confirmed-result"') < error.index('id="global-error-evidence"')
 

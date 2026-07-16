@@ -25,6 +25,14 @@ _DISABLED_ID = "00000000-0000-4000-8000-000000000001"
 _ENABLED_ID = "00000000-0000-4000-8000-000000000002"
 _DOWNSTREAM_ROW_ID = "00000000-0000-4000-8000-000000000003"
 _UPSTREAM_FIXTURE = "synthetic-held-upstream-cancellation-value"
+_OVERLAP_COPY = (
+    "This refresh overlapped an administration change, so the current snapshot was not confirmed."
+)
+_LOCAL_CORRELATION_COPY = (
+    "The service cannot identify whether that change was the unconfirmed operation in this tab."
+)
+_EXTERNAL_CORRELATION_COPY = "The service cannot identify the change or its target from this tab."
+_NO_NEW_CHANGE_COPY = "Do not start another change. Refresh now."
 
 
 @pytest.fixture
@@ -444,22 +452,21 @@ def test_settling_dashboard_keeps_unknown_and_only_refresh(
             route,
             503,
             "admin_mutation_settling",
-            "previous mutation is still settling",
+            "mutation settlement not confirmed",
         ),
         times=1,
     )
     with page.expect_response(lambda response: response.url.endswith("/dashboard")) as settling:
         page.locator("#retry-dashboard").click()
     assert settling.value.status == 503
-    _expect_dashboard_recovery_ready(page, "Administration change settling")
-    expect(page.locator("#global-error-message")).to_contain_text(
-        "Probing Key aaaaaaaa remains unconfirmed"
+    _expect_dashboard_recovery_ready(page, "Refresh overlapped a change")
+    expect(page.locator("#global-error-message")).to_have_text(
+        f"{_OVERLAP_COPY} {_LOCAL_CORRELATION_COPY} Refresh now."
     )
-    expect(page.locator("#global-error-message")).to_contain_text(
-        "an administration change is still settling, but cannot identify whether it is the same change"
-    )
-    expect(page.locator("#global-error-message")).to_contain_text(
-        "Do not repeat the unconfirmed action"
+    expect(page.locator("#global-unconfirmed-operation")).to_be_visible()
+    expect(page.locator("#global-unconfirmed-operation strong")).to_have_text("Current operation")
+    expect(page.locator("#global-operation-status")).to_have_text(
+        "Probing Key aaaaaaaa remains unconfirmed. Do not repeat it."
     )
     expect(page.locator("#recommended-action")).to_be_hidden()
     assert page.locator("[data-mutation]:enabled").count() == 0
@@ -481,7 +488,7 @@ def test_external_settling_names_unavailable_target_and_keeps_only_refresh(
             route,
             503,
             "admin_mutation_settling",
-            "another mutation is still settling",
+            "mutation settlement not confirmed",
         ),
         times=1,
     )
@@ -489,11 +496,11 @@ def test_external_settling_names_unavailable_target_and_keeps_only_refresh(
     with page.expect_response(lambda response: response.url.endswith("/dashboard")) as settling:
         page.locator("#refresh-dashboard").click()
     assert settling.value.status == 503
-    _expect_dashboard_recovery_ready(page, "Administration change settling")
-    expect(page.locator("#global-error-message")).to_contain_text(
-        "an administration change is still settling. Its target is not available in this tab"
+    _expect_dashboard_recovery_ready(page, "Refresh overlapped a change")
+    expect(page.locator("#global-error-message")).to_have_text(
+        f"{_OVERLAP_COPY} {_EXTERNAL_CORRELATION_COPY} {_NO_NEW_CHANGE_COPY}"
     )
-    expect(page.locator("#global-error-message")).to_contain_text("Do not start another change")
+    expect(page.locator("#global-unconfirmed-operation")).to_be_hidden()
     expect(page.locator("#recommended-action")).to_be_hidden()
     assert page.locator("[data-mutation]:enabled").count() == 0
 

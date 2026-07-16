@@ -206,8 +206,8 @@ function showProblem(problem, context = "Refreshing administration state", snaps
   const incompatible = snapshotOnly && problem.code === "incompatible_service";
   const message = settling
     ? settlingContext
-      ? `${settlingContext} remains unconfirmed. The service reports that an administration change is still settling, but cannot identify whether it is the same change. Do not repeat the unconfirmed action. Refresh after settlement completes.`
-      : "The service reports that an administration change is still settling. Its target is not available in this tab. Do not start another change. Refresh after settlement completes."
+      ? "This refresh overlapped an administration change, so the current snapshot was not confirmed. The service cannot identify whether that change was the unconfirmed operation in this tab. Refresh now."
+      : "This refresh overlapped an administration change, so the current snapshot was not confirmed. The service cannot identify the change or its target from this tab. Do not start another change. Refresh now."
     : incompatible
       ? "This service version does not provide the required coherent dashboard. Upgrade the service; legacy reads are not used as a fallback."
       : unconfirmedBeforeRefresh
@@ -219,9 +219,11 @@ function showProblem(problem, context = "Refreshing administration state", snaps
       : knownActionFailure
         ? `${context} did not complete. The service confirmed no successful result. ${humanize(problem.code)}. Refresh current state before retrying.`
       : `${context} did not complete. Success was not assumed. ${humanize(problem.code)}. Refresh current state before retrying.`;
-  const state = settling ? "Administration change settling" : incompatible ? "Incompatible service" : unconfirmedBeforeRefresh ? "Action not confirmed" : hasConfirmedResult ? "Snapshot refresh not confirmed" : snapshotOnly ? "Current state not confirmed" : knownActionFailure ? "Action failed" : "Action not confirmed";
+  const state = settling ? "Refresh overlapped a change" : incompatible ? "Incompatible service" : unconfirmedBeforeRefresh ? "Action not confirmed" : hasConfirmedResult ? "Snapshot refresh not confirmed" : snapshotOnly ? "Current state not confirmed" : knownActionFailure ? "Action failed" : "Action not confirmed";
   setText("global-error-state", state);
   setText("global-error-message", message);
+  byId("global-unconfirmed-operation").hidden = !settlingContext;
+  if (settlingContext) setText("global-operation-status", `${settlingContext} remains unconfirmed. Do not repeat it.`);
   const globalEvidence = byId("global-error-evidence").closest("details");
   globalEvidence.open = false;
   renderProblemEvidence("global-error-evidence", problem);

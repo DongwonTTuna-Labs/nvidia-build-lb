@@ -124,13 +124,14 @@ loops.
   mutations, Copy, and Dismiss all preserve focus inside the active task and
   restore it deterministically after completion. Submitted dialog fields remain
   immutable while their request is pending.
-- A settling response keeps any locally known non-secret target and attempted
-  action in L1 as an unconfirmed operation. Separately, it states that the
-  service reports some administration change is settling and cannot identify
-  whether it is the same change. It preserves the local outcome as unknown,
-  locks every mutation, and offers Refresh as the only action; it never invents
-  correlation, collapses to an anonymous "previous request", or re-enables the
-  unresolved mutation.
+- A settlement-not-confirmed response states only that the snapshot read
+  overlapped an administration change. It never claims that change is still in
+  progress or asks the operator to wait. Any locally known non-secret target and
+  attempted action remains a separate L1 unconfirmed operation, while the copy
+  states that the service cannot correlate it with the overlapping change. The
+  local outcome stays unknown, every mutation stays locked, and immediate
+  Refresh is the only action; the surface never invents correlation, collapses
+  to an anonymous "previous request", or re-enables the unresolved mutation.
 - A confirmed deliberate Disable or final-token Revoke is not immediately
   reversed by an Enable or Issue primary action. Enable is recommended only
   when this journey has current probe/replacement evidence; first-token Issue
