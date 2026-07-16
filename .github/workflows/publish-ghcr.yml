@@ -1,9 +1,6 @@
 name: Publish GHCR
 
 on:
-  push:
-    tags:
-      - "publish-*"
   workflow_dispatch:
 
 permissions:
