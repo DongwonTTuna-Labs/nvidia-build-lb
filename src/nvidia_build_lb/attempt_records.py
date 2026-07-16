@@ -9,10 +9,20 @@ from nvidia_build_lb.attempt_types import (
     AttemptStartCommand,
 )
 from nvidia_build_lb.db_models import (
+    EVENT_WRITER_GENERATION,
     AdminEventRow,
     UpstreamAttemptReceiptRow,
     UpstreamLivePinRow,
 )
+
+
+def attempt_event_type(explicit_probe_key_id: UUID | None) -> str:
+    """Name explicit operator probes separately from routed client attempts."""
+    return (
+        EventType.UPSTREAM_PROBE.value
+        if explicit_probe_key_id is not None
+        else EventType.UPSTREAM_ATTEMPT.value
+    )
 
 
 def start_matches(row: UpstreamAttemptReceiptRow, command: AttemptStartCommand) -> bool:
@@ -44,13 +54,15 @@ def pending_start_matches(
         and row.terminal_outcome is None
         and event is not None
         and event.request_id == command.request_id
-        and event.event_type == EventType.UPSTREAM_ATTEMPT.value
+        and event.event_type == attempt_event_type(command.explicit_probe_key_id)
         and event.upstream_key_id == row.upstream_key_id
+        and event.upstream_key_fingerprint is not None
         and event.outcome_class == EventOutcome.STARTED.value
         and event.status_class is None
         and event.latency_ms is None
         and event.occurred_at == command.started_at
         and event.attempt_started_event_id is None
+        and event.writer_generation == EVENT_WRITER_GENERATION
         and pin is not None
         and pin.upstream_key_id == row.upstream_key_id
         and pin.service_epoch == command.service_epoch
@@ -105,13 +117,15 @@ def completed_terminal_matches(
         and pin is None
         and event is not None
         and event.request_id == command.identity.request_id
-        and event.event_type == EventType.UPSTREAM_ATTEMPT.value
+        and event.event_type == attempt_event_type(row.explicit_probe_key_id)
         and event.upstream_key_id == row.upstream_key_id
+        and event.upstream_key_fingerprint is not None
         and event.outcome_class == expected_outcome.value
         and event.status_class == command.status_class.value
         and event.latency_ms == command.latency_ms
         and event.occurred_at == command.terminal_committed_at
         and event.attempt_started_event_id == command.identity.started_event_id
+        and event.writer_generation == EVENT_WRITER_GENERATION
     )
 
 
@@ -130,19 +144,25 @@ def complete_receipt(
     row.terminal_committed_at = command.terminal_committed_at
 
 
-def started_event(key_id: UUID, command: AttemptStartCommand) -> AdminEventRow:
+def started_event(
+    key_id: UUID,
+    key_fingerprint: str,
+    command: AttemptStartCommand,
+) -> AdminEventRow:
     """Build the one durable started event."""
     return AdminEventRow(
         id=command.started_event_id,
         request_id=command.request_id,
-        event_type=EventType.UPSTREAM_ATTEMPT.value,
+        event_type=attempt_event_type(command.explicit_probe_key_id),
         upstream_key_id=key_id,
+        upstream_key_fingerprint=key_fingerprint,
         downstream_token_id=None,
         outcome_class=EventOutcome.STARTED.value,
         status_class=None,
         latency_ms=None,
         occurred_at=command.started_at,
         attempt_started_event_id=None,
+        writer_generation=EVENT_WRITER_GENERATION,
     )
 
 
@@ -186,6 +206,7 @@ def live_pin(key_id: UUID, command: AttemptStartCommand) -> UpstreamLivePinRow:
 
 def terminal_event(
     row: UpstreamAttemptReceiptRow,
+    key_fingerprint: str,
     command: AttemptFinalizeCommand,
 ) -> AdminEventRow:
     """Build the terminal event linked to exactly one started event."""
@@ -199,12 +220,14 @@ def terminal_event(
     return AdminEventRow(
         id=row.terminal_event_id,
         request_id=row.request_id,
-        event_type=EventType.UPSTREAM_ATTEMPT.value,
+        event_type=attempt_event_type(row.explicit_probe_key_id),
         upstream_key_id=row.upstream_key_id,
+        upstream_key_fingerprint=key_fingerprint,
         downstream_token_id=None,
         outcome_class=outcome.value,
         status_class=command.status_class.value,
         latency_ms=command.latency_ms,
         occurred_at=command.terminal_committed_at,
         attempt_started_event_id=row.started_event_id,
+        writer_generation=EVENT_WRITER_GENERATION,
     )

@@ -55,14 +55,12 @@ def network_observation_is_allowed(item: SafeNetworkObservation) -> bool:
         ("GET", "/assets/admin.css", 200),
         ("GET", "/assets/admin.js", 200),
         ("GET", "/assets/showcase.css", 200),
-        ("GET", "/admin/api/v1/overview", 200),
-        ("GET", "/admin/api/v1/overview", 401),
-        ("GET", "/admin/api/v1/overview", 503),
-        ("GET", "/admin/api/v1/upstream-keys", 200),
+        ("GET", "/assets/showcase.js", 200),
+        ("GET", "/admin/api/v1/dashboard", 200),
+        ("GET", "/admin/api/v1/dashboard", 401),
+        ("GET", "/admin/api/v1/dashboard", 503),
         ("POST", "/admin/api/v1/upstream-keys", 201),
-        ("GET", "/admin/api/v1/downstream-tokens", 200),
         ("POST", "/admin/api/v1/downstream-tokens", 201),
-        ("GET", "/admin/api/v1/events", 200),
     }
     if (item.method, item.path, item.status) in exact:
         return True
@@ -122,11 +120,11 @@ def authenticated_observability_receipt(
         for item in audit.browser_logs
     )
     wrong_auth = sum(
-        item.method == "GET" and item.path == "/admin/api/v1/overview" and item.status == 401
+        item.method == "GET" and item.path == "/admin/api/v1/dashboard" and item.status == 401
         for item in server_audit
     )
     initial_503 = sum(
-        item.method == "GET" and item.path == "/admin/api/v1/overview" and item.status == 503
+        item.method == "GET" and item.path == "/admin/api/v1/dashboard" and item.status == 503
         for item in server_audit
     )
     unanswered_failures = audit.unanswered_request_failures()

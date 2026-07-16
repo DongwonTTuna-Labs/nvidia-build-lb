@@ -1,4 +1,5 @@
 import hashlib
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from nvidia_build_lb.admin.schemas import (
     HealthState,
     ProbeStatus,
     UpstreamKeyCreateRequest,
+    UpstreamRoutingState,
 )
 from nvidia_build_lb.credential_types import Clock, ResourceConflictError, ResourceNotFoundError
 from nvidia_build_lb.db_models import AdminEventRow, SchedulerStateRow, UpstreamKeyRow
@@ -41,6 +43,7 @@ async def test_upstream_create_is_disabled_encrypted_and_decryptable_only_in_rep
     expected = hashlib.sha256(credential.encode()).hexdigest()
     assert created.fingerprint == f"sha256:{expected}"
     assert created.enabled is False
+    assert created.routing_state is UpstreamRoutingState.DISABLED
     assert created.health_state is HealthState.UNKNOWN
     assert created.created_at == created.updated_at == fixed_clock.now()
     async with migrated_session_factory() as session:
@@ -105,6 +108,38 @@ async def test_upstream_list_is_complete_safe_and_stably_ordered(
     assert all("synthetic-key" not in item.model_dump_json() for item in listed.items)
 
 
+async def test_upstream_projection_prioritizes_quarantine_then_cooldown_then_disabled(
+    migrated_session_factory: async_sessionmaker[AsyncSession],
+    vault: Vault,
+    fixed_clock: Clock,
+) -> None:
+    repository = UpstreamKeyRepository(
+        UpstreamKeyDependencies(migrated_session_factory, vault, fixed_clock)
+    )
+    created = await repository.create(
+        UpstreamKeyCreateRequest(key="routing-priority-key"),
+        request_id="routing-priority-create",
+    )
+    async with migrated_session_factory.begin() as session:
+        row = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert row is not None
+        row.quarantined = True
+        row.cooldown_until = fixed_clock.now() + timedelta(minutes=5)
+        row.cooldown_kind = "rate_limit"
+    assert (await repository.list_all()).items[0].routing_state is UpstreamRoutingState.QUARANTINED
+    async with migrated_session_factory.begin() as session:
+        row = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert row is not None
+        row.quarantined = False
+    assert (await repository.list_all()).items[0].routing_state is UpstreamRoutingState.COOLDOWN
+    async with migrated_session_factory.begin() as session:
+        row = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert row is not None
+        row.cooldown_until = None
+        row.cooldown_kind = None
+    assert (await repository.list_all()).items[0].routing_state is UpstreamRoutingState.DISABLED
+
+
 async def test_upstream_state_transitions_and_delete_are_exact(
     migrated_session_factory: async_sessionmaker[AsyncSession],
     vault: Vault,
@@ -120,7 +155,13 @@ async def test_upstream_state_transitions_and_delete_are_exact(
     )
     unknown_id = uuid4()
 
-    # When: enable is repeated, enabled delete is rejected, then disable and delete run.
+    # When: unverified enable is rejected, then verified enable and lifecycle actions run.
+    with pytest.raises(ResourceConflictError):
+        await repository.enable(created.id, request_id="enable-before-probe")
+    async with migrated_session_factory.begin() as session:
+        row = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert row is not None
+        row.health_state = HealthState.HEALTHY.value
     await repository.enable(created.id, request_id="enabled")
     await repository.enable(created.id, request_id="enabled-again")
     with pytest.raises(ResourceConflictError):

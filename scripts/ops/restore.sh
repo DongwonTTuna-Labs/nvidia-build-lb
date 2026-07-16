@@ -20,7 +20,40 @@ HOST_UID=""
 HOST_GID=""
 INSTALL_MARKER_ID=""
 KEY_INSTALL_ATTEMPTED=0
+KEY_INSTALL_OWNED=0
 RESTORE_RECEIPT=""
+
+remove_installed_key() {
+    docker run --rm --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE \
+        --security-opt no-new-privileges:true --entrypoint /bin/sh \
+        --mount "type=bind,source=$TARGET_SECRET_DIR,target=/target" \
+        "$HELPER_IMAGE" -c 'set -eu; marker=/target/.nblb-restore-install; if [ "$2" = 1 ]; then if [ -e "$marker" ] || [ -L "$marker" ]; then test -f "$marker"; test ! -L "$marker"; test "$(cat "$marker")" = "$1"; fi; rm -f /target/.vault_master_key.tmp /target/vault_master_key "$marker"; sync -f /target; elif [ -f "$marker" ] && [ ! -L "$marker" ] && [ "$(cat "$marker")" = "$1" ]; then rm -f /target/.vault_master_key.tmp /target/vault_master_key "$marker"; sync -f /target; fi' \
+        helper "$INSTALL_MARKER_ID" "$KEY_INSTALL_OWNED" >/dev/null 2>&1
+}
+
+remove_state_directory() {
+    [ -n "$STATE_DIR" ] && [ -d "$STATE_DIR" ] || { STATE_DIR=""; return 0; }
+    docker run --rm --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE \
+        --security-opt no-new-privileges:true --entrypoint /bin/sh \
+        --mount "type=bind,source=$STATE_DIR,target=/state" \
+        "$HELPER_IMAGE" -c 'rm -f /state/database-state.json' >/dev/null 2>&1 \
+        || return 1
+    rmdir "$STATE_DIR" >/dev/null 2>&1 || return 1
+    STATE_DIR=""
+}
+
+remove_stage_directory() {
+    [ -n "$RESTORE_STAGE_DIR" ] && [ -d "$RESTORE_STAGE_DIR" ] \
+        || { RESTORE_STAGE_DIR=""; return 0; }
+    docker run --rm --network none --read-only --cap-drop ALL \
+        --cap-add DAC_OVERRIDE --cap-add CHOWN \
+        --security-opt no-new-privileges:true --entrypoint /bin/sh \
+        --mount "type=bind,source=$RESTORE_STAGE_DIR,target=/stage" \
+        "$HELPER_IMAGE" -c 'rm -f /stage/database.dump /stage/vault_master_key /stage/manifest.json /stage/.*.tmp; chown "$1:$2" /stage; chmod 0700 /stage; sync -f /stage' \
+        helper "$HOST_UID" "$HOST_GID" >/dev/null 2>&1 || return 1
+    rmdir "$RESTORE_STAGE_DIR" >/dev/null 2>&1 || return 1
+    RESTORE_STAGE_DIR=""
+}
 
 cleanup() {
     status=$?
@@ -29,30 +62,10 @@ cleanup() {
     cleanup_error=0
     if [ "$status" -ne 0 ] && [ "$KEY_INSTALL_ATTEMPTED" -eq 1 ] \
         && [ -n "$TARGET_SECRET_DIR" ] && [ -d "$TARGET_SECRET_DIR" ]; then
-        docker run --rm --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE \
-            --security-opt no-new-privileges:true --entrypoint /bin/sh \
-            --mount "type=bind,source=$TARGET_SECRET_DIR,target=/target" \
-            "$HELPER_IMAGE" -c 'set -eu; marker=/target/.nblb-restore-install; if [ -f "$marker" ] && [ ! -L "$marker" ] && [ "$(cat "$marker")" = "$1" ]; then rm -f /target/.vault_master_key.tmp /target/vault_master_key "$marker"; sync -f /target; fi' \
-            helper "$INSTALL_MARKER_ID" \
-            >/dev/null 2>&1 || cleanup_error=1
+        remove_installed_key || cleanup_error=1
     fi
-    if [ -n "$STATE_DIR" ] && [ -d "$STATE_DIR" ]; then
-        docker run --rm --network none --read-only --cap-drop ALL --cap-add DAC_OVERRIDE \
-            --security-opt no-new-privileges:true --entrypoint /bin/sh \
-            --mount "type=bind,source=$STATE_DIR,target=/state" \
-            "$HELPER_IMAGE" -c 'rm -f /state/database-state.json' >/dev/null 2>&1 \
-            || cleanup_error=1
-        rmdir "$STATE_DIR" >/dev/null 2>&1 || cleanup_error=1
-    fi
-    if [ -n "$RESTORE_STAGE_DIR" ] && [ -d "$RESTORE_STAGE_DIR" ]; then
-        docker run --rm --network none --read-only --cap-drop ALL \
-            --cap-add DAC_OVERRIDE --cap-add CHOWN \
-            --security-opt no-new-privileges:true --entrypoint /bin/sh \
-            --mount "type=bind,source=$RESTORE_STAGE_DIR,target=/stage" \
-            "$HELPER_IMAGE" -c 'rm -f /stage/database.dump /stage/vault_master_key /stage/manifest.json /stage/.*.tmp; chown "$1:$2" /stage; chmod 0700 /stage; sync -f /stage' \
-            helper "$HOST_UID" "$HOST_GID" >/dev/null 2>&1 || cleanup_error=1
-        rmdir "$RESTORE_STAGE_DIR" >/dev/null 2>&1 || cleanup_error=1
-    fi
+    remove_state_directory || cleanup_error=1
+    remove_stage_directory || cleanup_error=1
     [ "$cleanup_error" -eq 0 ] || status=1
     exit "$status"
 }
@@ -193,6 +206,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
     "$HELPER_IMAGE" -c 'set -eu; umask 077; marker=/target/.nblb-restore-install; test "$(stat -c "%u:%g:%a" /target)" = 0:0:700; test ! -e /target/vault_master_key; test ! -e /target/.vault_master_key.tmp; test ! -e "$marker"; (set -C; printf "%s\n" "$1" > "$marker"); chmod 0600 "$marker"; chown 0:0 "$marker"; test "$(cat "$marker")" = "$1"; sync -f "$marker"; sync -f /target; cp /stage/vault_master_key /target/.vault_master_key.tmp; chmod 0600 /target/.vault_master_key.tmp; chown 0:0 /target/.vault_master_key.tmp; mv /target/.vault_master_key.tmp /target/vault_master_key; sync -f /target/vault_master_key; sync -f /target' \
     helper "$INSTALL_MARKER_ID" \
     || fail restore_key_install_failed
+KEY_INSTALL_OWNED=1
 docker run --rm --network none --read-only \
     --cap-drop ALL --security-opt no-new-privileges:true \
     --entrypoint /app/.venv/bin/python \
@@ -242,11 +256,15 @@ RESTORE_RECEIPT=$(docker run --rm --network none --read-only \
     --manifest /stage/manifest.json) \
     || fail restored_state_mismatch
 
+remove_state_directory || fail restore_state_cleanup_failed
+remove_stage_directory || fail restore_stage_cleanup_failed
+
 docker run --rm --network none --read-only --cap-drop ALL \
     --cap-add DAC_OVERRIDE --security-opt no-new-privileges:true --entrypoint /bin/sh \
     --mount "type=bind,source=$TARGET_SECRET_DIR,target=/target" \
     "$HELPER_IMAGE" -c 'set -eu; marker=/target/.nblb-restore-install; test -f "$marker"; test ! -L "$marker"; test "$(cat "$marker")" = "$1"; sync -f /target/vault_master_key; rm -f "$marker"; sync -f /target' \
     helper "$INSTALL_MARKER_ID" \
     || fail restore_key_commit_failed
+KEY_INSTALL_OWNED=0
 
 printf '%s\n' "$RESTORE_RECEIPT"

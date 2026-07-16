@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from playwright.sync_api import Browser, BrowserContext, Page
+from playwright.sync_api import Browser, BrowserContext, Page, expect
 
 from .browser_checks import (
     AdminDesktopObservation,
@@ -51,6 +51,68 @@ def close_page_context(page: _Closable, context: _Closable) -> None:
         context.close()
 
 
+def _capture_tablet_dialog(
+    journey: AuthJourneyContext,
+    page: Page,
+    counts: AxeCounts,
+    name: str,
+    state: str,
+) -> AxeCounts:
+    assert_no_page_overflow(page)
+    dialog_counts = axe_counts(page, journey.axe_asset)
+    journey.recorder.capture_viewport(
+        page,
+        CaptureSpec(name=name, state=state, viewport="768x900 viewport"),
+    )
+    return AxeCounts(
+        serious=counts.serious + dialog_counts.serious,
+        critical=counts.critical + dialog_counts.critical,
+        network_requests=counts.network_requests + dialog_counts.network_requests,
+    )
+
+
+def _capture_authenticated_tablet_dialogs(
+    journey: AuthJourneyContext,
+    page: Page,
+    counts: AxeCounts,
+) -> AxeCounts:
+    target = next(item for item in journey.state.upstreams().items if not item.enabled)
+    page.locator("#add-upstream").click()
+    expect(page.locator("#upstream-key")).to_be_focused()
+    counts = _capture_tablet_dialog(
+        journey,
+        page,
+        counts,
+        "admin-upstream-form-768",
+        "empty upstream credential form at 768px",
+    )
+    page.locator("[data-close='upstream-dialog']").click()
+    page.locator(f"#key-{target.id}-probe").click()
+    page.locator(f"#key-{target.id}-toggle").click()
+    expect(page.locator("#issue-downstream")).to_be_enabled()
+    page.locator("#issue-downstream").click()
+    expect(page.locator("#downstream-label")).to_be_focused()
+    counts = _capture_tablet_dialog(
+        journey,
+        page,
+        counts,
+        "admin-downstream-form-768",
+        "empty downstream token form at 768px",
+    )
+    page.locator("[data-close='downstream-dialog']").click()
+    page.locator(f"#key-{target.id}-toggle").click()
+    expect(page.locator("#confirm-title")).to_be_focused()
+    counts = _capture_tablet_dialog(
+        journey,
+        page,
+        counts,
+        "admin-destructive-confirmation-768",
+        "identified disable confirmation at 768px",
+    )
+    page.locator("[data-close='confirm-dialog']").click()
+    return counts
+
+
 def _capture_authenticated_narrow_surface(journey: AuthJourneyContext, width: int) -> AxeCounts:
     context = journey.browser.new_context(viewport={"width": width, "height": 900})
     page = context.new_page()
@@ -76,9 +138,37 @@ def _capture_authenticated_narrow_surface(journey: AuthJourneyContext, width: in
                 viewport=f"{width}x900",
             ),
         )
+        if width == 768:
+            assert (
+                page.locator("#upstream-keys table").evaluate(
+                    "node => getComputedStyle(node).display"
+                )
+                == "table"
+            )
+        if width == 375:
+            page.locator("#add-upstream").click()
+            page.locator("#upstream-dialog").wait_for(state="visible")
+            dialog_counts = axe_counts(page, journey.axe_asset)
+            counts = AxeCounts(
+                serious=counts.serious + dialog_counts.serious,
+                critical=counts.critical + dialog_counts.critical,
+                network_requests=counts.network_requests + dialog_counts.network_requests,
+            )
+            journey.recorder.capture(
+                page,
+                CaptureSpec(
+                    name="admin-upstream-form-375",
+                    state="empty upstream credential form before secret entry",
+                    viewport="375x900",
+                ),
+            )
+            page.locator("[data-close='upstream-dialog']").click()
+        if width == 768:
+            counts = _capture_authenticated_tablet_dialogs(journey, page, counts)
         assert_public_observability_clean(audit)
         return counts
     finally:
+        journey.state.reset()
         journey.recorder.end_blackout()
         try:
             audit.detach()
@@ -110,13 +200,13 @@ def _exercise_auth_failures(
     page.keyboard.press("Tab")
     assert focused_id(page) == "admin-bearer"
     journey.recorder.begin_blackout("admin bearer entered in password control")
-    journey.state.fail_next("/admin/api/v1/overview")
+    journey.state.fail_next("/admin/api/v1/dashboard")
     audit.set_phase("auth_initial_503")
     page.keyboard.insert_text(journey.state.admin_bearer)
     page.keyboard.press("Enter")
     page.locator("#global-error").wait_for(state="visible")
     assert focused_id(page) == "global-error"
-    assert "database_unavailable" in page.locator("#global-error-message").inner_text()
+    assert "Database unavailable" in page.locator("#global-error-message").inner_text()
     assert page.locator("#login-form").count() == 0
     assert page.locator("#admin-bearer").count() == 0
     assert_secret_absent(page, journey.state.admin_bearer)
@@ -184,7 +274,7 @@ def open_authenticated_session(journey: AuthJourneyContext) -> AuthenticatedSess
             actions=(
                 "#admin-bearer keyboard text then Enter with downstream credential",
                 "Tab from #login-error to restored #admin-bearer",
-                "#admin-bearer Enter with admin credential while overview returns safe 503",
+                "#admin-bearer Enter with admin credential while dashboard returns safe 503",
                 "Tab from #global-error to #retry-dashboard, then Enter",
             ),
             observables=(

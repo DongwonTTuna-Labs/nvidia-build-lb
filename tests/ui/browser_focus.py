@@ -10,12 +10,16 @@ from .browser_checks import (
 )
 
 _FOCUSABLE_COUNT: Final = r"""() => JSON.stringify([...document.querySelectorAll(
-'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),summary,[tabindex="0"]'
-)].filter((item) => item.getClientRects().length > 0).length)"""
+'a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled]),summary,[tabindex="0"]'
+)].filter((item) => {
+  const modal = document.querySelector('dialog:modal');
+  return item.getClientRects().length > 0 && (!modal || modal.contains(item));
+}).length)"""
 _FOCUS_STATE: Final = r"""() => {
+const modal = document.querySelector('dialog:modal');
 const focusable = [...document.querySelectorAll(
-  'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),summary,[tabindex="0"]'
-)].filter((item) => item.getClientRects().length > 0);
+  'a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled]),summary,[tabindex="0"]'
+)].filter((item) => item.getClientRects().length > 0 && (!modal || modal.contains(item)));
 const active = document.activeElement;
 const rect = active.getBoundingClientRect();
 const style = getComputedStyle(active);
@@ -56,6 +60,7 @@ const overlaps = [...document.querySelectorAll("*")].some((item) => {
 });
 return JSON.stringify({
   index: focusable.indexOf(active), inside, clipped_count, hidden_count, covered_count, overlaps,
+  modal_open: Boolean(modal), inside_modal: !modal || modal.contains(active),
   left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom,
   viewport_width: viewport.width, viewport_height: viewport.height
 });
@@ -71,6 +76,8 @@ class _FocusState(BaseModel):
     hidden_count: int
     covered_count: int
     overlaps: bool
+    modal_open: bool
+    inside_modal: bool
     left: float
     top: float
     right: float
@@ -87,11 +94,15 @@ def keyboard_focus_count(page: Page) -> int:
         page.keyboard.press("Tab")
         state = _FocusState.model_validate_json(evaluate_string(page, _FOCUS_STATE))
         if state.index == -1:
+            if state.modal_open:
+                reason = "native focus escaped the open modal"
+                raise BrowserAssertionError(reason)
             continue
         if state.index in observed:
             break
         if (
             not state.inside
+            or not state.inside_modal
             or state.clipped_count
             or state.hidden_count
             or state.covered_count

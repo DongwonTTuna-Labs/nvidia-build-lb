@@ -1,108 +1,29 @@
 """Secret-free administration aggregate and event projections."""
 
-from sqlalchemy import Select, func, or_, select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from nvidia_build_lb.admin.schemas import (
     AdminEventListResponse,
     AdminEventRead,
     AdminOverviewRead,
-    DownstreamTokenOverview,
     EventOutcome,
     EventType,
     LastStatusClass,
-    OverviewStatus,
-    UpstreamKeyOverview,
 )
+from nvidia_build_lb.admin_dashboard import read_dashboard
+from nvidia_build_lb.admin_ledger import AdminLedgerPolicy
 from nvidia_build_lb.credential_types import Clock
-from nvidia_build_lb.db_models import AdminEventRow, DownstreamTokenRow, UpstreamKeyRow
-
-
-async def _count(session: AsyncSession, statement: Select[tuple[int]]) -> int:
-    value = await session.scalar(statement)
-    return 0 if value is None else value
+from nvidia_build_lb.db_models import AdminEventRow
 
 
 async def read_overview(
     sessions: async_sessionmaker[AsyncSession],
     clock: Clock,
+    policy: AdminLedgerPolicy | None = None,
 ) -> AdminOverviewRead:
-    """Read one repeatable secret-free overview snapshot."""
-    now = clock.now()
-    async with sessions.begin() as session:
-        _ = await session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
-        upstream_total = await _count(session, select(func.count()).select_from(UpstreamKeyRow))
-        enabled = await _count(
-            session,
-            select(func.count())
-            .select_from(UpstreamKeyRow)
-            .where(UpstreamKeyRow.enabled.is_(True)),
-        )
-        eligible = await _count(
-            session,
-            select(func.count())
-            .select_from(UpstreamKeyRow)
-            .where(
-                UpstreamKeyRow.enabled.is_(True),
-                UpstreamKeyRow.quarantined.is_(False),
-                or_(UpstreamKeyRow.cooldown_until.is_(None), UpstreamKeyRow.cooldown_until <= now),
-            ),
-        )
-        cooling = await _count(
-            session,
-            select(func.count())
-            .select_from(UpstreamKeyRow)
-            .where(
-                UpstreamKeyRow.enabled.is_(True),
-                UpstreamKeyRow.cooldown_until > now,
-            ),
-        )
-        degraded = await _count(
-            session,
-            select(func.count())
-            .select_from(UpstreamKeyRow)
-            .where(UpstreamKeyRow.health_state == "degraded"),
-        )
-        downstream_total = await _count(
-            session,
-            select(func.count()).select_from(DownstreamTokenRow),
-        )
-        revoked = await _count(
-            session,
-            select(func.count())
-            .select_from(DownstreamTokenRow)
-            .where(DownstreamTokenRow.revoked_at.is_not(None)),
-        )
-        request_count = await _count(
-            session,
-            select(func.count())
-            .select_from(AdminEventRow)
-            .where(
-                AdminEventRow.event_type == EventType.UPSTREAM_ATTEMPT.value,
-                AdminEventRow.outcome_class == EventOutcome.STARTED.value,
-            ),
-        )
-        last_event_at = await session.scalar(select(func.max(AdminEventRow.occurred_at)))
-    ready = eligible > 0
-    return AdminOverviewRead(
-        status=OverviewStatus.OK if ready else OverviewStatus.DEGRADED,
-        ready=ready,
-        upstream_keys=UpstreamKeyOverview(
-            total=upstream_total,
-            enabled=enabled,
-            eligible=eligible,
-            cooling=cooling,
-            degraded=degraded,
-        ),
-        downstream_tokens=DownstreamTokenOverview(
-            total=downstream_total,
-            active=downstream_total - revoked,
-            revoked=revoked,
-        ),
-        request_count=request_count,
-        last_event_at=last_event_at,
-        generated_at=now,
-    )
+    """Read the legacy shape from the same capacity and aggregate predicate."""
+    return (await read_dashboard(sessions, clock, policy or AdminLedgerPolicy())).overview
 
 
 def _event_read(row: AdminEventRow) -> AdminEventRead:

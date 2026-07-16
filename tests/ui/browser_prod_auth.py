@@ -18,7 +18,7 @@ from .browser_observability_contract import assert_public_observability_clean
 from .browser_prod_context import ProductionQaContext
 from .browser_runtime import UI_ORIGIN
 
-_OVERVIEW_PATTERN = f"{UI_ORIGIN}/admin/api/v1/overview"
+_DASHBOARD_PATTERN = f"{UI_ORIGIN}/admin/api/v1/dashboard"
 
 
 def _set_phase(audit: PageAudit, qa: ProductionQaContext, phase: str) -> None:
@@ -100,6 +100,24 @@ def _capture_narrow(
                 viewport=f"{width}x900",
             ),
         )
+        if width == 375:
+            page.locator("#add-upstream").click()
+            page.locator("#upstream-dialog").wait_for(state="visible")
+            dialog_counts = axe_counts(page, qa.axe_asset)
+            counts = AxeCounts(
+                serious=counts.serious + dialog_counts.serious,
+                critical=counts.critical + dialog_counts.critical,
+                network_requests=counts.network_requests + dialog_counts.network_requests,
+            )
+            qa.recorder.capture(
+                page,
+                CaptureSpec(
+                    name="admin-upstream-form-375",
+                    state="actual empty upstream credential form before secret entry",
+                    viewport="375x900",
+                ),
+            )
+            page.locator("[data-close='upstream-dialog']").click()
         assert_public_observability_clean(audit)
         return counts
     finally:
@@ -136,6 +154,22 @@ def _initial_offline(route: Route) -> None:
     route.abort("connectionrefused")
 
 
+def _recover_initial_offline(
+    page: Page,
+    qa: ProductionQaContext,
+    audit: PageAudit,
+) -> None:
+    _set_phase(audit, qa, "auth_initial_offline_recovery")
+    page.keyboard.press("Tab")
+    assert focused_id(page) == "retry-dashboard"
+    page.keyboard.press("Enter")
+    page.locator("#global-error").wait_for(state="hidden")
+    assert focused_id(page) == "dashboard-title"
+    page.locator("#logout").click()
+    page.locator("#admin-bearer").wait_for(state="visible")
+    assert focused_id(page) == "admin-bearer"
+
+
 def _exercise_auth_failures(
     page: Page,
     qa: ProductionQaContext,
@@ -155,35 +189,36 @@ def _exercise_auth_failures(
     )
     page.keyboard.press("Tab")
     assert focused_id(page) == "admin-bearer"
-    _ = page.route(_OVERVIEW_PATTERN, _initial_offline, times=1)
+    _ = page.route(_DASHBOARD_PATTERN, _initial_offline, times=1)
     _set_phase(audit, qa, "auth_initial_offline")
     qa.recorder.begin_blackout("admin bearer entered before bounded offline injection")
     page.keyboard.insert_text(qa.client.admin_bearer)
     page.keyboard.press("Enter")
-    page.locator("#login-offline").wait_for(state="visible")
-    assert focused_id(page) == "login-offline"
-    assert "Service unavailable" in page.locator("#login-offline").inner_text()
-    assert page.locator("#login-error").is_hidden()
+    page.locator("#global-error").wait_for(state="visible")
+    assert focused_id(page) == "global-error"
+    assert page.locator("#global-error-state").inner_text() == "Current state not confirmed"
+    assert "Offline" in page.locator("#global-error-message").inner_text()
+    assert page.locator("#login-form").count() == 0
+    assert page.locator("#admin-bearer").count() == 0
     assert_secret_absent(page, qa.client.admin_bearer)
     qa.recorder.end_blackout()
     qa.recorder.capture(
         page,
         CaptureSpec(
             name="admin-login-offline",
-            state="distinct initial service outage after credential cleanup",
+            state="initial service outage on the dashboard recovery surface",
             viewport="1280x900",
         ),
     )
-    page.keyboard.press("Tab")
-    assert focused_id(page) == "admin-bearer"
-    _ = page.route(_OVERVIEW_PATTERN, _initial_503, times=1)
+    _recover_initial_offline(page, qa, audit)
+    _ = page.route(_DASHBOARD_PATTERN, _initial_503, times=1)
     _set_phase(audit, qa, "auth_initial_503")
     qa.recorder.begin_blackout("admin bearer entered before bounded 503 injection")
     page.keyboard.insert_text(qa.client.admin_bearer)
     page.keyboard.press("Enter")
     page.locator("#global-error").wait_for(state="visible")
     assert focused_id(page) == "global-error"
-    assert "database_unavailable" in page.locator("#global-error-message").inner_text()
+    assert "Database unavailable" in page.locator("#global-error-message").inner_text()
     assert_secret_absent(page, qa.client.admin_bearer)
     qa.recorder.end_blackout()
     qa.recorder.capture(
@@ -236,7 +271,7 @@ def open_production_session(
             actions=(
                 "Wrong realm login",
                 "Bounded initial service outage",
-                "Bounded overview 503",
+                "Bounded dashboard 503",
                 "Natural Tab and Enter retry",
             ),
             observables=(

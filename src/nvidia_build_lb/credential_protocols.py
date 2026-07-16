@@ -4,7 +4,9 @@ from typing import Protocol
 from uuid import UUID
 
 from nvidia_build_lb.admin.schemas import (
+    AdminDashboardRead,
     AdminEventListResponse,
+    AdminOperatorReadinessRead,
     AdminOverviewRead,
     DownstreamScope,
     DownstreamTokenIssued,
@@ -84,6 +86,14 @@ class CredentialRepositorySurface(Protocol):
 
     async def overview(self) -> AdminOverviewRead:
         """Return the secret-free administration aggregate."""
+        ...
+
+    async def dashboard(self) -> AdminDashboardRead:
+        """Return the canonical coherent browser snapshot."""
+        ...
+
+    async def operator_readiness(self) -> AdminOperatorReadinessRead:
+        """Return bounded host-operator readiness without resource lists."""
         ...
 
     async def events(self) -> AdminEventListResponse:

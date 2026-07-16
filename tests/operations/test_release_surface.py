@@ -3,12 +3,15 @@
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 
+import pytest
 from scripts.qa.scan_sensitive_patterns import matching_paths
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -97,6 +100,8 @@ if ARGS[0] == "exec":
     query = ARGS[ARGS.index("--command") + 1]
     if "SELECT version_num" in query:
         print("0004_vault_key_verifier")
+    elif "information_schema.columns" in query and "admin_ledger_state_pkey" in query:
+        print("0\t1")
     elif "encode(verifier_salt" in query:
         print(("1" * 64) + "\t" + ("2" * 64))
     elif "jsonb_agg" in query:
@@ -247,6 +252,8 @@ if ARGS[0] == "exec":
         print("0")
     elif "SELECT version_num" in query:
         print("0004_vault_key_verifier")
+    elif "information_schema.columns" in query and "admin_ledger_state_pkey" in query:
+        print("0\t1")
     elif "encode(verifier_salt" in query:
         print(("1" * 64) + "\t" + ("2" * 64))
     elif "jsonb_agg" in query:
@@ -268,17 +275,25 @@ if os.environ.get("NBLB_FAKE_FAIL_AT") == "after-lock":
 
 if "rm -f /target/.vault_master_key.tmp /target/vault_master_key" in shell_command:
     marker = bound["/target"] / ".nblb-restore-install"
-    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == ARGS[-1]:
+    marker_id = ARGS[-2]
+    install_owned = ARGS[-1] == "1"
+    if install_owned or (
+        marker.is_file() and marker.read_text(encoding="utf-8").strip() == marker_id
+    ):
         (bound["/target"] / ".vault_master_key.tmp").unlink(missing_ok=True)
         (bound["/target"] / "vault_master_key").unlink(missing_ok=True)
-        marker.unlink()
+        marker.unlink(missing_ok=True)
     raise SystemExit(0)
 
 if "rm -f /state/database-state.json" in shell_command:
+    if os.environ.get("NBLB_FAKE_FAIL_AT") == "state-cleanup":
+        raise SystemExit(42)
     (bound["/state"] / "database-state.json").unlink(missing_ok=True)
     raise SystemExit(0)
 
 if "rm -f /stage/database.dump" in shell_command:
+    if os.environ.get("NBLB_FAKE_FAIL_AT") == "stage-cleanup":
+        raise SystemExit(42)
     stage = bound["/stage"]
     for name in (
         "database.dump",
@@ -359,6 +374,8 @@ if 'test -f "$marker"' in shell_command and 'rm -f "$marker"' in shell_command:
     if os.environ.get("NBLB_FAKE_FAIL_AT") == "marker-commit":
         raise SystemExit(42)
     marker.unlink()
+    if os.environ.get("NBLB_FAKE_FAIL_AT") == "marker-commit-after-unlink":
+        raise SystemExit(42)
     raise SystemExit(0)
 
 if "nvidia_build_lb.backup_contract" in ARGS and "verify" in ARGS:
@@ -382,7 +399,7 @@ import json
 import sys
 
 arguments = sys.argv[1:]
-if "-cS" in arguments:
+if any("cS" in argument for argument in arguments):
     _ = sys.stdin.read()
     print("[]")
 elif "-er" in arguments:
@@ -611,6 +628,82 @@ def test_backup_and_restore_scripts_fail_closed_on_custody_or_target_drift() -> 
     assert "encode(token_digest,'hex')" in state
 
 
+def test_database_state_requires_exact_0005_columns_constraints_and_indexes() -> None:
+    state = _text("scripts/ops/database-state.sh")
+
+    assert "pg_get_constraintdef(constraint_row.oid,true)" in state
+    assert "CREATE INDEX ix_admin_events_request_type ON public.admin_events" in state
+    assert "FOREIGN KEY (attempt_started_event_id, id)" in state
+    assert "constraint_row.convalidated" in state
+    assert "SELECT * FROM expected_columns EXCEPT SELECT * FROM observed_columns" in state
+    assert "SELECT * FROM expected_constraints EXCEPT SELECT * FROM observed_constraints" in state
+    assert "SELECT * FROM expected_indexes EXCEPT SELECT * FROM observed_indexes" in state
+    assert '[ "$v3_exact" = 1 ]' in state
+    assert '[ "$v3_absent" = 1 ]' in state
+    assert "8:12:4:1" not in state
+
+
+def test_compose_exposes_validated_ledger_capacity_settings() -> None:
+    compose = _text("compose.yml")
+
+    assert "NVIDIA_BUILD_LB_ADMIN_EVENT_MAX_ROWS: ${NBLB_ADMIN_EVENT_MAX_ROWS:-100000}" in compose
+    assert (
+        "NVIDIA_BUILD_LB_ADMIN_ATTEMPT_MAX_ROWS: ${NBLB_ADMIN_ATTEMPT_MAX_ROWS:-40000}" in compose
+    )
+    assert (
+        "NVIDIA_BUILD_LB_ADMIN_LEDGER_PRUNE_BATCH_SIZE: ${NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE:-1000}"
+        in compose
+    )
+
+
+def test_operator_backup_and_restore_examples_preserve_failure_status() -> None:
+    guide = _text("docs/BACKUP_RESTORE.md")
+
+    backup = guide[guide.index("## Quiesced backup") : guide.index("## Mandatory isolated")]
+    assert "trap backup_exit EXIT" in backup
+    assert "trap 'exit 129' HUP" in backup
+    assert backup.index("APP_STOPPED=1") < backup.index(
+        "scripts/ops/production-compose.sh stop app"
+    )
+    assert backup.rindex("BACKUP_STATUS=$?") < backup.rindex(
+        '[ "$BACKUP_STATUS" -eq 0 ] || exit "$BACKUP_STATUS"'
+    )
+    assert backup.rindex('[ "$BACKUP_STATUS" -eq 0 ]') < backup.rindex("restart_source_app")
+    runtime_probe = "scripts/operator_readiness_probe.py"
+    assert backup.rindex("restart_source_app") < backup.index(runtime_probe)
+    assert "docker exec" not in backup
+    assert "BACKUP_RUNTIME_ATTEMPT" in backup
+    assert "backup_restart_runtime_timeout" in backup
+    assert backup.index(runtime_probe) < backup.rindex("trap - EXIT HUP INT TERM")
+    assert backup.rindex("trap - EXIT HUP INT TERM") < backup.rindex(
+        '''printf '%s\\n' "$BACKUP_RECEIPT"'''
+    )
+
+    restore = guide[guide.index("## Mandatory isolated restore drill") :]
+    assert "trap restore_exit EXIT" in restore
+    assert (
+        'RESTORE_SECRET_DIR="/opt/nvidia-build-lb/restore-secrets-$RESTORE_ATTEMPT_ID"' in restore
+    )
+    assert "down --volumes --remove-orphans" in restore
+    assert 'export BACKUP_ID="replace-with-verified-backup-id"' in restore
+    assert restore.index("restore_source_custody_invalid") < restore.index("RESTORE_SECRET_OWNED=1")
+    assert restore.index("RESTORE_SECRET_OWNED=1") < restore.index("sudo install -d")
+    assert restore.index("RESTORE_STARTED=1") < restore.index("up -d db")
+    assert restore.index("up -d db") < restore.index("RESTORE_DB_HEALTH_ATTEMPT")
+    assert restore.index("restore_database_health_timeout") < restore.index(
+        'RESTORE_RECEIPT="$(sudo scripts/ops/restore.sh'
+    )
+    assert restore.index("RESTORE_STATUS=$?") < restore.index(
+        '[ "$RESTORE_STATUS" -eq 0 ] || exit "$RESTORE_STATUS"'
+    )
+    assert restore.index('[ "$RESTORE_STATUS" -eq 0 ]') < restore.index("up -d migrate app")
+    assert restore.index("up -d migrate app") < restore.index(runtime_probe)
+    assert restore.index(runtime_probe) < restore.rindex("cleanup_restore_attempt")
+    assert restore.rindex("cleanup_restore_attempt") < restore.rindex(
+        '''printf '%s\\n' "$RESTORE_RECEIPT"'''
+    )
+
+
 def test_backup_copies_then_verifies_the_copied_key_against_database_state() -> None:
     backup = _text("scripts/ops/backup.sh")
     copy_key = "cp /source/vault_master_key /output/.vault_master_key.tmp"
@@ -756,9 +849,13 @@ def test_restore_snapshots_the_pair_then_rechecks_the_installed_key() -> None:
     assert 'test "$(cat "$marker")" = "$1"' in restore
     assert "restore_key_commit_failed" in restore
     assert "RESTORE_RECEIPT=$(docker run" in restore
-    assert restore.rindex("restore_key_commit_failed") < restore.rindex(
-        '''printf '%s\\n' "$RESTORE_RECEIPT"'''
-    )
+    state_cleanup = "remove_state_directory || fail restore_state_cleanup_failed"
+    stage_cleanup = "remove_stage_directory || fail restore_stage_cleanup_failed"
+    publish = '''printf '%s\\n' "$RESTORE_RECEIPT"'''
+    assert restore.rindex(compare_state) < restore.rindex(state_cleanup)
+    assert restore.rindex(state_cleanup) < restore.rindex(stage_cleanup)
+    assert restore.rindex(stage_cleanup) < restore.rindex("restore_key_commit_failed")
+    assert restore.rindex("restore_key_commit_failed") < restore.rindex(publish)
     commit_start = restore.rindex("marker=/target/.nblb-restore-install")
     commit_end = restore.index("\n    helper", commit_start)
     commit = restore[commit_start:commit_end]
@@ -816,6 +913,33 @@ def test_restore_does_not_emit_pass_before_marker_commit(tmp_path: Path) -> None
     assert execution.completed.returncode != 0
     assert execution.completed.stdout == ""
     assert execution.completed.stderr.endswith("restore_key_commit_failed\n")
+    assert not execution.target_key.exists()
+    assert not (execution.target_key.parent / ".nblb-restore-install").exists()
+    assert not execution.stage_path.exists()
+
+
+def test_restore_marker_commit_sync_failure_revokes_attempt_owned_key(
+    tmp_path: Path,
+) -> None:
+    execution = _run_restore_with_source_swap(
+        tmp_path,
+        fail_at="marker-commit-after-unlink",
+    )
+
+    assert execution.completed.returncode != 0
+    assert execution.completed.stdout == ""
+    assert execution.completed.stderr.endswith("restore_key_commit_failed\n")
+    assert not execution.target_key.exists()
+    assert not (execution.target_key.parent / ".nblb-restore-install").exists()
+    assert not execution.stage_path.exists()
+
+
+def test_restore_cleanup_failure_revokes_key_and_withholds_pass(tmp_path: Path) -> None:
+    execution = _run_restore_with_source_swap(tmp_path, fail_at="state-cleanup")
+
+    assert execution.completed.returncode != 0
+    assert execution.completed.stdout == ""
+    assert execution.completed.stderr.endswith("restore_state_cleanup_failed\n")
     assert not execution.target_key.exists()
     assert not (execution.target_key.parent / ".nblb-restore-install").exists()
     assert not execution.stage_path.exists()
@@ -1003,7 +1127,7 @@ def test_release_scanner_rejects_shallow_history_before_gitleaks() -> None:
     )
 
 
-def test_production_compose_and_operations_docs_keep_the_release_boundary_closed() -> None:
+def test_production_compose_keeps_the_release_boundary_closed() -> None:
     compose = _text("compose.yml")
 
     app_reference = (
@@ -1026,7 +1150,10 @@ def test_production_compose_and_operations_docs_keep_the_release_boundary_closed
     assert "internal: true" in compose
     assert "latest" not in compose.lower()
 
+
+def test_operations_docs_keep_the_release_boundary_closed() -> None:
     backup = _text("docs/BACKUP_RESTORE.md")
+    design = _text("DESIGN.md")
     security = _text("docs/SECURITY.md")
     rollback = _text("docs/ROLLBACK.md")
     runbook = _text("docs/RUNBOOK.md")
@@ -1034,11 +1161,185 @@ def test_production_compose_and_operations_docs_keep_the_release_boundary_closed
     assert "Never restore over the live volume" in backup
     assert "Do not rotate `vault_master_key` in isolation" in runbook
     assert "full 40-hex commit pins" in security
+    assert ".omo/evidence/task-6b-release" not in security
+    assert 'FINAL_BASE=".omo/evidence/final-$RUN_ID"' in security
+    assert "BROWSER_FRESH_STATUS" in security
+    assert "REVIEW_REQUIRED" in security
+    assert "scripts/qa/record_visual_review.py" in security
+    assert "visual_reviews.pass_a" in security
+    assert "Any blocker or source/image/manifest/artifact drift" in security
     assert "Do not run Alembic downgrade" in rollback
+    recovery = runbook[runbook.index("## Ledger-capacity forward recovery") :]
+    assert "/etc/nvidia-build-lb/runtime.env.lock" in runbook
+    assert "sudo test ! -e /etc/nvidia-build-lb/runtime.env.lock" in runbook
+    assert "recover-ledger-capacity 200000 80000 2000" in recovery
+    assert "update-ledger-caps 200000 80000 2000" not in recovery
+    assert "stops `app` and leaves intake withdrawn" in recovery
+    assert "RESTORE_RUNTIME_ATTEMPT" in backup
+    assert "restore_runtime_timeout" in backup
+    assert "ROLLBACK_RUNTIME_ATTEMPT" in rollback
+    assert "rollback_runtime_timeout" in rollback
+    assert "No intermediate cap value" in design
+    assert "Permanent evidence blockers never enter this path" in design
+    assert "independent of eligible-key readiness" in design
+    assert "empty first-run" in design
+    assert "target-image-independent host checker" in design
+    assert "legacy-overview fallback" in design
+    assert "runtime.env.lock" in rollback
+    assert "exclude competing rollout operators" in rollback
     trivy_exceptions = [
         line for line in _text(".trivyignore").splitlines() if line and not line.startswith("#")
     ]
     assert trivy_exceptions == ["DS-0002"]
+
+
+def test_operator_probe_docs_name_evidence_and_withdraw_failed_rollback() -> None:
+    backup = _text("docs/BACKUP_RESTORE.md")
+    design = _text("DESIGN.md")
+    rollback = _text("docs/ROLLBACK.md")
+    runbook = _text("docs/RUNBOOK.md")
+
+    assert backup.count("authenticated runtime probe") == 2
+    assert "Only that route's `404`" in backup
+    assert "same container ID and `StartedAt` generation" in backup
+    assert "operational evidence is unconfirmed" in backup
+    assert "canonical service `Host`" in rollback
+    assert "ledger-capacity` mode used by forward recovery has no legacy" in rollback
+    assert "two-second absolute deadline" in design
+    assert "second exact sample 30 seconds" in design
+    assert "This `ledger-capacity` mode" in runbook
+    assert "never uses the legacy-overview fallback" in runbook
+    assert "ROLLBACK_APP_MUST_WITHDRAW=1" in rollback
+    assert "rollback_candidate_withdraw_failed" in rollback
+    assert "trap rollback_exit EXIT" in rollback
+    assert "trap 'exit 129' HUP" in rollback
+    assert "trap 'exit 130' INT" in rollback
+    assert "trap 'exit 143' TERM" in rollback
+    assert rollback.index("ROLLBACK_APP_MUST_WITHDRAW=1") < rollback.index(
+        "up -d --force-recreate --no-deps app"
+    )
+    assert rollback.index("curl --fail http://127.0.0.1:2455/health") < rollback.rindex(
+        "ROLLBACK_APP_MUST_WITHDRAW=0"
+    )
+
+
+def test_rollback_document_trap_withdraws_failed_candidate(tmp_path: Path) -> None:
+    rollback = _text("docs/ROLLBACK.md")
+    start = rollback.index("ROLLBACK_APP_MUST_WITHDRAW=0")
+    end_marker = "trap 'exit 143' TERM"
+    trap_end = rollback.index(end_marker, start) + len(end_marker)
+    trap_setup = rollback[start:trap_end]
+    fake_wrapper = tmp_path / "scripts/ops/production-compose.sh"
+    fake_wrapper.parent.mkdir(parents=True)
+    _ = fake_wrapper.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$NBLB_ROLLBACK_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_wrapper.chmod(0o755)
+    command_log = tmp_path / "rollback.log"
+    environment = os.environ.copy()
+    environment["NBLB_ROLLBACK_LOG"] = str(command_log)
+
+    completed = subprocess.run(  # noqa: S603 - exact documented trap under test.
+        [
+            "/usr/bin/bash",
+            "-c",
+            f"{trap_setup}\nROLLBACK_APP_MUST_WITHDRAW=1\nfalse\n",
+        ],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    assert command_log.read_text(encoding="utf-8") == "stop app\n"
+
+
+@pytest.mark.parametrize(
+    ("interruption", "expected_status"),
+    [
+        (signal.SIGHUP, 129),
+        (signal.SIGINT, 130),
+        (signal.SIGTERM, 143),
+    ],
+)
+@pytest.mark.parametrize("foreground_child", [False, True], ids=("boundary", "child"))
+def test_rollback_document_signal_withdraws_and_preserves_signal_status(
+    tmp_path: Path,
+    interruption: signal.Signals,
+    expected_status: int,
+    foreground_child: bool,
+) -> None:
+    rollback = _text("docs/ROLLBACK.md")
+    start = rollback.index("ROLLBACK_APP_MUST_WITHDRAW=0")
+    end_marker = "trap 'exit 143' TERM"
+    trap_end = rollback.index(end_marker, start) + len(end_marker)
+    trap_setup = rollback[start:trap_end]
+    fake_wrapper = tmp_path / "scripts/ops/production-compose.sh"
+    fake_wrapper.parent.mkdir(parents=True)
+    _ = fake_wrapper.write_text(
+        '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$NBLB_ROLLBACK_LOG"\n',
+        encoding="utf-8",
+    )
+    fake_wrapper.chmod(0o755)
+    command_log = tmp_path / "rollback.log"
+    ready = tmp_path / "signal-ready"
+    child_ready = tmp_path / "child-ready"
+    foreground_wrapper = tmp_path / "scripts/foreground-child.sh"
+    _ = foreground_wrapper.write_text(
+        '#!/bin/sh\n: > "$NBLB_ROLLBACK_CHILD_READY"\nexec /usr/bin/sleep 30\n',
+        encoding="utf-8",
+    )
+    foreground_wrapper.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "NBLB_ROLLBACK_CHILD_READY": str(child_ready),
+            "NBLB_ROLLBACK_LOG": str(command_log),
+            "NBLB_ROLLBACK_READY": str(ready),
+        }
+    )
+    blocked_command = "scripts/foreground-child.sh" if foreground_child else "while :; do :; done"
+    signal_tail = 'ROLLBACK_APP_MUST_WITHDRAW=1\n: > "$NBLB_ROLLBACK_READY"'
+    signal_script = f"{trap_setup}\n{signal_tail}\n{blocked_command}"
+    rollback_process = subprocess.Popen(  # noqa: S603 - exact documented traps under test.
+        [
+            "/usr/bin/bash",
+            "-c",
+            signal_script,
+        ],
+        cwd=tmp_path,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        _wait_for_path(ready)
+        if foreground_child:
+            _wait_for_path(child_ready)
+            os.killpg(rollback_process.pid, interruption)
+        else:
+            os.kill(rollback_process.pid, interruption)
+        stdout, stderr = rollback_process.communicate(timeout=5)
+    finally:
+        if rollback_process.poll() is None:
+            os.killpg(rollback_process.pid, signal.SIGKILL)
+            _ = rollback_process.communicate(timeout=5)
+
+    assert rollback_process.returncode == expected_status, stderr
+    assert stdout == ""
+    if foreground_child:
+        assert "rollback_candidate_withdraw_failed" not in stderr
+        assert "foreground-child.sh" in stderr or stderr == ""
+    else:
+        assert stderr == ""
+    assert command_log.read_text(encoding="utf-8") == "stop app\n"
 
 
 def test_production_compose_wrapper_rejects_mutable_or_malformed_images(
@@ -1048,14 +1349,46 @@ def test_production_compose_wrapper_rejects_mutable_or_malformed_images(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_docker = fake_bin / "docker"
-    _ = fake_docker.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n", encoding="utf-8")
+    _ = fake_docker.write_text(
+        r"""#!/bin/sh
+printf '%s\n' \
+  "$NBLB_APP_REGISTRY_DIGEST" \
+  "$NBLB_ADMIN_EVENT_MAX_ROWS" \
+  "$NBLB_ADMIN_ATTEMPT_MAX_ROWS" \
+  "$NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE" \
+  "$@"
+""",
+        encoding="utf-8",
+    )
     fake_docker.chmod(0o755)
+    runtime_config = tmp_path / "runtime.env"
+    runtime_lock = tmp_path / "runtime.env.lock"
+    _ = runtime_lock.write_text("", encoding="utf-8")
+    runtime_lock.chmod(0o644)
+
+    def write_config(app_digest: str, *, event_rows: int = 100_000) -> None:
+        _ = runtime_config.write_text(
+            "\n".join(
+                (
+                    f"NBLB_APP_REGISTRY_DIGEST={app_digest}",
+                    f"NBLB_POSTGRES_REGISTRY_DIGEST={'b' * 64}",
+                    "NBLB_SECRET_DIR=/opt/nvidia-build-lb/secrets",
+                    f"NBLB_ADMIN_EVENT_MAX_ROWS={event_rows}",
+                    "NBLB_ADMIN_ATTEMPT_MAX_ROWS=40000",
+                    "NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE=1000",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        runtime_config.chmod(0o644)
+
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
-    environment["NBLB_POSTGRES_REGISTRY_DIGEST"] = "b" * 64
+    environment["NBLB_RUNTIME_CONFIG_FILE"] = str(runtime_config)
 
     for rejected in ("latest", "sha256:" + "a" * 64, "A" * 64, "a" * 63):
-        environment["NBLB_APP_REGISTRY_DIGEST"] = rejected
+        write_config(rejected)
         completed = subprocess.run(  # noqa: S603 - fixed local wrapper under test.
             [wrapper, "config", "--quiet"],
             check=False,
@@ -1066,7 +1399,9 @@ def test_production_compose_wrapper_rejects_mutable_or_malformed_images(
         assert completed.returncode != 0
         assert completed.stderr == "app_registry_digest_invalid\n"
 
-    environment["NBLB_APP_REGISTRY_DIGEST"] = "a" * 64
+    write_config("a" * 64)
+    environment["NBLB_APP_REGISTRY_DIGEST"] = "c" * 64
+    environment["NBLB_ADMIN_EVENT_MAX_ROWS"] = "999999"
     accepted = subprocess.run(  # noqa: S603 - fixed local wrapper under test.
         [wrapper, "config", "--quiet"],
         check=False,
@@ -1075,9 +1410,463 @@ def test_production_compose_wrapper_rejects_mutable_or_malformed_images(
         env=environment,
     )
     assert accepted.returncode == 0
+    assert accepted.stdout.startswith(f"{'a' * 64}\n100000\n40000\n1000\n")
     assert "compose\n" in accepted.stdout
     assert f"{_ROOT / 'compose.yml'}\n" in accepted.stdout
     assert accepted.stdout.endswith("config\n--quiet\n")
+
+    updated = subprocess.run(  # noqa: S603 - fixed local wrapper under test.
+        [wrapper, "update-ledger-caps", "200000", "80000", "2000"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert updated.returncode == 0, updated.stderr
+    assert updated.stdout == "runtime_config_updated\n"
+    assert runtime_config.read_text(encoding="utf-8").splitlines() == [
+        f"NBLB_APP_REGISTRY_DIGEST={'a' * 64}",
+        f"NBLB_POSTGRES_REGISTRY_DIGEST={'b' * 64}",
+        "NBLB_SECRET_DIR=/opt/nvidia-build-lb/secrets",
+        "NBLB_ADMIN_EVENT_MAX_ROWS=200000",
+        "NBLB_ADMIN_ATTEMPT_MAX_ROWS=80000",
+        "NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE=2000",
+    ]
+    persisted = subprocess.run(  # noqa: S603 - fixed local wrapper under test.
+        [wrapper, "config", "--quiet"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert persisted.returncode == 0, persisted.stderr
+    assert persisted.stdout.startswith(f"{'a' * 64}\n200000\n80000\n2000\n")
+
+    image_updated = subprocess.run(  # noqa: S603 - fixed local wrapper under test.
+        [wrapper, "update-app-digest", "d" * 64],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert image_updated.returncode == 0, image_updated.stderr
+    updated_lines = runtime_config.read_text(encoding="utf-8").splitlines()
+    assert updated_lines[0] == f"NBLB_APP_REGISTRY_DIGEST={'d' * 64}"
+    assert updated_lines[-3:] == [
+        "NBLB_ADMIN_EVENT_MAX_ROWS=200000",
+        "NBLB_ADMIN_ATTEMPT_MAX_ROWS=80000",
+        "NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE=2000",
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeRecoveryHarness:
+    wrapper: Path
+    environment: dict[str, str]
+    runtime_config: Path
+    command_log: Path
+    capacity_count: Path
+    capacity_started: Path
+    recreated: Path
+    stopped: Path
+    up_started: Path
+    up_release: Path
+
+    def run(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - fixed repository wrapper under test.
+            [self.wrapper, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=self.environment,
+        )
+
+
+_FAKE_RUNTIME_DOCKER = r"""#!/usr/bin/env python3
+import os
+import sys
+import time
+from pathlib import Path
+
+ARGS = sys.argv[1:]
+LOG = Path(os.environ["NBLB_FAKE_COMMAND_LOG"])
+PHASE = Path(os.environ["NBLB_FAKE_PHASE"])
+STOPPED = Path(os.environ["NBLB_FAKE_STOPPED"])
+BEFORE = "1" * 64
+AFTER = "2" * 64
+EXPECTED_ID = "sha256:" + ("3" * 64)
+EXPECTED_REF = (
+    "ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:"
+    + os.environ["NBLB_APP_REGISTRY_DIGEST"]
+)
+
+
+def record(value):
+    with LOG.open("a", encoding="utf-8") as stream:
+        stream.write(value + "\n")
+
+
+if ARGS[:2] == ["image", "inspect"]:
+    print(EXPECTED_ID)
+    raise SystemExit(0)
+
+if ARGS and ARGS[0] == "inspect":
+    template = ARGS[ARGS.index("--format") + 1]
+    container = ARGS[-1]
+    after = container == AFTER
+    if "Config.Image" in template:
+        if not after and os.environ.get("NBLB_FAKE_PRESTART_MISMATCH") == "1":
+            print("ghcr.io/example/mismatched@sha256:" + ("4" * 64))
+        elif after and os.environ.get("NBLB_FAKE_POSTSTART_MISMATCH") == "1":
+            print("ghcr.io/example/mismatched@sha256:" + ("5" * 64))
+        else:
+            print(EXPECTED_REF)
+    elif template == "{{.Image}}":
+        print(EXPECTED_ID)
+    elif "State.Running" in template:
+        print("false" if STOPPED.exists() else "true")
+    else:
+        raise SystemExit(91)
+    raise SystemExit(0)
+
+if not ARGS or ARGS[0] != "compose":
+    raise SystemExit(92)
+
+if "ps" in ARGS:
+    print(AFTER if PHASE.exists() else BEFORE)
+    raise SystemExit(0)
+
+if "config" in ARGS:
+    record("config:" + os.environ["NBLB_ADMIN_EVENT_MAX_ROWS"])
+    raise SystemExit(0)
+
+if "up" in ARGS:
+    record("recreate:" + os.environ["NBLB_ADMIN_EVENT_MAX_ROWS"])
+    runtime_path = os.environ.get("NBLB_FAKE_MUTATE_RUNTIME_ON_UP")
+    if runtime_path:
+        runtime = Path(runtime_path)
+        current = runtime.read_text(encoding="utf-8")
+        runtime.write_text(
+            current.replace(
+                "NBLB_ADMIN_EVENT_MAX_ROWS=100000",
+                "NBLB_ADMIN_EVENT_MAX_ROWS=300000",
+            ),
+            encoding="utf-8",
+        )
+    if os.environ.get("NBLB_FAKE_BLOCK_UP") == "1":
+        Path(os.environ["NBLB_FAKE_UP_STARTED"]).touch()
+        release = Path(os.environ["NBLB_FAKE_UP_RELEASE"])
+        deadline = time.monotonic() + 10
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not release.exists():
+            raise SystemExit(93)
+    if os.environ.get("NBLB_FAKE_RECREATE_FAIL") == "1":
+        raise SystemExit(94)
+    STOPPED.unlink(missing_ok=True)
+    PHASE.touch()
+    raise SystemExit(0)
+
+if "stop" in ARGS:
+    record("stop")
+    STOPPED.touch()
+    raise SystemExit(0)
+
+raise SystemExit(95)
+"""
+
+_FAKE_RUNTIME_PYTHON = r"""#!__PYTHON__
+import os
+import sys
+import time
+from pathlib import Path
+
+ARGS = sys.argv[1:]
+REAL_PYTHON = "__PYTHON__"
+if not ARGS or Path(ARGS[0]).name != "operator_readiness_probe.py":
+    os.execv(REAL_PYTHON, [REAL_PYTHON, *ARGS])
+if len(ARGS) != 4 or ARGS[1:] != [
+    "ledger-capacity",
+    "2456",
+    "/opt/nvidia-build-lb/secrets/admin_token",
+]:
+    raise SystemExit(96)
+counter = Path(os.environ["NBLB_FAKE_CAPACITY_COUNT"])
+count = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+counter.write_text(str(count), encoding="utf-8")
+if os.environ.get("NBLB_FAKE_BLOCK_CAPACITY") == "1":
+    Path(os.environ["NBLB_FAKE_CAPACITY_STARTED"]).touch()
+    release = Path(os.environ["NBLB_FAKE_CAPACITY_RELEASE"])
+    deadline = time.monotonic() + 10
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not release.exists():
+        raise SystemExit(97)
+if os.environ.get("NBLB_FAKE_CAPACITY_ALWAYS_FAIL") == "1":
+    raise SystemExit(22)
+required = int(os.environ.get("NBLB_FAKE_CAPACITY_SUCCEED_AFTER", "1"))
+raise SystemExit(0 if count >= required else 22)
+"""
+
+_FAKE_RUNTIME_SYNC = r"""#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[-1])
+if (
+    os.environ.get("NBLB_FAKE_SYNC_FAIL_TEMP") == "1"
+    and target.name.startswith(".nblb-runtime.")
+):
+    raise SystemExit(1)
+raise SystemExit(0)
+"""
+
+
+def _runtime_config_text(*, event_rows: int = 100_000) -> str:
+    return "\n".join(
+        (
+            f"NBLB_APP_REGISTRY_DIGEST={'a' * 64}",
+            f"NBLB_POSTGRES_REGISTRY_DIGEST={'b' * 64}",
+            "NBLB_SECRET_DIR=/opt/nvidia-build-lb/secrets",
+            f"NBLB_ADMIN_EVENT_MAX_ROWS={event_rows}",
+            "NBLB_ADMIN_ATTEMPT_MAX_ROWS=40000",
+            "NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE=1000",
+            "",
+        )
+    )
+
+
+def _runtime_recovery_harness(tmp_path: Path) -> _RuntimeRecoveryHarness:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    _ = fake_docker.write_text(_FAKE_RUNTIME_DOCKER, encoding="utf-8")
+    fake_docker.chmod(0o755)
+    fake_python = fake_bin / "python3"
+    _ = fake_python.write_text(
+        _FAKE_RUNTIME_PYTHON.replace("__PYTHON__", sys.executable),
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    fake_sleep = fake_bin / "sleep"
+    _ = fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_sleep.chmod(0o755)
+    fake_sync = fake_bin / "sync"
+    _ = fake_sync.write_text(_FAKE_RUNTIME_SYNC, encoding="utf-8")
+    fake_sync.chmod(0o755)
+
+    runtime_config = tmp_path / "runtime.env"
+    _ = runtime_config.write_text(_runtime_config_text(), encoding="utf-8")
+    runtime_config.chmod(0o644)
+    runtime_lock = tmp_path / "runtime.env.lock"
+    _ = runtime_lock.write_text("", encoding="utf-8")
+    runtime_lock.chmod(0o644)
+
+    command_log = tmp_path / "commands.log"
+    capacity_count = tmp_path / "capacity-count"
+    capacity_started = tmp_path / "capacity-started"
+    recreated = tmp_path / "after-recreate"
+    stopped = tmp_path / "app-stopped"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "NBLB_RUNTIME_CONFIG_FILE": str(runtime_config),
+            "NBLB_RUNTIME_LOCK_FILE": str(runtime_lock),
+            "NBLB_FAKE_COMMAND_LOG": str(command_log),
+            "NBLB_FAKE_PHASE": str(recreated),
+            "NBLB_FAKE_STOPPED": str(stopped),
+            "NBLB_FAKE_CAPACITY_COUNT": str(capacity_count),
+            "NBLB_FAKE_CAPACITY_STARTED": str(capacity_started),
+            "NBLB_FAKE_CAPACITY_RELEASE": str(tmp_path / "capacity-release"),
+            "NBLB_FAKE_UP_STARTED": str(tmp_path / "up-started"),
+            "NBLB_FAKE_UP_RELEASE": str(tmp_path / "up-release"),
+        }
+    )
+    return _RuntimeRecoveryHarness(
+        wrapper=_ROOT / "scripts/ops/production-compose.sh",
+        environment=environment,
+        runtime_config=runtime_config,
+        command_log=command_log,
+        capacity_count=capacity_count,
+        capacity_started=capacity_started,
+        recreated=recreated,
+        stopped=stopped,
+        up_started=tmp_path / "up-started",
+        up_release=tmp_path / "up-release",
+    )
+
+
+def test_runtime_recovery_retries_capacity_before_committing_caps(tmp_path: Path) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_CAPACITY_SUCCEED_AFTER"] = "3"
+
+    completed = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "ledger_capacity_recreated_same_image\n"
+    assert harness.capacity_count.read_text(encoding="utf-8") == "3"
+    assert "NBLB_ADMIN_EVENT_MAX_ROWS=200000" in harness.runtime_config.read_text(encoding="utf-8")
+    assert harness.command_log.read_text(encoding="utf-8").splitlines() == [
+        "config:200000",
+        "recreate:200000",
+    ]
+
+
+def test_runtime_recovery_prestart_mismatch_never_recreates(tmp_path: Path) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_PRESTART_MISMATCH"] = "1"
+
+    completed = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+
+    assert completed.returncode != 0
+    assert completed.stderr == "runtime_recovery_prestart_image_mismatch\n"
+    assert not harness.command_log.exists()
+    assert harness.runtime_config.read_text(encoding="utf-8") == _runtime_config_text()
+
+
+def test_runtime_recovery_poststart_mismatch_withdraws_without_commit(
+    tmp_path: Path,
+) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_POSTSTART_MISMATCH"] = "1"
+
+    completed = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+
+    assert completed.returncode != 0
+    assert completed.stderr == "runtime_recovery_same_image_mismatch\n"
+    assert harness.command_log.read_text(encoding="utf-8").splitlines()[-1] == "stop"
+    assert harness.runtime_config.read_text(encoding="utf-8") == _runtime_config_text()
+
+
+def test_runtime_recovery_capacity_timeout_withdraws_without_commit(tmp_path: Path) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_CAPACITY_ALWAYS_FAIL"] = "1"
+
+    completed = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+
+    assert completed.returncode != 0
+    assert completed.stderr == "runtime_recovery_capacity_failed\n"
+    assert harness.capacity_count.read_text(encoding="utf-8") == "30"
+    assert harness.command_log.read_text(encoding="utf-8").splitlines()[-1] == "stop"
+    assert harness.runtime_config.read_text(encoding="utf-8") == _runtime_config_text()
+
+
+def test_runtime_recovery_cas_drift_withdraws_and_preserves_external_generation(
+    tmp_path: Path,
+) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_MUTATE_RUNTIME_ON_UP"] = str(harness.runtime_config)
+
+    completed = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+
+    assert completed.returncode != 0
+    assert completed.stderr == "runtime_recovery_config_changed\n"
+    assert harness.command_log.read_text(encoding="utf-8").splitlines()[-1] == "stop"
+    current = harness.runtime_config.read_text(encoding="utf-8")
+    assert "NBLB_ADMIN_EVENT_MAX_ROWS=300000" in current
+    assert "NBLB_ADMIN_EVENT_MAX_ROWS=200000" not in current
+
+
+def test_runtime_recovery_commit_failure_cleans_scoped_temporary(
+    tmp_path: Path,
+) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_SYNC_FAIL_TEMP"] = "1"
+
+    completed = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+
+    assert completed.returncode != 0
+    assert completed.stderr == "runtime_recovery_config_commit_failed\n"
+    assert harness.command_log.read_text(encoding="utf-8").splitlines()[-1] == "stop"
+    assert harness.runtime_config.read_text(encoding="utf-8") == _runtime_config_text()
+    assert tuple(tmp_path.glob(".nblb-runtime.*")) == ()
+
+
+def test_runtime_recovery_reenters_its_same_image_withdrawn_state(tmp_path: Path) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_CAPACITY_ALWAYS_FAIL"] = "1"
+    failed = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+    assert failed.stderr == "runtime_recovery_capacity_failed\n"
+    assert harness.stopped.exists()
+
+    del harness.environment["NBLB_FAKE_CAPACITY_ALWAYS_FAIL"]
+    harness.capacity_count.unlink()
+    recovered = harness.run("recover-ledger-capacity", "200000", "80000", "2000")
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not harness.stopped.exists()
+    assert "NBLB_ADMIN_EVENT_MAX_ROWS=200000" in harness.runtime_config.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("interruption", "expected_status"),
+    [(signal.SIGHUP, 129), (signal.SIGTERM, 143)],
+)
+def test_runtime_recovery_signal_after_recreate_start_withdraws_before_exit(
+    tmp_path: Path,
+    interruption: signal.Signals,
+    expected_status: int,
+) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_BLOCK_CAPACITY"] = "1"
+    recovery = subprocess.Popen(  # noqa: S603 - fixed repository wrapper under test.
+        [harness.wrapper, "recover-ledger-capacity", "200000", "80000", "2000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=harness.environment,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not harness.capacity_started.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert harness.capacity_started.exists()
+        assert harness.recreated.exists()
+        os.killpg(recovery.pid, interruption)
+        _, stderr = recovery.communicate(timeout=5)
+    finally:
+        if recovery.poll() is None:
+            os.killpg(recovery.pid, signal.SIGKILL)
+            _ = recovery.communicate(timeout=5)
+
+    assert recovery.returncode == expected_status, stderr
+    assert harness.command_log.read_text(encoding="utf-8").splitlines()[-1] == "stop"
+    assert harness.stopped.exists()
+    assert harness.runtime_config.read_text(encoding="utf-8") == _runtime_config_text()
+
+
+def test_runtime_recovery_lock_rejects_concurrent_update_without_reverting_caps(
+    tmp_path: Path,
+) -> None:
+    harness = _runtime_recovery_harness(tmp_path)
+    harness.environment["NBLB_FAKE_BLOCK_UP"] = "1"
+    recovery = subprocess.Popen(  # noqa: S603 - fixed repository wrapper under test.
+        [harness.wrapper, "recover-ledger-capacity", "200000", "80000", "2000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=harness.environment,
+    )
+    deadline = time.monotonic() + 5
+    while not harness.up_started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    try:
+        assert harness.up_started.exists(), recovery.communicate(timeout=1)
+        concurrent = harness.run("update-ledger-caps", "300000", "100000", "3000")
+        assert concurrent.returncode != 0
+        assert concurrent.stderr == "runtime_config_lock_busy\n"
+    finally:
+        harness.up_release.touch()
+    stdout, stderr = recovery.communicate(timeout=5)
+
+    assert recovery.returncode == 0, stderr
+    assert stdout == "ledger_capacity_recreated_same_image\n"
+    current = harness.runtime_config.read_text(encoding="utf-8")
+    assert "NBLB_ADMIN_EVENT_MAX_ROWS=200000" in current
+    assert "NBLB_ADMIN_EVENT_MAX_ROWS=300000" not in current
 
 
 def test_workflows_use_only_full_sha_actions_and_minimum_job_permissions() -> None:

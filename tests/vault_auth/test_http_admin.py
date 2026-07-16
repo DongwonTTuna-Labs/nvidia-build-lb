@@ -1,20 +1,26 @@
 import hashlib
+from uuid import UUID
 
 import anyio
 import pytest
+from sqlalchemy import text
 
 from nvidia_build_lb.admin.schemas import (
     AdminEventListResponse,
+    AdminOperatorReadinessRead,
     AdminOverviewRead,
     AdminValidationErrorResponse,
     DownstreamScope,
     DownstreamTokenIssued,
     DownstreamTokenIssueRequest,
     DownstreamTokenListResponse,
+    HealthState,
+    ReadinessCause,
     UpstreamKeyCreateRequest,
     UpstreamKeyListResponse,
     UpstreamKeyRead,
 )
+from nvidia_build_lb.db_models import UpstreamKeyRow
 from nvidia_build_lb.schemas import ErrorEnvelope
 
 from .conftest import ADMIN_TOKEN, CredentialHttpSlice
@@ -31,6 +37,39 @@ def _admin_headers() -> dict[str, str]:
         "Origin": _ORIGIN,
         "Authorization": f"Bearer {ADMIN_TOKEN}",
     }
+
+
+async def _mark_healthy(credential_http_slice: CredentialHttpSlice, key_id: UUID) -> None:
+    async with credential_http_slice.repositories.sessions.begin() as session:
+        row = await session.get(UpstreamKeyRow, key_id, with_for_update=True)
+        assert row is not None
+        row.health_state = HealthState.HEALTHY.value
+
+
+async def _seed_bulk_downstream_tokens(
+    credential_http_slice: CredentialHttpSlice,
+    count: int,
+) -> None:
+    async with credential_http_slice.repositories.sessions.begin() as session:
+        _ = await session.execute(
+            text(
+                """
+                INSERT INTO downstream_tokens (
+                    id, label, label_bytes, token_digest, models_read, chat_write,
+                    revoked_at, request_count, last_used_at, created_at
+                )
+                SELECT
+                    ('00000000-0000-4000-8000-' || lpad(item::text, 12, '0'))::uuid,
+                    'bulk-' || item,
+                    convert_to('bulk-' || item, 'UTF8'),
+                    decode(lpad(to_hex(item), 64, '0'), 'hex'),
+                    true, false, NULL, 0, NULL,
+                    TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                FROM generate_series(1, :count) AS item
+                """
+            ),
+            {"count": count},
+        )
 
 
 def test_http_upstream_create_returns_exact_safe_disabled_row(
@@ -85,6 +124,26 @@ def test_http_upstream_list_is_complete_and_stably_ordered(
     assert order == tuple(sorted(order))
 
 
+def test_http_unverified_upstream_enable_is_a_safe_conflict(
+    credential_http_slice: CredentialHttpSlice,
+) -> None:
+    created = anyio.run(
+        credential_http_slice.repositories.upstream.create,
+        UpstreamKeyCreateRequest(key="http-unverified-enable"),
+        "http-unverified-create",
+    )
+
+    response = credential_http_slice.client.post(
+        f"/admin/api/v1/upstream-keys/{created.id}/enable",
+        headers=_admin_headers(),
+    )
+
+    error = ErrorEnvelope.model_validate_json(response.content)
+    assert response.status_code == 409
+    assert error.error.code == "resource_conflict"
+    assert "health" not in response.text
+
+
 def test_http_enabled_upstream_delete_is_a_safe_conflict(
     credential_http_slice: CredentialHttpSlice,
 ) -> None:
@@ -94,6 +153,7 @@ def test_http_enabled_upstream_delete_is_a_safe_conflict(
         UpstreamKeyCreateRequest(key="http-enabled-delete"),
         "http-enabled-create",
     )
+    anyio.run(_mark_healthy, credential_http_slice, created.id)
     anyio.run(
         credential_http_slice.repositories.upstream.enable,
         created.id,
@@ -232,3 +292,26 @@ def test_http_overview_and_events_use_closed_product_projections(
     assert events_response.status_code == 200
     assert overview.downstream_tokens.total == 1
     assert events.items[0].event_type.value == "downstream_token_issued"
+
+
+def test_http_operator_readiness_is_bounded_with_ten_thousand_tokens(
+    credential_http_slice: CredentialHttpSlice,
+) -> None:
+    anyio.run(_seed_bulk_downstream_tokens, credential_http_slice, 10_000)
+
+    response = credential_http_slice.client.get(
+        "/admin/api/v1/operator-readiness",
+        headers=_admin_headers(),
+    )
+
+    readiness = AdminOperatorReadinessRead.model_validate_json(response.content)
+    assert response.status_code == 200
+    assert len(response.content) < 256
+    assert readiness.readiness_cause is ReadinessCause.NO_ELIGIBLE_UPSTREAM
+    assert set(readiness.model_dump()) == {
+        "runtime_state",
+        "readiness_cause",
+        "ledger_status",
+        "capacity_blocker",
+    }
+    assert b"bulk-" not in response.content

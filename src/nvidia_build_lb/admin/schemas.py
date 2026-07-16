@@ -1,33 +1,46 @@
 """Strict administration request and response DTOs."""
 
-from typing import Annotated, ClassVar, Literal, Self
+from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from nvidia_build_lb.admin._types import (
     CanonicalScopes,
+    CapacityBlocker,
     DownstreamLabel,
     DownstreamScope,
     EventOutcome,
     EventType,
     HealthState,
     LastStatusClass,
+    LedgerStatus,
     NonNegativeCounter,
     OneTimeToken,
     OpaqueIdentifier,
     OverviewStatus,
     ProbeStatus,
+    ReadinessCause,
+    RuntimeState,
     UpstreamCredential,
+    UpstreamRoutingState,
     UtcTimestamp,
     WireFingerprint,
 )
+from nvidia_build_lb.admin.schema_base import AdminDTO
+from nvidia_build_lb.admin.validation_schemas import AdminValidationErrorResponse
 
 __all__: tuple[str, ...] = (
+    "AdminDashboardEventListResponse",
+    "AdminDashboardEventRead",
+    "AdminDashboardRead",
     "AdminEventListResponse",
     "AdminEventRead",
+    "AdminLedgerRead",
+    "AdminOperatorReadinessRead",
     "AdminOverviewRead",
     "AdminValidationErrorResponse",
+    "CapacityBlocker",
     "DownstreamScope",
     "DownstreamTokenIssueRequest",
     "DownstreamTokenIssued",
@@ -37,31 +50,32 @@ __all__: tuple[str, ...] = (
     "EventType",
     "HealthState",
     "LastStatusClass",
+    "LedgerStatus",
     "OverviewStatus",
     "ProbeStatus",
+    "ReadinessCause",
+    "RuntimeState",
     "UpstreamKeyCreateRequest",
     "UpstreamKeyListResponse",
     "UpstreamKeyRead",
     "UpstreamProbeResponse",
+    "UpstreamRoutingState",
 )
 
 
-class _AdminDTO(BaseModel):
-    model_config: ClassVar[ConfigDict] = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-
-class UpstreamKeyCreateRequest(_AdminDTO):
+class UpstreamKeyCreateRequest(AdminDTO):
     """Opaque upstream credential creation input."""
 
     key: UpstreamCredential
 
 
-class UpstreamKeyRead(_AdminDTO):
+class UpstreamKeyRead(AdminDTO):
     """Secret-free upstream key state."""
 
     id: UUID
     fingerprint: WireFingerprint
     enabled: bool
+    routing_state: UpstreamRoutingState
     health_state: HealthState
     cooldown_until: UtcTimestamp | None
     request_count: NonNegativeCounter
@@ -73,13 +87,13 @@ class UpstreamKeyRead(_AdminDTO):
     updated_at: UtcTimestamp
 
 
-class UpstreamKeyListResponse(_AdminDTO):
+class UpstreamKeyListResponse(AdminDTO):
     """Complete ordered upstream key collection."""
 
     items: tuple[UpstreamKeyRead, ...]
 
 
-class UpstreamProbeResponse(_AdminDTO):
+class UpstreamProbeResponse(AdminDTO):
     """One key's explicit probe outcome."""
 
     id: UUID
@@ -88,14 +102,14 @@ class UpstreamProbeResponse(_AdminDTO):
     observed_at: UtcTimestamp
 
 
-class DownstreamTokenIssueRequest(_AdminDTO):
+class DownstreamTokenIssueRequest(AdminDTO):
     """Unique label and exact scopes for one token issuance."""
 
     label: DownstreamLabel
     scopes: CanonicalScopes
 
 
-class _DownstreamTokenState(_AdminDTO):
+class _DownstreamTokenState(AdminDTO):
     label: DownstreamLabel
     scopes: CanonicalScopes
     id: UUID
@@ -115,13 +129,13 @@ class DownstreamTokenRead(_DownstreamTokenState):
     """Digest-free persisted downstream token state."""
 
 
-class DownstreamTokenListResponse(_AdminDTO):
+class DownstreamTokenListResponse(AdminDTO):
     """Complete ordered downstream token collection."""
 
     items: tuple[DownstreamTokenRead, ...]
 
 
-class UpstreamKeyOverview(_AdminDTO):
+class UpstreamKeyOverview(AdminDTO):
     """Closed current upstream aggregate counts."""
 
     total: NonNegativeCounter
@@ -131,7 +145,7 @@ class UpstreamKeyOverview(_AdminDTO):
     degraded: NonNegativeCounter
 
 
-class DownstreamTokenOverview(_AdminDTO):
+class DownstreamTokenOverview(AdminDTO):
     """Closed current downstream aggregate counts."""
 
     total: NonNegativeCounter
@@ -139,7 +153,7 @@ class DownstreamTokenOverview(_AdminDTO):
     revoked: NonNegativeCounter
 
 
-class AdminOverviewRead(_AdminDTO):
+class AdminOverviewRead(AdminDTO):
     """Operational readiness and aggregate counters."""
 
     status: OverviewStatus
@@ -151,7 +165,7 @@ class AdminOverviewRead(_AdminDTO):
     generated_at: UtcTimestamp
 
 
-class AdminEventRead(_AdminDTO):
+class AdminEventRead(AdminDTO):
     """One secret-free durable event."""
 
     id: UUID
@@ -165,24 +179,57 @@ class AdminEventRead(_AdminDTO):
     occurred_at: UtcTimestamp
 
 
-class AdminEventListResponse(_AdminDTO):
+class AdminEventListResponse(AdminDTO):
     """Newest one hundred secret-free events."""
 
     items: Annotated[tuple[AdminEventRead, ...], Field(max_length=100)]
 
 
-class _AdminValidationErrorDetail(_AdminDTO):
-    code: Literal["invalid_request"] = "invalid_request"
-    message: Literal["request validation failed"] = "request validation failed"
-    request_id: OpaqueIdentifier
+class AdminDashboardEventRead(AdminEventRead):
+    """Dashboard event with durable key identity and exact attempt linkage."""
+
+    upstream_key_fingerprint: WireFingerprint | None
+    attempt_started_event_id: UUID | None
 
 
-class AdminValidationErrorResponse(_AdminDTO):
-    """Fixed safe replacement for framework validation detail."""
+class AdminDashboardEventListResponse(AdminDTO):
+    """Newest one hundred events from the dashboard transaction."""
 
-    error: _AdminValidationErrorDetail
+    items: Annotated[tuple[AdminDashboardEventRead, ...], Field(max_length=100)]
 
-    @classmethod
-    def from_request_id(cls, request_id: str) -> Self:
-        """Construct the sole safe admin 422 response."""
-        return cls(error=_AdminValidationErrorDetail(request_id=request_id))
+
+class AdminLedgerRead(AdminDTO):
+    """Bounded retention and admission evidence from one database snapshot."""
+
+    status: LedgerStatus
+    capacity_blocker: CapacityBlocker
+    event_rows: NonNegativeCounter
+    reserved_terminal_slots: NonNegativeCounter
+    event_capacity: NonNegativeCounter
+    attempt_rows: NonNegativeCounter
+    attempt_capacity: NonNegativeCounter
+    last_maintenance_completed_at: UtcTimestamp | None
+    last_pruned_event_rows: NonNegativeCounter
+    last_pruned_attempt_rows: NonNegativeCounter
+    oldest_event_at: UtcTimestamp | None
+
+
+class AdminOperatorReadinessRead(AdminDTO):
+    """Bounded host-operator truth without credential or event collections."""
+
+    runtime_state: RuntimeState
+    readiness_cause: ReadinessCause
+    ledger_status: LedgerStatus
+    capacity_blocker: CapacityBlocker
+
+
+class AdminDashboardRead(AdminDTO):
+    """Canonical coherent administration read consumed by the browser."""
+
+    runtime_state: RuntimeState
+    readiness_cause: ReadinessCause
+    ledger: AdminLedgerRead
+    overview: AdminOverviewRead
+    upstream_keys: UpstreamKeyListResponse
+    downstream_tokens: DownstreamTokenListResponse
+    events: AdminDashboardEventListResponse

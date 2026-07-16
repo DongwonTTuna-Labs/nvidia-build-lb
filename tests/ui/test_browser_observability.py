@@ -105,13 +105,13 @@ def _accepted_audit() -> tuple[PageAudit, tuple[SafeNetworkObservation, ...]]:
     server_audit = (
         SafeNetworkObservation(
             method="GET",
-            path="/admin/api/v1/overview",
+            path="/admin/api/v1/dashboard",
             status=401,
             query_present=False,
         ),
         SafeNetworkObservation(
             method="GET",
-            path="/admin/api/v1/overview",
+            path="/admin/api/v1/dashboard",
             status=503,
             query_present=False,
         ),

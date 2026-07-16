@@ -167,7 +167,7 @@ def vault() -> Vault:
 def migrated_session_factory(
     empty_database: SecretStr,
 ) -> Generator[async_sessionmaker[AsyncSession]]:
-    migrate(alembic_config(empty_database), "0004_vault_key_verifier")
+    migrate(alembic_config(empty_database), "0005_admin_dashboard_ledger")
     engine = create_async_engine(
         empty_database.get_secret_value(),
         poolclass=NullPool,

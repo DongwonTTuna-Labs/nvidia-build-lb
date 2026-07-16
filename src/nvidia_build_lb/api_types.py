@@ -1,11 +1,13 @@
 """Injected dependencies for the composed public and administration API."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID
 
+import anyio
 from sqlalchemy.exc import SQLAlchemyError
 
+from nvidia_build_lb.active_routed_requests import ActiveRoutedRequestRegistry
 from nvidia_build_lb.admin_credentials import CredentialServices
 from nvidia_build_lb.credential_protocols import CredentialRepositorySurface
 from nvidia_build_lb.logging import ServiceLogger
@@ -26,12 +28,14 @@ class RepositoryReadinessProbe:
     """Project health readiness from the same repository overview as admin."""
 
     repositories: CredentialRepositorySurface
+    deadline_seconds: float = 5
 
     async def is_ready(self) -> bool:
         """Return the current repository-backed overview readiness."""
         try:
-            return (await self.repositories.overview()).ready
-        except (OSError, SQLAlchemyError):
+            with anyio.fail_after(self.deadline_seconds):
+                return (await self.repositories.overview()).ready
+        except (OSError, SQLAlchemyError, TimeoutError):
             return False
 
 
@@ -80,3 +84,6 @@ class ApplicationServices:
     responders: ChatResponderFactory
     readiness: ReadinessProbe
     logger: ServiceLogger
+    active_requests: ActiveRoutedRequestRegistry = field(
+        default_factory=ActiveRoutedRequestRegistry
+    )

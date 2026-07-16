@@ -68,9 +68,12 @@ class ShowcaseDesktopObservation(_StrictModel):
     main_padding_start: Literal["32px"]
     main_padding_end: Literal["32px"]
     disclosure_display: Literal["none"]
+    disclosure_open: Literal[True]
     rail_content_contained: Literal[True]
     main_children_full_span: Literal[True]
     navigation_links: Literal[6]
+    navigation_links_focusable: Literal[True]
+    current_links: Literal[1]
     summary_cells: Literal[0]
     specimen_grid_tracks: Literal[3]
     status_grid_tracks: Literal[4]
@@ -222,7 +225,9 @@ def showcase_desktop_observation(page: Page) -> ShowcaseDesktopObservation:
     expression = r"""() => {
 const rail = document.querySelector(".rail");
 const main = document.querySelector("main");
-const disclosure = document.querySelector(".navigation-disclosure > summary");
+const disclosureRoot = document.querySelector(".navigation-disclosure");
+const disclosure = disclosureRoot.querySelector(":scope > summary");
+const navigationLinks = [...disclosureRoot.querySelectorAll("nav a")];
 const style = getComputedStyle(main);
 const tracks = (selector) =>
   getComputedStyle(document.querySelector(selector)).gridTemplateColumns.split(/\s+/).length;
@@ -237,10 +242,14 @@ return JSON.stringify({
   main_padding_start: style.paddingInlineStart,
   main_padding_end: style.paddingInlineEnd,
   disclosure_display: getComputedStyle(disclosure).display,
+  disclosure_open: disclosureRoot.open,
   rail_content_contained: rail.contains(document.querySelector(".identity")) &&
     rail.contains(document.querySelector("nav")),
   main_children_full_span: [...main.children].every(fullSpan),
-  navigation_links: rail.querySelectorAll("nav a").length,
+  navigation_links: navigationLinks.length,
+  navigation_links_focusable: navigationLinks.every((link) =>
+    link.tabIndex === 0 && link.getClientRects().length > 0),
+  current_links: navigationLinks.filter((link) => link.hasAttribute("aria-current")).length,
   summary_cells: document.querySelectorAll(".summary-grid > *").length,
   specimen_grid_tracks: tracks(".specimen-grid"),
   status_grid_tracks: tracks(".status-grid"),

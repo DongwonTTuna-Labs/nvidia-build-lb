@@ -85,6 +85,52 @@ class _RuntimeAudit(_StrictModel):
         return self
 
 
+class _BackupReceiptV2(_StrictModel):
+    schema_version: Literal[2]
+    status: Literal["PASS"]
+    pair_id: _SHA256
+    backup_id: str
+    restored_state_matches: bool
+    alembic_revision: Literal["0004_vault_key_verifier"]
+    upstream_count: int = Field(ge=0)
+    upstream_identity_sha256: _SHA256
+    downstream_count: int = Field(ge=0)
+    downstream_digest_sha256: _SHA256
+    vault_key_sha256: _SHA256
+    vault_key_matches_database: Literal[True]
+
+
+class _BackupReceiptV3(_StrictModel):
+    schema_version: Literal[3]
+    status: Literal["PASS"]
+    pair_id: _SHA256
+    backup_id: str
+    restored_state_matches: bool
+    alembic_revision: Literal["0005_admin_dashboard_ledger"]
+    upstream_count: int = Field(ge=0)
+    upstream_identity_sha256: _SHA256
+    downstream_count: int = Field(ge=0)
+    downstream_digest_sha256: _SHA256
+    vault_key_sha256: _SHA256
+    vault_key_matches_database: Literal[True]
+    admin_event_count: int = Field(ge=0)
+    admin_event_identity_sha256: _SHA256
+    attempt_receipt_count: int = Field(ge=0)
+    pending_attempt_count: int = Field(ge=0)
+    attempt_receipt_identity_sha256: _SHA256
+    live_pin_count: int = Field(ge=0)
+    live_pin_identity_sha256: _SHA256
+    rolled_up_routed_request_count: int = Field(ge=0)
+    admin_ledger_state_sha256: _SHA256
+
+
+type _BackupReceipt = Annotated[
+    _BackupReceiptV2 | _BackupReceiptV3,
+    Field(discriminator="schema_version"),
+]
+_BACKUP_RECEIPT: Final[TypeAdapter[_BackupReceipt]] = TypeAdapter(_BackupReceipt)
+
+
 def _regular_bytes(path: Path) -> bytes:
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
@@ -136,27 +182,41 @@ def _validate_visual_reviews(
     source_tree_sha256: str,
     run_artifacts: dict[str, dict[str, str]],
 ) -> None:
-    request = _pass(todo6b / "review-request.json")
-    if (
-        request.get("schema_version") != _SCHEMA_VERSION
-        or request.get("image_digest") != image_digest
-        or request.get("postgres_image_digest") != postgres_image_digest
-        or request.get("source_tree_sha256") != source_tree_sha256
-        or request.get("run_artifact_sha256") != run_artifacts
-    ):
+    request_path = todo6b / "review-request.json"
+    request = _json(request_path)
+    process_baseline_sha = _sha256(todo6b / "process-baseline.json")
+    expected_request = _JSON_OBJECT.validate_python(
+        {
+            "schema_version": _SCHEMA_VERSION,
+            "status": "REVIEW_REQUIRED",
+            "fresh_cleanup_sha256": None,
+            "image_digest": image_digest,
+            "postgres_image_digest": postgres_image_digest,
+            "source_tree_sha256": source_tree_sha256,
+            "process_baseline_sha256": process_baseline_sha,
+            "run_artifact_sha256": run_artifacts,
+        }
+    )
+    if request != expected_request:
         reason = "visual_review_request_mismatch"
         raise ValueError(reason)
-    common = {
-        "schema_version": _SCHEMA_VERSION,
-        "status": "PASS",
-        "image_digest": image_digest,
-        "postgres_image_digest": postgres_image_digest,
-        "source_tree_sha256": source_tree_sha256,
-        "process_baseline_sha256": request.get("process_baseline_sha256"),
-        "fresh_cleanup_sha256": request.get("fresh_cleanup_sha256"),
-        "run_artifact_sha256": run_artifacts,
-        "blocking_findings": [],
-    }
+    request_sha = _sha256(request_path)
+    _ = _pass(todo6b / "cleanup-fresh.json")
+    cleanup_sha = _sha256(todo6b / "cleanup-fresh.json")
+    common = _JSON_OBJECT.validate_python(
+        {
+            "schema_version": _SCHEMA_VERSION,
+            "status": "PASS",
+            "image_digest": image_digest,
+            "postgres_image_digest": postgres_image_digest,
+            "source_tree_sha256": source_tree_sha256,
+            "process_baseline_sha256": process_baseline_sha,
+            "fresh_cleanup_sha256": cleanup_sha,
+            "review_request_sha256": request_sha,
+            "run_artifact_sha256": run_artifacts,
+            "blocking_findings": [],
+        }
+    )
     for filename, lane in (
         ("visual-review-a.json", "objective-visual"),
         ("visual-review-b.json", "design-accessibility-persona"),
@@ -187,24 +247,17 @@ def _source_identity(arguments: Arguments) -> tuple[str, str]:
 
 
 def _validate_backup_restore(verify_local: Path) -> None:
-    backup = _pass(verify_local / "backup.json")
-    restore = _pass(verify_local / "restore.json")
-    state_fields = (
-        "pair_id",
-        "alembic_revision",
-        "upstream_count",
-        "upstream_identity_sha256",
-        "downstream_count",
-        "downstream_digest_sha256",
-        "vault_key_sha256",
-    )
-    if any(backup.get(field) != restore.get(field) for field in state_fields):
+    backup = _BACKUP_RECEIPT.validate_json(_regular_bytes(verify_local / "backup.json"))
+    restore = _BACKUP_RECEIPT.validate_json(_regular_bytes(verify_local / "restore.json"))
+    backup_state = backup.model_dump(exclude={"restored_state_matches"})
+    restore_state = restore.model_dump(exclude={"restored_state_matches"})
+    if type(backup) is not type(restore) or backup_state != restore_state:
         reason = "backup_restore_state_mismatch"
         raise ValueError(reason)
-    if backup.get("restored_state_matches") is not False:
+    if backup.restored_state_matches is not False:
         reason = "backup_receipt_invalid"
         raise ValueError(reason)
-    if restore.get("restored_state_matches") is not True:
+    if restore.restored_state_matches is not True:
         reason = "restore_receipt_invalid"
         raise ValueError(reason)
 
@@ -242,7 +295,6 @@ def _validate_stage_passes(arguments: Arguments) -> None:
             (
                 "candidate.json",
                 "determinism.json",
-                "review-request.json",
                 "visual-review-a.json",
                 "visual-review-b.json",
                 "cleanup-fresh.json",

@@ -20,7 +20,12 @@ from nvidia_build_lb.config import DeploymentStage, LogLevel
 from nvidia_build_lb.logging import LoggingConfig, ServiceLogger, init_logging
 from nvidia_build_lb.nvidia_adapter import NvidiaAdapterDependencies, NvidiaHostedAdapter
 from nvidia_build_lb.outcome_types import SourceSignal
-from nvidia_build_lb.outcomes import NoEligibleKey, ReservationFailure, map_public_outcome
+from nvidia_build_lb.outcomes import (
+    LedgerCapacityExhausted,
+    NoEligibleKey,
+    ReservationFailure,
+    map_public_outcome,
+)
 from nvidia_build_lb.pinned_httpx import httpx2
 from nvidia_build_lb.polling import FailureTerminal
 from nvidia_build_lb.routing import (
@@ -88,7 +93,7 @@ class ScenarioRouter:
         if failure is not None:
             signal, retry_after_seconds = failure
             outcome = map_public_outcome(signal)
-            if isinstance(signal, (NoEligibleKey, ReservationFailure)):
+            if isinstance(signal, (LedgerCapacityExhausted, NoEligibleKey, ReservationFailure)):
                 attempt_count = 0
                 observations: tuple[RoutedAttemptObservation, ...] = ()
             else:

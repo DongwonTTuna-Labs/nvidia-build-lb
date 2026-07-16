@@ -122,6 +122,7 @@ class EvidenceRecorder:
             "src/nvidia_build_lb/web/templates/showcase.html",
             "src/nvidia_build_lb/web/static/admin.css",
             "src/nvidia_build_lb/web/static/showcase.css",
+            "src/nvidia_build_lb/web/static/showcase.js",
             "src/nvidia_build_lb/web/static/admin.js",
         )
         repository_root = Path(__file__).resolve().parents[2]
@@ -169,6 +170,64 @@ y:document.documentElement.scrollHeight*devicePixelRatio
                     pixel_height=image.height,
                     landmarks=(f"right-edge:{image.width}", f"bottom-edge:{image.height}"),
                     content_row_coverage=coverage,
+                ),
+            )
+        )
+
+    def capture_viewport(self, page: Page, spec: CaptureSpec) -> None:
+        """Capture one real viewport for fixed dialogs without full-page repetition."""
+        if self._blackout is not None:
+            raise CaptureBlockedError(self._blackout)
+        path = (self._directory / "captures" / f"{spec.name}.png").resolve()
+        content = page.screenshot(path=str(path), full_page=False)
+        source_paths = (
+            "src/nvidia_build_lb/web/templates/admin.html",
+            "src/nvidia_build_lb/web/templates/showcase.html",
+            "src/nvidia_build_lb/web/static/admin.css",
+            "src/nvidia_build_lb/web/static/showcase.css",
+            "src/nvidia_build_lb/web/static/showcase.js",
+            "src/nvidia_build_lb/web/static/admin.js",
+        )
+        repository_root = Path(__file__).resolve().parents[2]
+        source_newest = max(
+            (repository_root / source).stat().st_mtime_ns for source in source_paths
+        )
+        capture_mtime = path.stat().st_mtime_ns
+        if capture_mtime <= source_newest:
+            reason = "viewport capture is not newer than every rendered source"
+            raise CaptureVerificationError(reason)
+        image = decode_rgb_png(content)
+        dimensions = ScrollPosition.model_validate_json(
+            evaluate_string(
+                page,
+                """() => JSON.stringify({
+                  x: innerWidth * devicePixelRatio,
+                  y: innerHeight * devicePixelRatio
+                })""",
+            )
+        )
+        if image.width != round(dimensions.x) or image.height != round(dimensions.y):
+            reason = "viewport capture raster does not match the real browser viewport"
+            raise CaptureVerificationError(reason)
+        self.add_capture_records(
+            (
+                CaptureRecord(
+                    name=spec.name,
+                    route=page.url.split("?", maxsplit=1)[0],
+                    state=spec.state,
+                    viewport=spec.viewport,
+                    reduced_motion=spec.reduced_motion,
+                    native_zoom=spec.native_zoom,
+                    path=str(path),
+                    sha256=sha256(content).hexdigest(),
+                    byte_count=len(content),
+                    source_newest_mtime_ns=source_newest,
+                    capture_mtime_ns=capture_mtime,
+                    source_paths=source_paths,
+                    pixel_width=image.width,
+                    pixel_height=image.height,
+                    landmarks=(f"viewport-right:{image.width}", f"viewport-bottom:{image.height}"),
+                    content_row_coverage=informative_row_coverage(image),
                 ),
             )
         )

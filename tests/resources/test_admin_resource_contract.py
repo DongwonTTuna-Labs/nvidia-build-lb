@@ -27,11 +27,12 @@ def test_admin_resource_allowlist_has_no_generic_path_when_enumerated() -> None:
     values = {resource.value for resource in WebResource}
 
     # When: the Todo 4 names are compared with the existing showcase resources.
-    # Then: only the five exact document and asset names exist.
+    # Then: only the six exact document and asset names exist.
     assert values == {
         "admin-document",
         "admin-stylesheet",
         "admin-script",
         "showcase-document",
         "showcase-stylesheet",
+        "showcase-script",
     }

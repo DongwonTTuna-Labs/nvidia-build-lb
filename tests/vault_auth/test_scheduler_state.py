@@ -40,6 +40,13 @@ async def _persist_key(
     async with sessions() as session:
         row = await session.get(UpstreamKeyRow, created.id)
         assert row is not None
+    async with sessions.begin() as session:
+        verified = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert verified is not None
+        verified.health_state = HealthState.HEALTHY.value
+    async with sessions() as session:
+        row = await session.get(UpstreamKeyRow, created.id)
+        assert row is not None
         return row
 
 
@@ -76,7 +83,7 @@ async def test_pre_network_attempt_and_cursor_survive_repository_restart_as_cras
     assert persisted.success_count == persisted.failure_count == 0
     assert persisted.last_used_at == fixed_clock.now()
     assert len(events) == 1
-    assert events[0].event_type == EventType.UPSTREAM_ATTEMPT.value
+    assert events[0].event_type == EventType.UPSTREAM_PROBE.value
     assert events[0].outcome_class == EventOutcome.STARTED.value
 
 
@@ -104,10 +111,10 @@ async def test_terminal_success_commits_separately_and_preserves_counter_invaria
     # Then: exactly one success and terminal event are durable after the started event.
     async with migrated_session_factory() as session:
         persisted = await session.get(UpstreamKeyRow, key.id)
-        outcomes = tuple(
+        events = tuple(
             (
                 await session.scalars(
-                    select(AdminEventRow.outcome_class)
+                    select(AdminEventRow)
                     .where(AdminEventRow.request_id == "success-request")
                     .order_by(AdminEventRow.occurred_at.asc(), AdminEventRow.id.asc())
                 )
@@ -117,7 +124,11 @@ async def test_terminal_success_commits_separately_and_preserves_counter_invaria
     assert persisted.request_count == persisted.success_count == 1
     assert persisted.failure_count == 0
     assert persisted.health_state == HealthState.HEALTHY.value
-    assert set(outcomes) == {EventOutcome.STARTED.value, EventOutcome.SUCCEEDED.value}
+    assert {event.outcome_class for event in events} == {
+        EventOutcome.STARTED.value,
+        EventOutcome.SUCCEEDED.value,
+    }
+    assert {event.event_type for event in events} == {EventType.UPSTREAM_PROBE.value}
 
 
 async def test_terminal_failure_is_once_only_and_never_decrements_attempts(

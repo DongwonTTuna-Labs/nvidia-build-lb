@@ -62,11 +62,11 @@ def test_answered_request_failure_is_removed_from_verified_projection() -> None:
     audit.observe_response(_Response(request=answered, status=204))
 
     audit.set_phase("auth_initial_offline")
-    audit.observe_failed(_Request(method="GET", url="http://127.0.0.1:2456/admin/api/v1/overview"))
+    audit.observe_failed(_Request(method="GET", url="http://127.0.0.1:2456/admin/api/v1/dashboard"))
     audit.set_phase("offline_refresh")
-    audit.observe_failed(_Request(method="GET", url="http://127.0.0.1:2456/admin/api/v1/overview"))
+    audit.observe_failed(_Request(method="GET", url="http://127.0.0.1:2456/admin/api/v1/dashboard"))
     audit.set_phase("native-offline_refresh")
-    audit.observe_failed(_Request(method="GET", url="http://127.0.0.1:2456/admin/api/v1/overview"))
+    audit.observe_failed(_Request(method="GET", url="http://127.0.0.1:2456/admin/api/v1/dashboard"))
     for phase, action, status in (
         ("upstream_probe_503", "probe", 503),
         ("upstream_enable_401", "enable", 401),

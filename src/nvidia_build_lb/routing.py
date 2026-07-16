@@ -2,13 +2,12 @@
 
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from typing import Final
 from uuid import UUID
 
 import anyio
 from anyio.lowlevel import checkpoint_if_cancelled
 
-from nvidia_build_lb.attempt_types import AttemptLease, AttemptStartCommand
+from nvidia_build_lb.attempt_types import AttemptLease
 from nvidia_build_lb.pinned_runtime import PinnedRuntimeDriftError
 from nvidia_build_lb.polling import (
     FailureTerminal,
@@ -22,6 +21,7 @@ from nvidia_build_lb.routing_failures import (
     is_aggregate_member,
     protocol_failure,
 )
+from nvidia_build_lb.routing_limits import MAX_PUBLIC_ATTEMPTS
 from nvidia_build_lb.routing_models import (
     RoutedFailure,
     RoutedJson,
@@ -31,18 +31,15 @@ from nvidia_build_lb.routing_models import (
 )
 from nvidia_build_lb.routing_observations import RoutedObservations
 from nvidia_build_lb.routing_persistence import (
+    checkpoint_before_network,
     finalize_cancelled_shielded,
     finalize_failure_shielded,
     finalize_success_shielded,
 )
-from nvidia_build_lb.routing_reservations import no_eligible_failure, reservation_failure
-from nvidia_build_lb.scheduler_state import NoEligibleUpstreamKeyError
-from nvidia_build_lb.scheduler_types import SchedulerStateUnavailableError
+from nvidia_build_lb.routing_reservations import build_start_command, reserve_attempt
 from nvidia_build_lb.terminal_retirement_fail_stop import fail_stop_after_terminal
 from nvidia_build_lb.transport_common import PinnedTransportDriftError
-from nvidia_build_lb.vault import VaultDecryptionError
 
-_MAX_PUBLIC_ATTEMPTS: Final = 2
 __all__ = [
     "RoutedFailure",
     "RoutedJson",
@@ -72,14 +69,20 @@ class RoutingCoordinator:
         observations = RoutedObservations()
         attempt_count = 0
         excluded_key_ids: frozenset[UUID] = frozenset()
-        maximum_attempts = 1 if explicit_probe_key_id is not None else _MAX_PUBLIC_ATTEMPTS
+        maximum_attempts = 1 if explicit_probe_key_id is not None else MAX_PUBLIC_ATTEMPTS
         for ordinal in range(1, maximum_attempts + 1):
-            command = self._start_command(
+            command = build_start_command(
+                self.dependencies,
                 request_id,
                 explicit_probe_key_id,
                 excluded_key_ids,
             )
-            reservation = await self._reserve(command, bool(failures), attempt_count)
+            reservation = await reserve_attempt(
+                self.dependencies,
+                command,
+                has_failure=bool(failures),
+                attempt_count=attempt_count,
+            )
             if reservation is None:
                 break
             if isinstance(reservation, RoutedFailure):
@@ -87,7 +90,7 @@ class RoutingCoordinator:
             lease = reservation
             attempt_count += 1
             started_monotonic = self.dependencies.monotonic_clock.monotonic()
-            await self._checkpoint_before_network(lease, started_monotonic)
+            await checkpoint_before_network(self.dependencies, lease, started_monotonic)
             terminal = await self._execute_attempt(lease, body, started_monotonic)
             handled = await self._handle_terminal(
                 terminal,
@@ -112,38 +115,6 @@ class RoutingCoordinator:
                 break
             excluded_key_ids = frozenset({lease.key_id})
         return observations.failure(aggregate_failures(failures), attempt_count)
-
-    def _start_command(
-        self,
-        request_id: str,
-        explicit_probe_key_id: UUID | None,
-        excluded_key_ids: frozenset[UUID],
-    ) -> AttemptStartCommand:
-        return AttemptStartCommand(
-            started_event_id=self.dependencies.uuid_source.new(),
-            terminal_event_id=self.dependencies.uuid_source.new(),
-            request_id=request_id,
-            service_epoch=self.dependencies.service_epoch,
-            explicit_probe_key_id=explicit_probe_key_id,
-            excluded_key_ids=excluded_key_ids,
-            started_at=self.dependencies.clock.now(),
-        )
-
-    async def _reserve(
-        self,
-        command: AttemptStartCommand,
-        has_failure: bool,
-        attempt_count: int,
-    ) -> AttemptLease | RoutedFailure | None:
-        try:
-            with anyio.CancelScope(shield=True):
-                return await self.dependencies.attempts.reserve_attempt(command)
-        except NoEligibleUpstreamKeyError as error:
-            if has_failure:
-                return None
-            return RoutedFailure(no_eligible_failure(error), 0)
-        except (SchedulerStateUnavailableError, VaultDecryptionError):
-            return RoutedFailure(reservation_failure(), attempt_count)
 
     async def _handle_terminal(
         self,
@@ -234,17 +205,6 @@ class RoutingCoordinator:
         )
         fail_stop_after_terminal(self.dependencies, committed)
         return committed
-
-    async def _checkpoint_before_network(
-        self,
-        lease: AttemptLease,
-        started_monotonic: float,
-    ) -> None:
-        try:
-            await checkpoint_if_cancelled()
-        except anyio.get_cancelled_exc_class():
-            await self._finalize_cancelled(lease, started_monotonic)
-            raise
 
     async def _cancel_stream_before_handoff(
         self,

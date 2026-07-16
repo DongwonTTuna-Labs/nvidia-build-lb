@@ -22,7 +22,7 @@ from .lighthouse_gate import LighthouseReceipt
 _UUID: Final = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _READ_CHUNK_BYTES: Final = 1024 * 1024
 
-_EXPECTED_CAPTURE_COUNT: Final = 32
+_EXPECTED_CAPTURE_COUNT: Final = 35
 _EXPECTED_SCENARIO_COUNT: Final = 10
 _EXPECTED_ADVERSARIAL_PROBE_COUNT: Final = 5
 _EXPECTED_LIGHTHOUSE_AUDIT_COUNT: Final = 4
@@ -63,6 +63,7 @@ class _VisualReview(_StrictModel):
     postgres_image_digest: str
     lane: Literal["objective-visual", "design-accessibility-persona"]
     process_baseline_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+    review_request_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     run_artifact_sha256: _RunArtifactBinding
     schema_version: Literal[2]
     source_tree_sha256: str
@@ -70,14 +71,14 @@ class _VisualReview(_StrictModel):
 
 
 class _ReviewRequest(_StrictModel):
-    fresh_cleanup_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")] | None
+    fresh_cleanup_sha256: None
     image_digest: str
     postgres_image_digest: str
     process_baseline_sha256: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
     run_artifact_sha256: _RunArtifactBinding
     schema_version: Literal[2]
     source_tree_sha256: str
-    status: Literal["PASS", "REVIEW_REQUIRED"]
+    status: Literal["REVIEW_REQUIRED"]
 
 
 class _DeterminismComparisons(_StrictModel):
@@ -320,6 +321,58 @@ def _write(path: Path, value: BaseModel) -> None:
         if descriptor >= 0:
             os.close(descriptor)
         os.close(parent)
+
+
+def _write_exclusive(path: Path, value: BaseModel) -> bytes:
+    payload = (value.model_dump_json(indent=2) + "\n").encode()
+    parent = _open_directory_no_follow(path.parent)
+    descriptor = -1
+    created = False
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent,
+        )
+        created = True
+        written = 0
+        while written < len(payload):
+            count = os.write(descriptor, payload[written:])
+            if count <= 0:
+                _raise_write_no_progress()
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.fsync(parent)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if created:
+            with suppress(FileNotFoundError):
+                os.unlink(path.name, dir_fd=parent)
+        raise
+    finally:
+        os.close(parent)
+    return payload
+
+
+def _immutable_review_request(
+    root: Path,
+    expected: _ReviewRequest,
+    *,
+    resume: bool,
+) -> tuple[_ReviewRequest, str]:
+    path = root / "review-request.json"
+    if resume:
+        payload = _read_regular_bytes(path)
+        observed = _ReviewRequest.model_validate_json(payload)
+        _assert_exact(observed, expected, "review request semantics changed")
+    else:
+        payload = _write_exclusive(path, expected)
+        observed = expected
+    return observed, hashlib.sha256(payload).hexdigest()
 
 
 def _raise_write_no_progress() -> None:
@@ -663,8 +716,8 @@ def main() -> int:
         _lighthouse_projection(lighthouse_b),
         "Lighthouse deterministic median projection changed",
     )
-    review_request = _ReviewRequest(
-        fresh_cleanup_sha256=fresh_cleanup_sha,
+    expected_review_request = _ReviewRequest(
+        fresh_cleanup_sha256=None,
         image_digest=args.image_digest,
         postgres_image_digest=args.postgres_image_digest,
         process_baseline_sha256=process_baseline_sha,
@@ -673,8 +726,12 @@ def main() -> int:
         source_tree_sha256=args.source_sha,
         status="REVIEW_REQUIRED",
     )
+    review_request, review_request_sha = _immutable_review_request(
+        root,
+        expected_review_request,
+        resume=fresh_cleanup_sha is not None,
+    )
     review_binding = review_request.run_artifact_sha256
-    _write(root / "review-request.json", review_request)
     _write(
         root / "determinism.json",
         _DeterminismReceipt(
@@ -701,6 +758,7 @@ def main() -> int:
             postgres_image_digest=args.postgres_image_digest,
             lane="objective-visual",
             process_baseline_sha256=process_baseline_sha,
+            review_request_sha256=review_request_sha,
             run_artifact_sha256=review_binding,
             schema_version=2,
             source_tree_sha256=args.source_sha,
@@ -716,6 +774,7 @@ def main() -> int:
             postgres_image_digest=args.postgres_image_digest,
             lane="design-accessibility-persona",
             process_baseline_sha256=process_baseline_sha,
+            review_request_sha256=review_request_sha,
             run_artifact_sha256=review_binding,
             schema_version=2,
             source_tree_sha256=args.source_sha,
@@ -745,19 +804,6 @@ def main() -> int:
     _write(root / "adversarial.json", adversarial)
     if final_status != "PASS":
         return 75
-    _write(
-        root / "review-request.json",
-        _ReviewRequest(
-            fresh_cleanup_sha256=fresh_cleanup_sha,
-            image_digest=args.image_digest,
-            postgres_image_digest=args.postgres_image_digest,
-            process_baseline_sha256=process_baseline_sha,
-            run_artifact_sha256=review_request.run_artifact_sha256,
-            schema_version=2,
-            source_tree_sha256=args.source_sha,
-            status="PASS",
-        ),
-    )
     return 0
 
 

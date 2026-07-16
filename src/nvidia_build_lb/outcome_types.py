@@ -48,6 +48,11 @@ class ReservationFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class LedgerCapacityExhausted:
+    """Local exact-evidence ledger cannot admit another routed attempt."""
+
+
+@dataclass(frozen=True, slots=True)
 class HttpStatusSignal:
     """An upstream status observed before downstream response start."""
 
@@ -82,6 +87,7 @@ class DownstreamLoss:
 type SourceSignal = (
     NoEligibleKey
     | ReservationFailure
+    | LedgerCapacityExhausted
     | HttpStatusSignal
     | ProtocolFailure
     | TransportSignal

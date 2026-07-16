@@ -5,16 +5,33 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import TypeAdapter
 from scripts.qa.canonical_evidence import Arguments, build_receipt
 
 _SOURCE = "a" * 64
 _APP = "sha256:" + "b" * 64
 _POSTGRES = "sha256:" + "c" * 64
+_JSON_OBJECT = TypeAdapter(dict[str, object])
+_V3_FIELDS: dict[str, object] = {
+    "admin_event_count": 4,
+    "admin_event_identity_sha256": "4" * 64,
+    "attempt_receipt_count": 2,
+    "pending_attempt_count": 1,
+    "attempt_receipt_identity_sha256": "5" * 64,
+    "live_pin_count": 1,
+    "live_pin_identity_sha256": "6" * 64,
+    "rolled_up_routed_request_count": 7,
+    "admin_ledger_state_sha256": "7" * 64,
+}
 
 
 def _write(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _read(path: Path) -> dict[str, object]:
+    return _JSON_OBJECT.validate_json(path.read_bytes())
 
 
 def _pass(**extra: object) -> dict[str, object]:
@@ -87,17 +104,34 @@ def _build_fixture(root: Path) -> Arguments:
             key: hashlib.sha256((run / filename).read_bytes()).hexdigest()
             for key, filename in run_files.items()
         }
-    request = _pass(
-        schema_version=2,
+    _write(arguments.todo6b / "process-baseline.json", {"schema_version": 1})
+    _write(arguments.todo6b / "cleanup-fresh.json", _pass(**pair))
+    process_sha = hashlib.sha256(
+        (arguments.todo6b / "process-baseline.json").read_bytes()
+    ).hexdigest()
+    cleanup_sha = hashlib.sha256((arguments.todo6b / "cleanup-fresh.json").read_bytes()).hexdigest()
+    request = {
+        "status": "REVIEW_REQUIRED",
+        "schema_version": 2,
         **pair,
-        process_baseline_sha256="d" * 64,
-        fresh_cleanup_sha256="e" * 64,
-        run_artifact_sha256=run_bindings,
-    )
+        "process_baseline_sha256": process_sha,
+        "fresh_cleanup_sha256": None,
+        "run_artifact_sha256": run_bindings,
+    }
     _write(arguments.todo6b / "review-request.json", request)
-    review_common: dict[str, object] = request | {"blocking_findings": list[str]()}
-    _ = review_common.pop("source_tree_sha256", None)
-    review_common["source_tree_sha256"] = _SOURCE
+    request_sha = hashlib.sha256(
+        (arguments.todo6b / "review-request.json").read_bytes()
+    ).hexdigest()
+    review_common: dict[str, object] = {
+        "status": "PASS",
+        "schema_version": 2,
+        **pair,
+        "process_baseline_sha256": process_sha,
+        "fresh_cleanup_sha256": cleanup_sha,
+        "review_request_sha256": request_sha,
+        "run_artifact_sha256": run_bindings,
+        "blocking_findings": [],
+    }
     _write(
         arguments.todo6b / "visual-review-a.json",
         review_common | {"lane": "objective-visual"},
@@ -109,22 +143,23 @@ def _build_fixture(root: Path) -> Arguments:
     for name in (
         "candidate.json",
         "determinism.json",
-        "cleanup-fresh.json",
         "cleanup-resume.json",
         "cleanup.json",
     ):
         _write(arguments.todo6b / name, _pass(**pair))
     _write(arguments.todo6b / "source-snapshot.json", {"status": "PASS"})
-    _write(arguments.todo6b / "process-baseline.json", {"schema_version": 1})
 
     backup_state = {
+        "schema_version": 2,
         "pair_id": "f" * 64,
+        "backup_id": "backup-v2",
         "alembic_revision": "0004_vault_key_verifier",
         "upstream_count": 1,
         "upstream_identity_sha256": "1" * 64,
         "downstream_count": 1,
         "downstream_digest_sha256": "2" * 64,
         "vault_key_sha256": "3" * 64,
+        "vault_key_matches_database": True,
     }
     _write(arguments.verify_local / "manual-qa.json", _pass(**pair))
     _write(arguments.verify_local / "adversarial.json", _pass())
@@ -148,6 +183,21 @@ def _build_fixture(root: Path) -> Arguments:
         ),
     )
     return arguments
+
+
+def _promote_backup_pair_to_v3(arguments: Arguments) -> None:
+    for name, restored in (("backup.json", False), ("restore.json", True)):
+        path = arguments.verify_local / name
+        receipt = _read(path)
+        receipt.update(
+            {
+                "schema_version": 3,
+                "alembic_revision": "0005_admin_dashboard_ledger",
+                "restored_state_matches": restored,
+                **_V3_FIELDS,
+            }
+        )
+        _write(path, receipt)
 
 
 def test_canonical_receipt_binds_all_source_and_image_pair_evidence(tmp_path: Path) -> None:
@@ -196,4 +246,74 @@ def test_canonical_receipt_rejects_runtime_audit_with_unbound_artifact_hash(
     )
 
     with pytest.raises(ValueError, match="runtime_audit_artifact_unbound"):
+        _ = build_receipt(arguments)
+
+
+def test_canonical_receipt_accepts_exact_v3_backup_restore_pair(tmp_path: Path) -> None:
+    arguments = _build_fixture(tmp_path)
+    _promote_backup_pair_to_v3(arguments)
+
+    receipt = build_receipt(arguments)
+
+    assert receipt.status == "PASS"
+
+
+@pytest.mark.parametrize("field", tuple(_V3_FIELDS))
+def test_canonical_receipt_rejects_each_missing_v3_field(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    arguments = _build_fixture(tmp_path)
+    _promote_backup_pair_to_v3(arguments)
+    path = arguments.verify_local / "restore.json"
+    receipt = _read(path)
+    _ = receipt.pop(field)
+    _write(path, receipt)
+
+    with pytest.raises(ValueError, match=field):
+        _ = build_receipt(arguments)
+
+
+@pytest.mark.parametrize("field", tuple(_V3_FIELDS))
+def test_canonical_receipt_rejects_each_v3_field_drift(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    arguments = _build_fixture(tmp_path)
+    _promote_backup_pair_to_v3(arguments)
+    path = arguments.verify_local / "restore.json"
+    receipt = _read(path)
+    value = receipt[field]
+    receipt[field] = value + 1 if isinstance(value, int) else "8" * 64
+    _write(path, receipt)
+
+    with pytest.raises(ValueError, match="backup_restore_state_mismatch"):
+        _ = build_receipt(arguments)
+
+
+def test_canonical_receipt_rejects_backup_restore_schema_version_mismatch(
+    tmp_path: Path,
+) -> None:
+    arguments = _build_fixture(tmp_path)
+    restore = arguments.verify_local / "restore.json"
+    receipt = _read(restore)
+    receipt.update(
+        {
+            "schema_version": 3,
+            "alembic_revision": "0005_admin_dashboard_ledger",
+            **_V3_FIELDS,
+        }
+    )
+    _write(restore, receipt)
+
+    with pytest.raises(ValueError, match="backup_restore_state_mismatch"):
+        _ = build_receipt(arguments)
+
+
+def test_canonical_receipt_rejects_review_request_byte_drift(tmp_path: Path) -> None:
+    arguments = _build_fixture(tmp_path)
+    request = arguments.todo6b / "review-request.json"
+    _ = request.write_bytes(request.read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="visual_review_mismatch"):
         _ = build_receipt(arguments)

@@ -9,10 +9,7 @@ from nvidia_build_lb.web.resources import WebResource, load_web_resource
 
 pytestmark = pytest.mark.ui_fake
 
-_NOTICE = (
-    "NVIDIA Build LB is an independent operations tool. It is not affiliated with, "
-    "endorsed by, or sponsored by NVIDIA."
-)
+_NOTICE = "Independent operations tool; not affiliated with or endorsed by NVIDIA."
 _RAW_COLOR = re.compile(
     r"#[0-9a-fA-F]{3,8}\b|(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch)\([^)]*\)"
 )
@@ -115,6 +112,11 @@ def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
         if path[-1] == "input" and attrs.get("type") == "password"
     ]
     dialogs = {attrs["id"] for path, attrs in parsed.elements if path[-1] == "dialog"}
+    credential = next(
+        attrs
+        for path, attrs in parsed.elements
+        if path[-1] == "textarea" and attrs.get("id") == "one-time-token"
+    )
 
     # Then: entry is password-only and every owner journey has a native semantic surface.
     assert {attrs["id"] for attrs in password_inputs} == {
@@ -122,55 +124,83 @@ def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
         "upstream-key",
     }
     assert all("value" not in attrs for attrs in password_inputs)
+    assert credential["readonly"] == "readonly"
+    assert credential["rows"] == "3"
+    assert "role" not in credential
+    assert "aria-readonly" not in credential
     assert dialogs == {
         "upstream-dialog",
         "confirm-dialog",
         "downstream-dialog",
         "credential-dialog",
     }
-    assert set(parsed.captions) == {"Upstream keys", "Downstream tokens", "Recent events"}
+    assert set(parsed.captions) == {
+        "Upstream key routing, health, and actions",
+        "Downstream client access, state, and actions",
+        "Recent events",
+    }
     assert any(path[-2:] == ("fieldset", "legend") for path, _ in parsed.elements)
     button_ids = {attrs.get("id") for path, attrs in parsed.elements if path[-1] == "button"}
     assert {"logout", "refresh-dashboard"} <= button_ids
-    recovery = [attrs for _, attrs in parsed.elements if attrs.get("id") == "clipboard-recovery"]
-    assert recovery == [
-        {
-            "class": "recovery-panel",
-            "hidden": "hidden",
-            "id": "clipboard-recovery",
-            "role": "status",
-        }
+    assert all(attrs.get("id") != "clipboard-recovery" for _, attrs in parsed.elements)
+
+
+def test_global_error_reads_action_before_result_and_then_evidence() -> None:
+    document, _ = _admin_document()
+    error = document[
+        document.index('id="global-error"') : document.index(
+            "</div>", document.index('id="global-error"')
+        )
     ]
+
+    assert error.index('id="global-error-state"') < error.index('id="global-error-message"')
+    assert error.index('id="global-error-message"') < error.index('id="retry-dashboard"')
+    assert error.index('id="retry-dashboard"') < error.index('id="global-confirmed-result"')
+    assert error.index('id="global-confirmed-result"') < error.index('id="global-error-evidence"')
 
 
 def test_initial_service_outage_is_not_rendered_as_authentication_failure() -> None:
     document, _ = _admin_document()
     script = load_web_resource(WebResource("admin-script"))
+    login = script[
+        script.index("async function login") : script.index("async function refreshDashboard")
+    ]
 
     assert 'id="login-error"' in document
     assert 'id="login-offline"' in document
     assert "Authentication failed." in document
     assert "Service unavailable." in document
-    assert "mountLogin(false, true)" in script
-    assert 'byId("login-offline").focus()' in script
+    assert 'const result = await api("/dashboard", {}, "dashboard", readDeadlineMs)' in login
+    assert "mountLoginWithRecovery(true, false)" in login
+    assert 'showProblem({code: "offline"' in login
+    assert '"Loading administration state", true)' in login
+    assert "mountLoginWithRecovery(false, true)" not in login
 
 
 def test_management_action_failures_preserve_details_and_force_401_reauthentication() -> None:
     script = load_web_resource(WebResource("admin-script"))
-    show_problem = script[
-        script.index("function showProblem") : script.index("function setDashboardBusy")
-    ]
+    show_problem = script[script.index("function showProblem") : script.index("async function api")]
     clear_sensitive = script[
         script.index("function clearSensitiveUi") : script.index("function mountLogin")
+    ]
+    login_with_recovery = script[
+        script.index("function mountLoginWithRecovery") : script.index("async function login")
     ]
 
     assert 'setText("global-error-message", message)' in show_problem
     assert 'byId("global-error").hidden = false' in show_problem
-    assert 'byId("stale-warning").hidden = !hasSafeData' in show_problem
-    assert "return" not in show_problem
-    assert "resetRequestController()" in clear_sensitive
+    assert (
+        'markSnapshotStale("The last request did not confirm current administration state.")'
+        in show_problem
+    )
+    assert "Success was not assumed" in show_problem
+    assert "resetSessionController()" in clear_sensitive
     assert 'document.querySelectorAll("dialog")' in clear_sensitive
-    assert 'byId("one-time-token").textContent = ""' in clear_sensitive
+    assert 'byId("one-time-token").value = ""' in clear_sensitive
+    assert "activeMutationContext ?? unresolvedRecoveryContext()" in login_with_recovery
+    assert "mountLogin(authFailed, serviceOffline, context, orphanRecoveryMessage())" in (
+        login_with_recovery
+    )
     for start, end in (
         ("async function runKeyAction", "function openConfirmation"),
         ("async function confirmPendingAction", "async function submitUpstream"),
@@ -178,7 +208,8 @@ def test_management_action_failures_preserve_details_and_force_401_reauthenticat
         ("async function submitDownstream", "async function copyToken"),
     ):
         consumer = script[script.index(start) : script.index(end)]
-        assert "if (response.status === 401) { mountLogin(true); return; }" in consumer
+        assert "result.status === 401" in consumer
+        assert "mountLoginWithRecovery(true, false, context)" in consumer
 
 
 def test_admin_static_sources_have_no_embedded_secret_or_unsafe_sink() -> None:
@@ -231,7 +262,7 @@ def test_desktop_shell_and_locked_information_order_are_explicit_in_both_documen
         "Gateway readiness",
         "Eligible keys",
         "Cooling keys",
-        "Logical attempts",
+        "Logical requests",
         "Last event/freshness",
     ]
     assert showcase.navigation_labels == [
@@ -252,6 +283,7 @@ def test_admin_navigation_and_main_order_match_the_operator_contract() -> None:
 
     # When: navigation containment and direct main order are inspected.
     logout_paths = [path for path, attrs in parsed.elements if attrs.get("id") == "logout"]
+    navigation_attributes = [attrs for path, attrs in parsed.elements if path[-2:] == ("nav", "a")]
     section_headings = re.findall(r'<h2[^>]*id="([^"]+)"[^>]*>([^<]+)</h2>', document)
     dashboard = document[document.index('<section hidden="hidden" id="dashboard"') :]
 
@@ -262,8 +294,9 @@ def test_admin_navigation_and_main_order_match_the_operator_contract() -> None:
         "Upstream keys",
         "Downstream tokens",
         "Events",
-        "Primitive showcase",
     ]
+    assert navigation_attributes[0]["aria-current"] == "location"
+    assert all("aria-current" not in attrs for attrs in navigation_attributes[1:])
     assert section_headings[:4] == [
         ("overview-heading", "Overview"),
         ("upstream-heading", "Upstream keys"),
@@ -322,6 +355,20 @@ def test_admin_human_labels_and_machine_ids_have_separate_wrapping_paths() -> No
 
     assert 'className = "human-label"' in script
     assert 'className = "machine-id"' in script
+    for term in (
+        "Internal ID",
+        "Fingerprint",
+        "Cooldown until",
+        "Requests",
+        "Succeeded",
+        "Failed",
+        "Last used",
+        "Updated",
+        "Created",
+        "Revoked",
+    ):
+        assert f'"{term}"' in script
+    assert "machineEvidenceTerms.has(term)" in script
     assert ".human-label" in stylesheet
     assert ".machine-id" in stylesheet
     assert "body { margin: 0;" in stylesheet
@@ -356,13 +403,17 @@ def test_programmatic_focus_targets_use_the_design_focus_token() -> None:
     assert '[tabindex="-1"]:focus-visible' in focus_rule
 
 
-def test_tablet_admin_tables_reflow_before_words_fragment() -> None:
+def test_tablet_admin_tables_keep_comparison_and_mobile_reflows() -> None:
     stylesheet = load_web_resource(WebResource("admin-stylesheet"))
 
     tablet = stylesheet.split("@media (max-width: 1279px)", maxsplit=1)[1].split(
         "@media (max-width: 767px)", maxsplit=1
     )[0]
-    assert "table, thead, tbody, tr, th, td { display: block; }" in tablet
+    mobile = stylesheet.split("@media (max-width: 767px)", maxsplit=1)[1].split(
+        "@media (min-width: 768px)", maxsplit=1
+    )[0]
+    assert "table, thead, tbody, tr, th, td { display: block; }" not in tablet
+    assert "table, thead, tbody, tr, th, td { display: block; }" in mobile
 
 
 @pytest.mark.parametrize("resource_name", ["admin-stylesheet", "showcase-stylesheet"])

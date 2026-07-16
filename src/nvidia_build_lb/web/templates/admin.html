@@ -15,16 +15,15 @@
     <aside class="rail">
       <header class="identity">
         <p class="product-name">NVIDIA Build LB</p>
-        <p class="notice">NVIDIA Build LB is an independent operations tool. It is not affiliated with, endorsed by, or sponsored by NVIDIA.</p>
+        <p class="notice">Independent operations tool; not affiliated with or endorsed by NVIDIA.</p>
       </header>
-      <details class="navigation-disclosure" open="open">
+      <details class="navigation-disclosure" hidden="hidden" id="navigation-disclosure">
         <summary>Administration sections</summary>
         <nav aria-label="Administration sections">
-          <a aria-current="page" href="#overview">Overview</a>
+          <a aria-current="location" href="#overview">Overview</a>
           <a href="#upstream-keys">Upstream keys</a>
           <a href="#downstream-tokens">Downstream tokens</a>
           <a href="#events">Events</a>
-          <a href="/showcase">Primitive showcase</a>
           <button class="control quiet" hidden="hidden" id="logout" type="button">Log out</button>
         </nav>
       </details>
@@ -37,40 +36,48 @@
         <header class="page-heading">
           <p class="metadata">Owner-only loopback administration</p>
           <h1 id="dashboard-title" tabindex="-1">Gateway operations</h1>
-          <p>Inspect safe state, then take the smallest reversible action.</p>
+          <p>See the current state, take one next action, then confirm the result.</p>
         </header>
         <div class="error-panel" hidden="hidden" id="global-error" role="alert" tabindex="-1">
-          <p class="state-label">ERR · Request failed</p>
+          <p class="state-label" id="global-error-state">Action not confirmed</p>
           <p id="global-error-message"></p>
-          <button class="control destructive" id="retry-dashboard" type="button">Retry safe request</button>
-        </div>
-        <div class="stale-panel" hidden="hidden" id="stale-warning" role="status">
-          <p><strong>STALE · Prior safe data.</strong> The refresh failed; values below are not current.</p>
-        </div>
-        <div class="recovery-panel" hidden="hidden" id="clipboard-recovery" role="status">
-          <p><strong>RECOVERED · Clipboard custody restored.</strong> The one-time credential was removed from this page and the clipboard after a copy or cleanup failure. Verify the issued token's state below.</p>
+          <button class="control primary" id="retry-dashboard" type="button">Refresh current state</button>
+          <p hidden="hidden" id="global-confirmed-result"></p>
+          <details class="request-evidence"><summary>Request evidence</summary><div class="request-evidence-body" id="global-error-evidence"></div></details>
         </div>
         <section class="summary" id="overview" aria-labelledby="overview-heading" aria-busy="true">
-          <div class="section-heading"><div><p class="metadata">Current state</p><h2 id="overview-heading">Overview</h2><p id="generated-at">Loading safe summary…</p></div><button class="control secondary" id="refresh-dashboard" type="button">Refresh safe state</button></div>
+          <div class="section-heading"><div><p class="metadata">Current judgment</p><h2 id="overview-heading" tabindex="-1">Overview</h2><p id="generated-at">Loading current snapshot…</p></div></div>
+          <div class="decision-brief" id="decision-brief">
+            <div class="decision-copy"><p class="state-label" id="decision-state">Loading · Verifying current state</p><h3 id="decision-title">Wait for current state</h3><p id="decision-explanation">Changes remain locked until the current administration state is verified.</p></div>
+            <button class="control primary" hidden="hidden" id="recommended-action" type="button"></button>
+            <p class="result-line"><strong>Last confirmed result</strong><span id="last-result">No action has completed in this tab.</span></p>
+            <p class="result-line" hidden="hidden" id="operation-status-line"><strong>Current operation</strong><span id="operation-status">No operation is pending.</span></p>
+            <details class="snapshot-details"><summary>Snapshot evidence</summary><p class="machine-id" id="snapshot-evidence">Not available</p></details>
+            <details class="snapshot-details" hidden="hidden" id="ledger-recovery"><summary id="ledger-recovery-summary">Recovery steps</summary><ol><li>Preserve a paired backup of the database dump and encrypted-key state.</li><li>Keep the gateway withdrawn; cap increases and restarts do not repair this evidence blocker.</li><li>Deploy a reviewed forward repair that preserves receipt, event, and pin evidence, then verify the blocker is absent before reopening intake.</li></ol><p>Do not manually delete retained rows. Refresh updates evidence; it is not the repair.</p></details>
+          </div>
           <dl class="summary-grid">
             <div><dt>Gateway readiness</dt><dd id="gateway-status">Loading</dd></div>
             <div><dt>Eligible keys</dt><dd id="eligible-count">Not available</dd></div>
             <div><dt>Cooling keys</dt><dd id="cooling-count">Not available</dd></div>
-            <div><dt>Logical attempts</dt><dd id="request-count">Not available</dd></div>
+            <div><dt>Logical requests</dt><dd id="request-count">Not available</dd></div>
             <div><dt>Last event/freshness</dt><dd id="last-event-at">Not available</dd></div>
           </dl>
+          <button class="control quiet compact" id="refresh-dashboard" type="button">Refresh current state</button>
+          <p hidden="hidden" id="refresh-status" role="status" tabindex="-1"></p>
         </section>
         <section id="upstream-keys" aria-labelledby="upstream-heading" aria-busy="true">
-          <div class="section-heading"><div><p class="metadata">Encrypted upstream vault</p><h2 id="upstream-heading" tabindex="-1">Upstream keys</h2></div><div><p>Plaintext is accepted once and never rendered after submission.</p><button class="control primary" id="add-upstream" type="button">Add upstream key</button></div></div>
-          <table><caption>Upstream keys</caption><thead><tr><th scope="col">Key</th><th scope="col">Routing</th><th scope="col">Health</th><th scope="col">Counters</th><th scope="col">Last observation</th><th scope="col">Actions</th></tr></thead><tbody id="upstream-body"><tr><td colspan="6">Loading upstream keys…</td></tr></tbody></table>
+          <div class="section-heading"><div><p class="metadata">Encrypted upstream vault</p><h2 id="upstream-heading" tabindex="-1">Upstream keys</h2></div><div><p>See which keys are eligible, then act on one stable key handle. Audit values stay one disclosure away.</p><button class="control secondary" data-mutation="true" id="add-upstream" type="button">Add upstream key</button></div></div>
+          <p class="row-result section-result" hidden="hidden" id="upstream-result" tabindex="-1"></p>
+          <table><caption class="visually-hidden">Upstream key routing, health, and actions</caption><thead><tr><th scope="col">Key</th><th scope="col">Routing</th><th scope="col">Health</th><th scope="col">Actions</th></tr></thead><tbody id="upstream-body"><tr><td colspan="4">Loading upstream keys…</td></tr></tbody></table>
         </section>
         <section id="downstream-tokens" aria-labelledby="downstream-heading" aria-busy="true">
-          <div class="section-heading"><div><p class="metadata">Scoped local clients</p><h2 id="downstream-heading" tabindex="-1">Downstream tokens</h2><p>Active clients: <strong id="active-token-count">Not available</strong></p></div><div><p>Issued credentials are shown once; lists remain digest-free.</p><button class="control primary" id="issue-downstream" type="button">Issue downstream token</button></div></div>
-          <table><caption>Downstream tokens</caption><thead><tr><th scope="col">Client</th><th scope="col">Scopes</th><th scope="col">State</th><th scope="col">Usage</th><th scope="col">Actions</th></tr></thead><tbody id="downstream-body"><tr><td colspan="5">Loading downstream tokens…</td></tr></tbody></table>
+          <div class="section-heading"><div><p class="metadata">Scoped local clients</p><h2 id="downstream-heading" tabindex="-1">Downstream tokens</h2><p>Active clients: <strong id="active-token-count">Not available</strong></p></div><div><p>Each client gets only the access it needs. One-time credentials are never listed again.</p><button class="control secondary" data-mutation="true" id="issue-downstream" type="button">Issue downstream token</button><p class="action-reason" hidden="hidden" id="issue-downstream-reason"></p></div></div>
+          <table><caption class="visually-hidden">Downstream client access, state, and actions</caption><thead><tr><th scope="col">Client</th><th scope="col">Access</th><th scope="col">State</th><th scope="col">Actions</th></tr></thead><tbody id="downstream-body"><tr><td colspan="4">Loading downstream tokens…</td></tr></tbody></table>
         </section>
         <section id="events" aria-labelledby="events-heading" aria-busy="true">
-          <div class="section-heading"><div><p class="metadata">Newest 100</p><h2 id="events-heading">Events</h2></div><p>Only opaque IDs, internal resource IDs, safe classes, latency, and time are shown.</p></div>
-          <table><caption>Recent events</caption><thead><tr><th scope="col">Event</th><th scope="col">Request</th><th scope="col">Resource</th><th scope="col">Outcome</th><th scope="col">Observed</th></tr></thead><tbody id="events-body"><tr><td colspan="5">Loading recent events…</td></tr></tbody></table>
+          <div class="section-heading"><div><p class="metadata">Attention before audit</p><h2 id="events-heading" tabindex="-1">Events</h2></div><p>Exceptions and configuration changes appear first in plain language. Exact newest-100 evidence remains below.</p></div>
+          <div id="activity-summary">Loading recent activity…</div>
+          <details class="audit-disclosure" id="audit-events"><summary id="audit-summary">Audit details · loading</summary><table><caption>Recent events</caption><thead><tr><th scope="col">Event</th><th scope="col">Request</th><th scope="col">Resource</th><th scope="col">Outcome</th><th scope="col">Observed</th></tr></thead><tbody id="events-body"><tr><td colspan="5">Loading recent events…</td></tr></tbody></table></details>
         </section>
       </section>
     </main>
@@ -81,8 +88,10 @@
     <form class="login-form" id="login-form" novalidate="novalidate">
       <p class="metadata">Per-tab credential custody</p>
       <h1 id="login-title">Authenticate locally</h1>
-      <p>The admin bearer stays only in this tab's JavaScript memory. Reload and logout erase it.</p>
-      <div class="error-panel" hidden="hidden" id="login-error" role="alert" tabindex="-1"><p>Authentication failed. Enter the current admin bearer and try again.</p></div>
+      <p>The admin bearer is kept only for this tab. Reload and logout erase it; this page never saves it.</p>
+      <p class="recovery-panel" hidden="hidden" id="login-busy" role="status" tabindex="-1">Authenticating locally…</p>
+      <div class="error-panel" hidden="hidden" id="login-error" role="alert" tabindex="-1"><p id="login-error-message">Authentication failed. Enter the current admin bearer and try again.</p></div>
+      <p class="recovery-panel" hidden="hidden" id="login-interrupted"></p>
       <div class="error-panel" hidden="hidden" id="login-offline" role="alert" tabindex="-1"><p>Service unavailable. The local administration service could not be reached. Your entered bearer was cleared; try again when the service is available.</p></div>
       <label for="admin-bearer">Admin bearer</label>
       <input aria-describedby="admin-bearer-help" autocomplete="off" id="admin-bearer" name="admin-bearer" required="required" spellcheck="false" type="password" />
@@ -95,35 +104,44 @@
     <form id="upstream-form" method="dialog" novalidate="novalidate">
       <h2 id="upstream-title">Add upstream key</h2>
       <p id="upstream-description">The key is encrypted and created disabled. It will not be shown again.</p>
-      <div class="error-panel" hidden="hidden" id="upstream-error" role="alert" tabindex="-1"></div>
+      <p class="stale-panel dialog-stale" data-dialog-stale="true" hidden="hidden" id="upstream-dialog-stale" role="status" tabindex="-1"></p>
+      <div class="error-panel" hidden="hidden" id="upstream-error" role="alert" tabindex="-1"><p id="upstream-error-message"></p><details class="request-evidence" hidden="hidden" id="upstream-error-evidence"><summary>Request evidence</summary><div class="request-evidence-body" id="upstream-error-evidence-value"></div></details></div>
+      <p class="recovery-panel" data-dialog-busy="true" hidden="hidden" id="upstream-dialog-busy" role="status" tabindex="-1">Waiting for server confirmation. Cancel and Escape are unavailable while this request is in flight.</p>
       <label for="upstream-key">NVIDIA hosted API key</label>
       <input aria-describedby="upstream-key-help" autocomplete="off" id="upstream-key" name="upstream-key" required="required" spellcheck="false" type="password" />
       <p class="helper" id="upstream-key-help">Probe the disabled key before enabling routing.</p>
-      <div class="dialog-actions"><button class="control secondary" data-close="upstream-dialog" type="button">Cancel</button><button class="control primary" id="submit-upstream" type="submit">Add disabled key</button></div>
+      <div class="dialog-actions"><button class="control secondary" data-close="upstream-dialog" type="button">Cancel</button><button class="control primary" data-mutation="true" id="submit-upstream" type="submit">Add disabled key</button></div>
     </form>
   </dialog>
 
   <dialog aria-describedby="confirm-description" aria-labelledby="confirm-title" id="confirm-dialog">
     <h2 id="confirm-title" tabindex="-1">Confirm action</h2><p id="confirm-description"></p>
-    <div class="error-panel" hidden="hidden" id="confirm-error" role="alert" tabindex="-1"></div>
-    <div class="dialog-actions"><button class="control secondary" data-close="confirm-dialog" type="button">Cancel</button><button class="control destructive" id="confirm-action" type="button">Confirm action</button></div>
+    <p class="stale-panel dialog-stale" data-dialog-stale="true" hidden="hidden" id="confirm-dialog-stale" role="status" tabindex="-1"></p>
+    <div class="error-panel" hidden="hidden" id="confirm-error" role="alert" tabindex="-1"><p id="confirm-error-message"></p><details class="request-evidence" hidden="hidden" id="confirm-error-evidence"><summary>Request evidence</summary><div class="request-evidence-body" id="confirm-error-evidence-value"></div></details></div>
+    <p class="recovery-panel" data-dialog-busy="true" hidden="hidden" id="confirm-dialog-busy" role="status" tabindex="-1">Waiting for server confirmation. Cancel and Escape are unavailable while this request is in flight.</p>
+    <div class="dialog-actions"><button class="control secondary" data-close="confirm-dialog" type="button">Cancel</button><button class="control destructive" data-mutation="true" id="confirm-action" type="button">Confirm action</button></div>
   </dialog>
 
   <dialog aria-describedby="downstream-description" aria-labelledby="downstream-title" id="downstream-dialog">
     <form id="downstream-form" method="dialog" novalidate="novalidate">
       <h2 id="downstream-title">Issue downstream token</h2><p id="downstream-description">Choose the minimum exact scopes. The bearer is available once.</p>
-      <div class="error-panel" hidden="hidden" id="downstream-error" role="alert" tabindex="-1"></div>
-      <label for="downstream-label">Unique client label</label><input autocomplete="off" id="downstream-label" maxlength="128" required="required" spellcheck="false" type="text" />
-      <fieldset><legend>Exact scopes</legend><label><input name="scope" type="checkbox" value="models:read" /> Read models</label><label><input name="scope" type="checkbox" value="chat:write" /> Write chat</label></fieldset>
-      <div class="dialog-actions"><button class="control secondary" data-close="downstream-dialog" type="button">Cancel</button><button class="control primary" id="submit-downstream" type="submit">Issue once</button></div>
+      <p class="stale-panel dialog-stale" data-dialog-stale="true" hidden="hidden" id="downstream-dialog-stale" role="status" tabindex="-1"></p>
+      <div class="error-panel" hidden="hidden" id="downstream-error" role="alert" tabindex="-1"><p id="downstream-error-message"></p><details class="request-evidence" hidden="hidden" id="downstream-error-evidence"><summary>Request evidence</summary><div class="request-evidence-body" id="downstream-error-evidence-value"></div></details></div>
+      <p class="recovery-panel" data-dialog-busy="true" hidden="hidden" id="downstream-dialog-busy" role="status" tabindex="-1">Waiting for server confirmation. Cancel and Escape are unavailable while this request is in flight.</p>
+      <label for="downstream-label">Unique client label</label><input aria-describedby="downstream-label-help" autocomplete="off" id="downstream-label" maxlength="128" required="required" spellcheck="false" type="text" /><p class="helper" id="downstream-label-help">Use the stable operator name of the client.</p>
+      <fieldset aria-describedby="scope-help" id="downstream-scopes"><legend>Exact scopes</legend><label><input name="scope" type="checkbox" value="models:read" /> Read models</label><label><input name="scope" type="checkbox" value="chat:write" /> Write chat</label></fieldset><p class="helper" id="scope-help">Choose at least one and grant only what this client needs.</p>
+      <div class="dialog-actions"><button class="control secondary" data-close="downstream-dialog" type="button">Cancel</button><button class="control primary" data-mutation="true" id="submit-downstream" type="submit">Issue once</button></div>
     </form>
   </dialog>
 
-  <dialog aria-describedby="credential-description" aria-labelledby="credential-title" id="credential-dialog">
-    <h2 id="credential-title" tabindex="-1">Store this credential now</h2><p id="credential-description">It cannot be recovered after dismissal.</p>
-    <code class="credential" id="one-time-token"></code>
-    <div class="error-panel" hidden="hidden" id="clipboard-error" role="alert" tabindex="-1"><p>Clipboard cleanup failed. Clear the clipboard before visual capture or logout.</p></div>
-    <div class="dialog-actions"><button class="control secondary" id="copy-token" type="button">Copy credential</button><button class="control primary" id="dismiss-token" type="button">Dismiss and clear</button></div>
+  <dialog aria-describedby="credential-target credential-description" aria-labelledby="credential-title" id="credential-dialog">
+    <h2 id="credential-title" tabindex="-1">Store this credential now</h2><p id="credential-description"><strong>Copy</strong> writes it to the clipboard. <strong>Dismiss</strong> removes it from this page and, when clipboard access exists, verifies the clipboard is empty. It cannot be recovered afterward.</p>
+    <p id="credential-target"></p>
+    <textarea aria-label="One-time credential. Press Control A or Command A to select only this credential." class="credential" id="one-time-token" readonly="readonly" rows="3" spellcheck="false"></textarea>
+    <p hidden="hidden" id="credential-status" role="status"></p>
+    <p class="recovery-panel" hidden="hidden" id="credential-busy" role="status" tabindex="-1"></p>
+    <div class="error-panel" hidden="hidden" id="clipboard-error" role="alert" tabindex="-1"><p id="clipboard-error-message">Clipboard cleanup failed. Restore access, then dismiss again.</p></div>
+    <div class="dialog-actions"><button class="control secondary" id="copy-token" type="button">Copy credential</button><button class="control primary" id="dismiss-token" type="button">Dismiss and remove</button></div>
   </dialog>
   <p aria-live="polite" class="visually-hidden" id="live-region"></p>
 </body>

@@ -6,7 +6,7 @@ import anyio
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from nvidia_build_lb.admin.schemas import LastStatusClass, UpstreamKeyCreateRequest
+from nvidia_build_lb.admin.schemas import HealthState, LastStatusClass, UpstreamKeyCreateRequest
 from nvidia_build_lb.credential_types import Clock, ResourceConflictError
 from nvidia_build_lb.db_models import UpstreamKeyRow
 from nvidia_build_lb.scheduler_state import (
@@ -29,6 +29,10 @@ async def _create_enabled_key(
         UpstreamKeyCreateRequest(key=credential),
         request_id=f"create-{credential}",
     )
+    async with repository.dependencies.sessions.begin() as session:
+        row = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert row is not None
+        row.health_state = HealthState.HEALTHY.value
     await repository.enable(created.id, request_id=f"enable-{credential}")
     return created.id
 

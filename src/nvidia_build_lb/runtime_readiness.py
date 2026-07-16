@@ -4,7 +4,17 @@ import threading
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from nvidia_build_lb.admin.schemas import AdminEventListResponse, AdminOverviewRead, OverviewStatus
+from nvidia_build_lb.admin.schemas import (
+    AdminDashboardRead,
+    AdminEventListResponse,
+    AdminOperatorReadinessRead,
+    AdminOverviewRead,
+    OverviewStatus,
+    ReadinessCause,
+    RuntimeState,
+)
+from nvidia_build_lb.admin_deadlines import AdminMutationSettlingError
+from nvidia_build_lb.admin_mutation_barrier import AdminMutationBarrier
 from nvidia_build_lb.attempt_fail_stop import AttemptFailStop, ReadinessGate
 from nvidia_build_lb.credential_protocols import (
     CredentialRepositorySurface,
@@ -69,6 +79,7 @@ class GatedCredentialRepositories:
 
     inner: CredentialRepositorySurface
     lifecycle: RuntimeReadinessGate
+    mutation_barrier: AdminMutationBarrier = field(default_factory=AdminMutationBarrier)
 
     @property
     def upstream(self) -> UpstreamCredentialRepository:
@@ -86,6 +97,49 @@ class GatedCredentialRepositories:
         if self.lifecycle.is_ready() and overview.ready:
             return overview
         return overview.model_copy(update={"status": OverviewStatus.DEGRADED, "ready": False})
+
+    async def dashboard(self) -> AdminDashboardRead:
+        """Reject mutation overlap and apply two-sample runtime truth."""
+        before_barrier = self.mutation_barrier.sample()
+        runtime_before = self.lifecycle.is_ready()
+        if before_barrier.active_count != 0:
+            raise AdminMutationSettlingError
+        dashboard = await self.inner.dashboard()
+        runtime_after = self.lifecycle.is_ready()
+        after_barrier = self.mutation_barrier.sample()
+        if after_barrier.active_count != 0 or after_barrier.generation != before_barrier.generation:
+            raise AdminMutationSettlingError
+        if runtime_before and runtime_after:
+            return dashboard
+        return dashboard.model_copy(
+            update={
+                "runtime_state": RuntimeState.UNAVAILABLE,
+                "readiness_cause": ReadinessCause.RUNTIME_UNAVAILABLE,
+                "overview": dashboard.overview.model_copy(
+                    update={"status": OverviewStatus.DEGRADED, "ready": False}
+                ),
+            }
+        )
+
+    async def operator_readiness(self) -> AdminOperatorReadinessRead:
+        """Reject mutation overlap and apply two-sample runtime truth."""
+        before_barrier = self.mutation_barrier.sample()
+        runtime_before = self.lifecycle.is_ready()
+        if before_barrier.active_count != 0:
+            raise AdminMutationSettlingError
+        readiness = await self.inner.operator_readiness()
+        runtime_after = self.lifecycle.is_ready()
+        after_barrier = self.mutation_barrier.sample()
+        if after_barrier.active_count != 0 or after_barrier.generation != before_barrier.generation:
+            raise AdminMutationSettlingError
+        if runtime_before and runtime_after:
+            return readiness
+        return readiness.model_copy(
+            update={
+                "runtime_state": RuntimeState.UNAVAILABLE,
+                "readiness_cause": ReadinessCause.RUNTIME_UNAVAILABLE,
+            }
+        )
 
     async def events(self) -> AdminEventListResponse:
         """Return the unchanged safe event collection."""

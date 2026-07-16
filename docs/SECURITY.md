@@ -70,19 +70,88 @@ capabilities, and `NoNewPrivs=1`.
 ## Release gate
 
 The exact application/PostgreSQL image ID pair and byte-identical source
-manifest produced by `build-candidate` must pass every later gate:
+manifest produced by `build-candidate` must pass every later gate. One final
+run uses a new absent base whose name is exactly
+`final-YYYYMMDDTHHMMSSZ-<8 lowercase hex>`; the browser gate accepts only its
+`browser` leaf (or the fixed compatibility default), never an arbitrary path.
+Build, browser, verify, and scan remain distinct leaves:
 
 ```console
-make test-browser-prod IMAGE_DIGEST=sha256:... POSTGRES_IMAGE_DIGEST=sha256:... SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json EVIDENCE_DIR=.omo/evidence/task-6b-release
-make verify-local IMAGE_DIGEST=sha256:... POSTGRES_IMAGE_DIGEST=sha256:... SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json EVIDENCE_DIR=.omo/evidence/task-7-verify
-make scan-release IMAGE_DIGEST=sha256:... POSTGRES_IMAGE_DIGEST=sha256:... SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json EVIDENCE_DIR=.omo/evidence/task-7-scan
+set -Eeuo pipefail
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(openssl rand -hex 4)"
+FINAL_BASE=".omo/evidence/final-$RUN_ID"
+[ ! -e "$FINAL_BASE" ] || exit 1
+BUILD_EVIDENCE="$FINAL_BASE/build"
+BROWSER_EVIDENCE="$FINAL_BASE/browser"
+VERIFY_EVIDENCE="$FINAL_BASE/verify"
+SCAN_EVIDENCE="$FINAL_BASE/scan"
+for path in "$BUILD_EVIDENCE" "$BROWSER_EVIDENCE" "$VERIFY_EVIDENCE" "$SCAN_EVIDENCE"; do
+  [ ! -e "$path" ] || exit 1
+done
+
+make build-candidate EVIDENCE_DIR="$BUILD_EVIDENCE"
+APP_IMAGE_ID="$(jq -er .image_digest "$BUILD_EVIDENCE/candidate.json")"
+POSTGRES_IMAGE_ID="$(jq -er .postgres_image_digest "$BUILD_EVIDENCE/candidate.json")"
+SOURCE_MANIFEST="$BUILD_EVIDENCE/source-manifest.json"
+
+set +e
+IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" \
+  SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR="$BROWSER_EVIDENCE" \
+  scripts/qa/test-browser-prod.sh
+BROWSER_FRESH_STATUS=$?
+set -e
+[ "$BROWSER_FRESH_STATUS" -eq 75 ]
+jq -e '.status == "REVIEW_REQUIRED" and .schema_version == 2' \
+  "$BROWSER_EVIDENCE/review-request.json" >/dev/null
+REVIEW_REQUEST_SHA256="$(sha256sum "$BROWSER_EVIDENCE/review-request.json" \
+  | awk 'NR == 1 {print $1} END {if (NR != 1) exit 1}')"
 ```
 
-Each script claims a new evidence directory, fails closed, labels every Docker
-resource it creates, and writes bound receipts. The release scan covers both
-images and the source tree without `--ignore-unfixed`. A scanner outage,
-unavailable vulnerability database, mutable Action reference, finding, missing
-cleanup, source-manifest byte drift, or either image-ID drift is FAIL.
+Exit 75 is the required fresh-capture result, not PASS. Pause here. Two
+independent review-only lanes inspect every indexed image plus the run-a/run-b
+capture, DOM, focus, axe, overflow, Lighthouse, and cleanup receipts bound by
+that exact request digest. Lane A is `objective-visual`; lane B is
+`design-accessibility-persona`. Each verdict must echo
+`REVIEW_REQUEST_SHA256`, contain no blocker, and end `VISUAL REVIEW: LGTM`.
+Reviewers do not edit source or evidence. Codex records those already-obtained
+verdicts; the recorder cannot create a receipt for drifted artifacts or
+overwrite one:
+
+```console
+uv run python scripts/qa/record_visual_review.py \
+  --evidence-dir "$BROWSER_EVIDENCE" \
+  --lane objective-visual \
+  --review-request-sha256 "$REVIEW_REQUEST_SHA256" \
+  --verdict lgtm
+uv run python scripts/qa/record_visual_review.py \
+  --evidence-dir "$BROWSER_EVIDENCE" \
+  --lane design-accessibility-persona \
+  --review-request-sha256 "$REVIEW_REQUEST_SHA256" \
+  --verdict lgtm
+
+IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" \
+  SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR="$BROWSER_EVIDENCE" \
+  scripts/qa/test-browser-prod.sh
+jq -e '.status == "PASS" and .visual_reviews.pass_a and .visual_reviews.pass_b' \
+  "$BROWSER_EVIDENCE/candidate.json" >/dev/null
+make verify-local IMAGE_DIGEST="$APP_IMAGE_ID" \
+  POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" \
+  EVIDENCE_DIR="$VERIFY_EVIDENCE"
+make scan-release IMAGE_DIGEST="$APP_IMAGE_ID" \
+  POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" \
+  EVIDENCE_DIR="$SCAN_EVIDENCE"
+```
+
+The second browser invocation is a same-leaf resume and must bind the unchanged
+request, source manifest, image pair, cleanup receipt, and both review receipts
+before PASS. Any blocker or source/image/manifest/artifact drift discards the
+entire final base and restarts with a new ID; no review receipt is reused.
+
+Each script claims its evidence leaf, fails closed, labels every Docker resource
+it creates, and writes bound receipts. The release scan covers both images and
+the source tree without `--ignore-unfixed`. A scanner outage, unavailable
+vulnerability database, mutable Action reference, finding, missing cleanup,
+source-manifest byte drift, or either image-ID drift is FAIL.
 
 After the runtime audit records at least three distinct disproved hypotheses,
 each hypothesis must cite a SHA-256 already present in the four gate artifact

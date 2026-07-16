@@ -3,7 +3,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Final
 
-from playwright.sync_api import BrowserContext, Page
+from playwright.sync_api import BrowserContext, Page, expect
 
 from .browser_auth import AuthenticatedSession
 from .browser_checks import (
@@ -92,6 +92,11 @@ def _desktop_placeholder() -> AdminDesktopObservation:
     )
 
 
+def _restore_dialog_capture(page: Page, focus_id: str, script: str) -> None:
+    execute_script(page, script)
+    expect(page.locator(f"#{focus_id}")).to_be_focused()
+
+
 def run_native_owner_journey(
     context: BrowserContext,
     page: Page,
@@ -141,6 +146,27 @@ def run_native_owner_journey(
         desktop_layout=_desktop_placeholder(),
     )
     stable.append(_stable(page, "dashboard", axe_asset))
+    page.locator("#add-upstream").click()
+    expect(page.locator("#upstream-key")).to_be_focused()
+    stable.append(_stable(page, "upstream-dialog", axe_asset))
+    _restore_dialog_capture(
+        page,
+        "upstream-key",
+        """() => {
+          document.querySelector('#upstream-dialog').scrollTop = 0;
+          document.querySelector('#upstream-key').focus({preventScroll: true});
+        }""",
+    )
+    recorder.capture_viewport(
+        page,
+        CaptureSpec(
+            name="native-admin-upstream-form",
+            state="native 200 percent empty upstream form",
+            viewport="1280x900 outer viewport",
+            native_zoom=True,
+        ),
+    )
+    page.locator("[data-close='upstream-dialog']").click()
     run_upstream_journey(
         session,
         recorder,
@@ -149,6 +175,51 @@ def run_native_owner_journey(
         native_zoom=True,
     )
     stable.append(_stable(page, "upstream", axe_asset))
+    page.locator("#issue-downstream").click()
+    expect(page.locator("#downstream-label")).to_be_focused()
+    stable.append(_stable(page, "downstream-dialog", axe_asset))
+    _restore_dialog_capture(
+        page,
+        "downstream-label",
+        """() => {
+          document.querySelector('#downstream-dialog').scrollTop = 0;
+          document.querySelector('#downstream-label').focus({preventScroll: true});
+        }""",
+    )
+    recorder.capture_viewport(
+        page,
+        CaptureSpec(
+            name="native-admin-downstream-form",
+            state="native 200 percent empty downstream form",
+            viewport="1280x900 outer viewport",
+            native_zoom=True,
+        ),
+    )
+    page.locator("[data-close='downstream-dialog']").click()
+    eligible = next(
+        item for item in state.upstreams().items if item.routing_state.value == "eligible"
+    )
+    page.locator(f"#key-{eligible.id}-toggle").click()
+    expect(page.locator("#confirm-title")).to_be_focused()
+    stable.append(_stable(page, "destructive-dialog", axe_asset))
+    _restore_dialog_capture(
+        page,
+        "confirm-title",
+        """() => {
+          document.querySelector('#confirm-dialog').scrollTop = 0;
+          document.querySelector('#confirm-title').focus({preventScroll: true});
+        }""",
+    )
+    recorder.capture_viewport(
+        page,
+        CaptureSpec(
+            name="native-admin-destructive-confirmation",
+            state="native 200 percent identified disable confirmation",
+            viewport="1280x900 outer viewport",
+            native_zoom=True,
+        ),
+    )
+    page.locator("[data-close='confirm-dialog']").click()
     run_downstream_journey(
         session,
         recorder,
@@ -181,7 +252,10 @@ def run_native_owner_journey(
         capture_ids=(
             "native-showcase-full",
             "native-showcase-focused-control",
+            "native-admin-upstream-form",
             "native-admin-upstream-post-cleanup",
+            "native-admin-downstream-form",
+            "native-admin-destructive-confirmation",
             "native-admin-downstream-post-cleanup",
             "native-admin-stale-offline",
             "native-admin-empty",

@@ -2,7 +2,13 @@
 
 from fastapi import FastAPI, Request, Response
 
-from nvidia_build_lb.admin.schemas import AdminEventListResponse, AdminOverviewRead
+from nvidia_build_lb.admin.schemas import (
+    AdminDashboardRead,
+    AdminEventListResponse,
+    AdminOperatorReadinessRead,
+    AdminOverviewRead,
+)
+from nvidia_build_lb.admin_deadlines import run_admin_read
 from nvidia_build_lb.admin_http_errors import safe_credential_error
 from nvidia_build_lb.admin_route_shapes import admin_allowed_methods
 from nvidia_build_lb.credential_protocols import CredentialRepositorySurface
@@ -27,18 +33,30 @@ def _not_found(request: Request) -> Response:
 def register_admin_read_routes(
     app: FastAPI,
     repositories: CredentialRepositorySurface,
+    *,
+    deadline_seconds: float,
 ) -> None:
     """Register aggregate/event reads and authenticated safe unknown fallbacks."""
+
+    @app.get("/admin/api/v1/dashboard")
+    async def _dashboard(request: Request) -> AdminDashboardRead:
+        _reject_query(request)
+        return await run_admin_read(repositories.dashboard, deadline_seconds)
 
     @app.get("/admin/api/v1/overview")
     async def _overview(request: Request) -> AdminOverviewRead:
         _reject_query(request)
-        return await repositories.overview()
+        return await run_admin_read(repositories.overview, deadline_seconds)
+
+    @app.get("/admin/api/v1/operator-readiness")
+    async def _operator_readiness(request: Request) -> AdminOperatorReadinessRead:
+        _reject_query(request)
+        return await run_admin_read(repositories.operator_readiness, deadline_seconds)
 
     @app.get("/admin/api/v1/events")
     async def _events(request: Request) -> AdminEventListResponse:
         _reject_query(request)
-        return await repositories.events()
+        return await run_admin_read(repositories.events, deadline_seconds)
 
     @app.api_route(
         "/admin/api/v1",
@@ -57,4 +75,11 @@ def register_admin_read_routes(
             return Response(status_code=405, headers={"Allow": ", ".join(sorted(allowed))})
         return _not_found(request)
 
-    _ = (_overview, _events, _unknown_admin_root, _unknown_admin)
+    _ = (
+        _dashboard,
+        _overview,
+        _operator_readiness,
+        _events,
+        _unknown_admin_root,
+        _unknown_admin,
+    )

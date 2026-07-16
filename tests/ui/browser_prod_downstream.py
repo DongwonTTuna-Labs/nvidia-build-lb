@@ -51,10 +51,32 @@ def _confirm_revoke(session: AuthenticatedSession) -> None:
     expect(page.locator("#confirm-dialog")).to_be_hidden()
 
 
-def _open_issue_form(page: Page, label: str) -> None:
+def _activate_copy_with_keyboard(page: Page) -> None:
+    expect(page.locator("#credential-title")).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(page.locator("#one-time-token")).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(page.locator("#copy-token")).to_be_focused()
+    page.keyboard.press("Enter")
+
+
+def _open_issue_form(
+    page: Page,
+    label: str,
+    journey: ProductionJourney | None = None,
+) -> None:
     page.locator("#issue-downstream").focus()
     page.keyboard.press("Enter")
     assert page.locator(":focus").get_attribute("id") == "downstream-label"
+    if journey is not None and not journey.native_zoom:
+        journey.qa.recorder.capture(
+            page,
+            CaptureSpec(
+                name="admin-downstream-form-1280",
+                state="actual empty downstream token form before label and scopes",
+                viewport="1280x900",
+            ),
+        )
     page.keyboard.insert_text(label)
     page.keyboard.press("Tab")
     page.keyboard.press("Space")
@@ -70,7 +92,7 @@ def run_production_downstream_journey(journey: ProductionJourney) -> None:
     label = f"{'Native ' if journey.native_zoom else ''}{_CJK_LABEL}"
     before_ids = {item.id for item in journey.qa.client.tokens().items}
     _phase(journey, f"{prefix}downstream_issue")
-    _open_issue_form(page, label)
+    _open_issue_form(page, label, journey)
     journey.qa.recorder.begin_blackout("actual one-time downstream token in production browser")
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_visible()
@@ -78,13 +100,26 @@ def run_production_downstream_journey(journey: ProductionJourney) -> None:
     assert state.admin_bearer_present
     assert state.one_time_token_present
     page.keyboard.press("Tab")
+    assert page.locator(":focus").get_attribute("id") == "one-time-token"
+    page.keyboard.press("Control+A")
+    selected = int(
+        evaluate_string(
+            page,
+            """() => JSON.stringify(
+document.getElementById("one-time-token").selectionEnd
+  - document.getElementById("one-time-token").selectionStart
+)""",
+        )
+    )
+    assert selected > 0
+    page.keyboard.press("Tab")
     assert page.locator(":focus").get_attribute("id") == "copy-token"
     page.keyboard.press("Enter")
     assert credential_state_observation(page).copied_credential
     page.keyboard.press("Tab")
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_hidden()
-    expect(page.locator("#clipboard-recovery")).to_be_hidden()
+    assert page.locator("#clipboard-recovery").count() == 0
     expect(page.locator("#refresh-dashboard")).to_be_enabled()
     expect(page.locator("#issue-downstream")).to_be_focused()
     assert clipboard_is_empty(page)
@@ -101,7 +136,7 @@ def run_production_downstream_journey(journey: ProductionJourney) -> None:
     page.locator(f"#{revoke_id}").focus()
     page.keyboard.press("Enter")
     _confirm_revoke(journey.session)
-    expect(page.locator(f"#{revoke_id}")).to_contain_text("REVOKED")
+    expect(page.locator(f"#{revoke_id}")).to_contain_text("Revoked")
     assert script_flag_is_false(page, "XSS_EXECUTED")
     assert page.locator("script", has_text="globalThis.XSS_EXECUTED").count() == 0
     assert page.locator("img").count() == 0
@@ -151,8 +186,7 @@ readText: () => Promise.reject(new DOMException("synthetic denial"))}})"""
     journey.qa.recorder.begin_blackout("one-time token during synthetic clipboard denial")
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_visible()
-    page.keyboard.press("Tab")
-    page.keyboard.press("Enter")
+    _activate_copy_with_keyboard(page)
     expect(page.locator("#clipboard-error")).to_be_visible()
     page.locator("#dismiss-token").focus()
     page.keyboard.press("Enter")
@@ -166,10 +200,8 @@ readText: () => Promise.reject(new DOMException("synthetic denial"))}})"""
     page.locator("#dismiss-token").focus()
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_hidden()
-    expect(page.locator("#clipboard-recovery")).to_be_visible()
-    expect(page.locator("#clipboard-recovery")).to_contain_text(
-        "RECOVERED · Clipboard custody restored."
-    )
+    expect(page.locator("#last-result")).to_contain_text("clipboard was verified empty")
+    assert page.locator("#clipboard-recovery").count() == 0
     expect(page.locator("#refresh-dashboard")).to_be_enabled()
     expect(page.locator("#issue-downstream")).to_be_focused()
     assert clipboard_is_empty(page)
@@ -180,8 +212,8 @@ readText: () => Promise.reject(new DOMException("synthetic denial"))}})"""
     journey.qa.client.revoke_token(str(issued.id))
     page.locator("#refresh-dashboard").focus()
     page.keyboard.press("Enter")
-    expect(page.locator(f"#token-{issued.id}-revoke")).to_contain_text("REVOKED")
-    expect(page.locator("#clipboard-recovery")).to_be_visible()
+    expect(page.locator(f"#token-{issued.id}-revoke")).to_contain_text("Revoked")
+    assert page.locator("#clipboard-recovery").count() == 0
     journey.qa.recorder.capture(
         page,
         CaptureSpec(

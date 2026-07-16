@@ -1,6 +1,278 @@
 # NVIDIA Build LB Design System
 
-## 0. Research Log
+## 0. Product Decision Axis
+
+The product axis is **judgment -> action -> evidence**. Every operational view
+uses the same sentence order: **state -> meaning or cause -> one safest next
+action -> confirmed result**. A technically complete screen fails this contract
+when the operator must translate raw identifiers, timestamps, counters, or event
+rows before knowing what to do.
+
+### Product promise
+
+Within ten seconds after authentication, an operator must be able to answer:
+
+1. Is the gateway ready to accept requests, and how fresh is that conclusion?
+2. How many keys can actually receive a request, and what excludes the others?
+3. What is the latest condition that needs attention and which stable key or
+   client handle does it affect?
+4. What is the one safest action available now?
+5. Did the last action finish, what changed, and what should happen next?
+
+The first content viewport presents those answers before audit detail. A normal
+state says that no action is required instead of inventing work. A degraded,
+stale, or failed state states what is known, what is unknown, the traffic
+impact, and the exact safe recovery action in one located surface.
+
+### Information hierarchy and budget
+
+| Layer | Purpose | Default treatment |
+| --- | --- | --- |
+| L0 | Current judgment, freshness, blocking cause | Always visible |
+| L1 | Affected resource, impact, one next action, last confirmed result | Visible in the relevant overview, section, or row |
+| L2 | Counters, exact UTC time, short fingerprint and internal ID | One explicit details disclosure from its L1 resource |
+| L3 | Raw event IDs, request IDs, exact status classes, complete audit history | One explicit audit disclosure from the activity summary |
+
+Each page heading has the route name and one current-purpose sentence. Each
+resource section has one state or count, one short explanation, and one primary
+task at most. Repeated visible captions, implementation vocabulary, QA language,
+and raw enum names do not consume the primary information budget. Machine data
+remains available for audit without competing with the operating decision.
+
+### Core journey ladder
+
+The console derives one recommended step from server-confirmed state:
+
+1. Authenticate locally.
+2. Add the first upstream credential; it remains disabled.
+3. Probe that stable key handle successfully.
+4. Enable the verified key for routing.
+5. Issue a downstream token with the minimum needed scopes.
+6. Operate normally, or address the newest exception before reading full audit
+   history.
+
+The recommended step is the sole strongest action. Section and row controls
+remain discoverable but visually secondary. Enable stays unavailable until a
+successful probe is represented by current server state. A disabled, cooling,
+quarantined, stale, or unknown key explains the prerequisite beside its action.
+Once at least one key is eligible, issuing the first downstream credential takes
+priority over non-blocking pool maintenance. An active cooldown states its
+automatic return condition and exposes no immediate primary action before that
+condition is reached; the matching row-level Probe is also unavailable until
+then. A rejected credential is retired immediately when another key is eligible;
+this does not reduce serving capacity because the rejected key was already
+excluded. When no key is eligible, add, probe, and enable a replacement before
+retirement. After cleanup, a one-key pool recommends adding and verifying the
+second key so round-robin failover is restored without duplicate replacement
+loops.
+
+### State, action, and result contract
+
+- Every mutation owns a target-specific progress label, for example `Probing
+  Key bc68b4f8...`.
+- In-progress and unknown outcomes use a separate `Current operation` surface.
+  They never overwrite or appear beneath the `Last confirmed result` label;
+  only a terminal response or fresh-state reconciliation advances that slot.
+- Success remains visibly located after refresh and states the postcondition
+  and next step. Failure names the target and action, states that success was
+  not assumed, and offers the action that is actually performed.
+- A mutation 2xx and its follow-up full-snapshot read are separate facts. If the
+  mutation is confirmed but refresh fails, the confirmed result remains visible
+  while every retained row and count becomes `Last confirmed`; the UI never
+  demotes the mutation to unknown or leaves an in-progress label behind.
+- Authentication expiry preserves a non-secret description of the interrupted
+  target and action. Reauthentication asks the operator to verify current state
+  before retrying; it never claims the ambiguous action failed or succeeded.
+- A lost add response is reconciled only by the submitted key's exact SHA-256
+  fingerprint, never by assuming that one newly visible row is the same request.
+  A lost probe, enable, disable, delete, or revoke response is reconciled against
+  a fresh target state and states only the observed postcondition; it never
+  attributes a concurrent change to the missing response.
+- A lost response uses one outcome-recovery surface inside the active dialog.
+  It never competes with a generic stale warning or marks a discarded secret
+  field invalid. The copy states exactly what was erased and what a fresh read
+  can correlate.
+- Generic dashboard refresh is labeled `Refresh`, never `Retry probe` or another
+  mutation it does not execute. Recovery controls are not destructive controls.
+- A destructive cleanup step is described in the decision brief, but its global
+  recommendation only moves focus to the exact row control. Disable, Delete, and
+  Revoke begin only from that row and never occupy the primary-action position.
+- Form errors identify the field or fieldset to fix, remain linked by
+  `aria-describedby`, and preserve all non-secret safe input where custody
+  permits.
+- Validation and resource conflict may belong to a field. Transport, service,
+  strict-response, and ambiguous-outcome failures belong to one dialog or page
+  recovery summary, never mark valid input invalid, and persist across input
+  edits until Cancel or fresh reconciliation.
+- A one-time credential dialog says visibly what Copy and Dismiss do. If the
+  Clipboard API was never available and no copy occurred, Dismiss still clears
+  the page and exits safely. A possibly copied value requires verified clipboard
+  cleanup before exit.
+- The one-time value is a native read-only multiline text control. Its accessible
+  name, value, caret, exact Select All behavior, manual Copy event, and cleanup
+  are browser-native; ARIA does not recreate textbox semantics on generic markup.
+- While a one-time credential, a possible clipboard copy, or a clipboard write
+  is unresolved, reload and tab close receive the same explicit exit guard as
+  an unresolved mutation. The credential value supports exact keyboard
+  selection; a manual copy enters the same verified-cleanup path as Copy.
+- Before any async task disables its focused control, focus moves to a visible
+  local progress status. Login, manual/recommended Refresh, row actions, dialog
+  mutations, Copy, and Dismiss all preserve focus inside the active task and
+  restore it deterministically after completion. Submitted dialog fields remain
+  immutable while their request is pending.
+- A confirmed deliberate Disable or final-token Revoke is not immediately
+  reversed by an Enable or Issue primary action. Enable is recommended only
+  when this journey has current probe/replacement evidence; first-token Issue
+  is onboarding only when no token history exists. Otherwise explicit row or
+  section controls remain available without inventing urgent work.
+- Local probe and deliberate-pause intent binds only to server evidence from
+  the confirmed operation. A probe may bind to a refreshed key version no
+  later than its returned `observed_at`; a pause may bind only when the fresh
+  key `updated_at` matches its successful disable event. Any later version
+  drift invalidates that local intent. A tracked replacement still requires
+  this current probe evidence before Enable becomes the primary action.
+
+### Freshness and progressive disclosure
+
+- A successful full refresh starts a bounded current-snapshot interval. When it
+  expires or refresh fails, prior data is explicitly stale and all mutations
+  lock until a new full snapshot succeeds. Read and recovery navigation remain
+  available.
+- Starting a refresh does not cancel the prior snapshot deadline. The prior
+  snapshot remains current only until its original deadline, then becomes stale
+  even while the new read is pending. A pending mutation exclusively owns its
+  outcome: every Refresh entry remains locked until that response settles.
+- When a snapshot is stale, readiness is unknown and every retained count is
+  labeled as a last-confirmed value. Relative event time is not presented as
+  current freshness; the exact prior event time remains snapshot evidence.
+- Fresh relative time uses the server snapshot time advanced by the measured
+  full-read latency. Stale key rows and activity summaries never retain `in ...`,
+  `Just now`, or another present-tense relative-time claim; they use exact
+  last-confirmed timestamps in evidence.
+- Snapshot currency ends at the earlier of one minute or the earliest known
+  future `cooldown_until`. Once that transition is due, old cooling state is
+  stale until Refresh. A refreshed past cooldown is described as ended rather
+  than still waiting, with enabled/disabled postconditions kept distinct.
+- The canonical `GET /admin/api/v1/dashboard` supplies overview, key, token,
+  ledger, runtime, deadline, and event facts from one database transaction.
+  Legacy individual reads remain bounded compatibility surfaces, but the UI
+  never composes them into current truth. Internal counter/readiness mismatch in
+  the canonical DTO is unavailable/stale, never a current snapshot.
+- The five locked Overview cells remain exactly five. A separate decision brief
+  translates them into cause, impact, and next action.
+- Stable operator handles use a short irreversible fingerprint; full UUIDs,
+  fingerprints, counters, and exact timestamps are evidence details.
+- Recent activity first summarizes failures, cancellations, and operational
+  changes. Routine raw events and the complete newest-100 audit remain available
+  through one keyboard-operable disclosure that reports how many items it
+  contains.
+- Attempt starts are paired with their terminal by exact
+  `attempt_started_event_id`; request identity groups one logical routed request
+  but is never sufficient evidence of an attempt edge. A completed attempt
+  appears once. Because the newest-100 event window alone cannot prove a start
+  is still pending, an unpaired start is labeled completion unconfirmed with
+  age and an explicit no-retry warning. Operator probes are named separately
+  from routed traffic.
+- Progressive disclosure changes priority, not truth. Hidden evidence is never
+  hover-only, is reachable in one activation, preserves DOM reading order, and
+  returns focus deterministically.
+
+### Responsive decision order
+
+At 375px, 768px, unzoomed 1280px, and native 200 percent, the order remains:
+current judgment, next action, affected resource, confirmed result, then audit
+evidence. Narrow navigation is closed by default and does not precede the first
+decision after login. Responsive success requires more than zero horizontal
+overflow: the first content viewport exposes the judgment and next action, each
+core section is one navigation activation away, and secondary evidence is one
+additional activation away.
+
+### Reusable expert-review prompt
+
+Every PdM, product-design, accessibility, content/design-system, and operator
+review uses this same prompt before declaring LGTM:
+
+> For each core journey and every default, loading, empty, success, stale,
+> offline, unauthorized, validation, upstream-failure, and destructive state:
+> identify the user's exact question; the L0/L1 information needed to answer it;
+> the one safest next action; the server-confirmed result; and the L2/L3 evidence
+> that may be disclosed. Verify the answer at 375px, 768px, unzoomed 1280px, and
+> native 200 percent with keyboard, low-vision, distracted-operator, and incident
+> personas. Report any competing action, unexplained state, raw-data-first
+> hierarchy, focus loss, dead end, ambiguous outcome, or hidden prerequisite as
+> CHANGES_REQUIRED with a located required outcome. LGTM requires every core
+> journey to satisfy judgment -> action -> evidence without weakening secret
+> custody, authorization, audit access, or the locked layout/API contracts.
+
+This section is the authority for future UI judgment. Later examples and
+component rules specialize it; they do not override it.
+
+### Verification cadence
+
+Implementation uses a fixed evidence ladder so feedback stays fast without
+weakening the release gate:
+
+1. Reproduce and rerun only the exact failing node while the cause is changing.
+2. Once that node is green, run the directly affected contract, unit, type, lint,
+   or browser group in one serial process where tests share a fixed authority.
+3. Do not run broad browser, native, container, security, or full regression
+   gates while source is still moving. Review agents inspect current source and
+   focused evidence; they do not independently repeat the full gate.
+4. Freeze one candidate source/image digest, then run the complete release gate.
+   Any source change after that gate invalidates its result and requires one new
+   complete gate against the newly frozen candidate, not full-suite reruns after
+   every intermediate edit.
+
+Tests remain sensors: no skip, weakening, broadened assertion, or fabricated
+result may replace a root-cause fix.
+
+### Backup evidence contract
+
+Operational recovery follows the same **judgment -> action -> evidence** axis.
+The judgment is the exact captured schema generation; the action is a quiesced
+paired backup or isolated restore; the evidence is a version-matched manifest
+comparison. V2 is valid only for the complete 0004 schema. V3 is valid only for
+the complete 0005 schema and binds canonical counts and SHA-256 projections for
+events, attempt receipts, pending attempts, live pins, logical routed-request
+rollup, and the ledger singleton. A partial schema, version mismatch, equal
+counts with different identities, or any projection mismatch fails closed.
+Receipts expose only stable field names, counts, and irreversible digests.
+`orphaned_pending` and `legacy_unlinked` are durable evidence blockers: both the
+dashboard and server admission stay closed even if an operator raises row caps.
+The L1 decision names the concrete cause, requires a paired backup and withdrawn
+gateway, and points only to a reviewed evidence-preserving forward repair. A cap
+increase or restart is never presented as repair for either state.
+
+Runtime recovery also has one authority boundary. Every production Compose read
+holds a shared lock on the stable root-owned `runtime.env.lock` inode; a runtime
+update or ledger-capacity recovery holds it exclusively and compare-checks the
+loaded runtime-file digest before replacement. Transient capacity recovery is
+one operation from current-image verification through same-image recreation,
+bounded authenticated ledger convergence, and final config commit. The
+convergence proof is independent of eligible-key readiness so an empty first-run
+key set does not deadlock administration. No intermediate cap value is presented
+as durable success. A post-recreation image, capacity, CAS, signal, or commit
+failure withdraws the app, and the same operation can reenter that stopped
+same-image state. Permanent evidence blockers never enter this path. Backup,
+restore, and rollback use the same target-image-independent host checker in
+runtime-only mode. Each request uses the canonical service `Host` independently
+of the host connection port, a two-second absolute deadline, and a 2 MiB body
+cap. Current images expose an authenticated, fixed four-field
+`GET /admin/api/v1/operator-readiness` DTO containing only `runtime_state`,
+`readiness_cause`, `ledger_status`, and `capacity_blocker`. Its repeatable-read
+query reads the ledger singleton, the three admission counts, and one eligible-
+key count; it never materializes upstream, downstream, or event collections.
+Only an `operator-readiness` `404` permits an exact legacy-overview fallback for
+older images. Legacy ready passes immediately. A degraded/no-key result requires
+a second exact sample 30 seconds later on the same container ID and Docker
+`StartedAt` generation, beyond the prior image's fatal grace plus bounded
+retirement budget.
+`ledger-capacity` never falls back and requires a nonblocked
+ledger. Their paired evidence binds the preserved ledger generation, so
+intentional ready, no-key, transient-capacity, and permanent-blocker states all
+pass while a database or lifecycle outage does not.
+
+## 0A. Research Log
 
 - Embedded refs: shortlisted `nvidia.md`, `sentry.md`, and `hashicorp.md`. Picked Layer A `taste-skill.md` plus Layer B `nvidia.md` because an owner-only gateway console needs operational restraint, technical density, fast scanning, and sharp industrial geometry. `sentry.md` was rejected for its purple product identity and dashboard-card bias. `hashicorp.md` was rejected for its lighter enterprise-marketing posture. The selected references are source material, not a cloning target.
 - Lazyweb: 4 desktop queries, 12 screens viewed. Queries were `AI infrastructure API key management dashboard`, `load balancer operations dashboard health status`, `developer API gateway admin dashboard`, and `GPU cloud infrastructure management dashboard`. The harvested grammar is a narrow navigation rail, state and freshness first, one nearby action band, compact summary values, stable key and event columns, explicit empty/loading/error geometry, filters before evidence, and a deliberate one-time credential dismissal flow. The screen-by-screen hashes and observations are in `.omo/evidence/task-1-nvidia-build-lb/design/research-manifest.md`.
@@ -24,7 +296,7 @@ This is an owner-only technical operations console, read as a quiet instrument p
 
 The UI uses the text product name `NVIDIA Build LB` only as a factual upstream descriptor. It is not rendered as a logo or imitative wordmark. Every login, dashboard, and showcase view includes this visible non-affiliation notice in the document flow:
 
-> NVIDIA Build LB is an independent operations tool. It is not affiliated with, endorsed by, or sponsored by NVIDIA.
+> Independent operations tool; not affiliated with or endorsed by NVIDIA.
 
 The notice is body-size text, remains visible at 200% zoom, and is not hidden in a tooltip, dialog, or hover state. No NVIDIA logo, wordmark, NVIDIA-EMEA font, trademark imagery, font asset, proprietary icon, external script, or external font may be copied or loaded. No exact marketing copy, public marketing hero, product render, green-black brand clone, or reference screenshot is permitted. Only the abstract industrial grammar is adapted.
 
@@ -33,7 +305,9 @@ The notice is body-size text, remains visible at 200% zoom, and is not hidden in
 - Use direct operator language: `2 keys eligible`, `Key cooling down`, `Last successful request 18s ago`.
 - Lead with the state, then the cause, then the smallest safe action.
 - Use sentence case. Avoid tiny all-uppercase eyebrows, slogans, metaphors, and promotional claims.
-- Name destructive targets by internal ID plus short irreversible fingerprint, never by plaintext credential.
+- Keep internal IDs in L2 evidence except for destructive confirmation, where the stable
+  short-fingerprint handle plus short internal ID is the explicit high-consequence exception.
+  Never name a target with plaintext credential material.
 - Error text is calm and actionable: `Probe failed. The key remains disabled. Try again after checking upstream access.`
 - Unknown values read `Not available`. Empty collections read `No upstream keys registered`. Do not show fabricated zeroes.
 - Do not invent quota, rate, latency, or success data. Every number shown comes from the API and includes its time context.
@@ -164,10 +438,12 @@ Geometry tokens are `--radius-control: 2px`, `--border-hairline: 1px`, and `--bo
 
 - Show the 224px left rail and fluid 12-column main grid with 24px gutters and 32px outer inline inset on both `/admin` and `/showcase`.
 - Keep product identity, the visible non-affiliation notice, and route navigation in the rail. Keep the narrow-layout top disclosure hidden.
-- Put exactly five Admin Overview cells in one horizontal band, in this order: `Gateway readiness`, `Eligible keys`, `Cooling keys`, `Logical attempts`, `Last event/freshness`. Render `generated_at` as heading metadata, never as a sixth cell; keep active downstream counts in the downstream-token section.
+- Put exactly five Admin Overview cells in one horizontal band, in this order: `Gateway readiness`, `Eligible keys`, `Cooling keys`, `Logical requests`, `Last event/freshness`. Render `generated_at` as heading metadata, never as a sixth cell; keep active downstream counts in the downstream-token section.
 - Give `/showcase` zero operational Overview cells. Its rail has exactly `Buttons`, `Inputs`, `Statuses`, `Tables`, `Dialogs`, `System states` in that order. Every named section spans the main grid; its internal `.specimen-grid`, `.status-grid`, and `.state-sections` remain exactly 3, 4, and 3 columns respectively.
 - Keep key and event tables in table form. Actions occupy the final column and never wrap into machine-value columns.
-- Keep one primary action per section at the heading edge. Destructive actions remain row-local.
+- Keep `#recommended-action` as the sole primary action for the authenticated page.
+  Section Add/Issue, manual Refresh, and row controls remain secondary or quiet;
+  destructive actions remain row-local.
 - Static DOM/CSS tests assert the exact structure, labels, grid declarations, and order; computed-browser tests assert the rendered rail width, column count, gutter, inset, disclosure visibility, section spans, and Overview/showcase cell counts.
 
 #### 768px to 1279px
@@ -236,7 +512,9 @@ Geometry tokens are `--radius-control: 2px`, `--border-hairline: 1px`, and `--bo
 
 ### Status
 
-- **Structure**: short visible state word, optional short cause, timestamp or freshness, and a text marker such as `OK`, `WARN`, `ERR`, `COOL`, `OFF`, `STALE`, or `REVOKED`. The marker is decorative to screen readers when the full state word is present.
+- **Structure**: short sentence-case state word, optional short cause, and freshness.
+  Visible copy uses `Ready`, `Reduced capacity`, `Cooling`, `Stale`, or `Revoked` rather
+  than raw enums or all-uppercase implementation markers.
 - **Variants**: healthy, degraded, cooldown, disabled, failed, stale, no data, and revoked.
 - **Spacing**: 4px marker gap, 8px state-to-detail gap, and 12px compact inset when bounded.
 - **States**: a noninteractive status has no Hover, Focus, or Active styling. A status filter is a real button and inherits the Button state contract. Disabled and revoked remain distinct text states.
@@ -259,7 +537,7 @@ Geometry tokens are `--radius-control: 2px`, `--border-hairline: 1px`, and `--bo
 - **Variants**: add upstream key, issue downstream token, confirm disable, confirm delete, confirm revoke, and one-time credential.
 - **Spacing**: 24px inset on desktop, 20px on mobile, 16px between sections, and 8px between action buttons.
 - **States**: Default open state uses the raised surface and scrim. Hover, Focus, Active, and Disabled behavior comes from contained controls. Loading disables repeat submission but keeps cancel available unless cancellation is unsafe. Error stays inside the dialog and focuses the error summary. Closing restores focus deterministically.
-- **Accessibility**: initial focus lands on the heading for an informational one-time credential or the first invalid/required field for a form. Tab remains inside the modal. Escape cancels safely. Destructive confirmation names the internal ID and short fingerprint.
+- **Accessibility**: initial focus lands on the heading for an informational one-time credential or the first invalid/required field for a form. Tab remains inside the modal. Escape cancels before submission; after a mutation is sent, Cancel and Escape wait for the authoritative response because discarding it would create an ambiguous result. Destructive confirmation names the stable handle and short internal ID.
 - **Motion**: optional 120ms opacity plus 4px transform on entry, 80ms opacity on exit. Reduced motion makes both immediate.
 
 ### Loading
@@ -289,45 +567,53 @@ Geometry tokens are `--radius-control: 2px`, `--border-hairline: 1px`, and `--bo
 
 ### Summary band
 
-- **Structure**: `/admin` has one section with a heading and a definition list containing exactly five cells, in order: `Gateway readiness`, `Eligible keys`, `Cooling keys`, `Logical attempts`, and `Last event/freshness`. `generated_at` is metadata beside the heading rather than a summary cell. Active downstream-token counts belong only in the downstream-token section. `/showcase` has no operational summary band or Overview cell.
+- **Structure**: `/admin` has one section with a heading and a definition list containing exactly five cells, in order: `Gateway readiness`, `Eligible keys`, `Cooling keys`, `Logical requests`, and `Last event/freshness`. `generated_at` is metadata beside the heading rather than a summary cell. Active downstream-token counts belong only in the downstream-token section. `/showcase` has no operational summary band or Overview cell.
 - **Surface**: shared panel with internal separators. It is not a row of generic cards.
 - **Behavior**: each value links to its controlling section only when navigation is useful. A missing value reads `Not available` rather than zero.
 
 ### Navigation
 
 - **Structure**: product text identity, non-affiliation notice, route links, and logout action in `nav`.
-- **Admin routes**: Overview, Upstream keys, Downstream tokens, Events, and Primitive showcase. Labels match the visible section headings.
+- **Admin routes**: Overview, Upstream keys, Downstream tokens, and Events. Labels match the visible section headings. `/showcase` remains a direct QA route and never competes with operator navigation.
 - **Showcase routes**: exactly Buttons, Inputs, Statuses, Tables, Dialogs, and System states, in that order.
-- **Behavior**: current route uses `aria-current="page"` and a 2px signal edge. Tablet and mobile use a native disclosure pattern, not a custom animated drawer.
+- **Behavior**: each rail link targets a section within the current document, so the selected section uses `aria-current="location"` and a 2px signal edge. Initial markup and runtime navigation keep exactly one current location. Tablet and mobile use a native disclosure pattern, not a custom animated drawer.
 
 ### Administration data projection
 
-- The UI parses only the exact `extra="forbid"` admin DTOs. It does not invent client-side pagination, cursor, query filter, health state, probe state, scope, or event field.
-- Upstream rows expose ID, full canonical fingerprint in accessible machine data, enabled, unknown/healthy/degraded health, cooldown, counters, last safe status, and timestamps. Visual text may shorten only the fingerprint's first 16 hex characters; actions and equality retain `sha256:` plus all 64 hex characters.
+- The UI parses only the exact `extra="forbid"` admin DTOs. It does not invent cursor, server query filters, health state, probe state, scope, routing state, or event fields. Local progressive disclosure may prioritize already validated items without changing their values or server order.
+- Upstream rows lead with the stable operator handle `Key <first eight fingerprint hex>`, exact `disabled|eligible|cooldown|quarantined` routing state, and the next safe action. Full canonical fingerprint, internal ID, counters, last safe status, and exact timestamps remain accessible evidence details. Actions and equality retain `sha256:` plus all 64 hex characters.
 - Downstream rows expose ID, exact unchanged label, canonical scope order, revoke state, counters, and timestamps. The one-time `nblb_ds_` token is accepted only by the issuance dialog and is impossible in list state.
-- Overview projects only the five locked cells: gateway readiness, eligible-key count, cooling-key count, logical-attempt request count, and last-event/freshness. Generation time remains heading metadata and active downstream counts remain in the downstream-token section. Empty storage is visibly degraded/not ready rather than fabricated healthy zero data.
-- Events show at most the newest 100 in server order and only ID, request ID, event type, internal resource IDs, outcome/status class, latency, and occurrence time. There are no message, label, body, header, digest, ciphertext, nonce, or path columns.
+- Overview projects only the five locked cells: gateway readiness, eligible-key count, cooling-key count, routed logical-request count, and last-event/freshness. Per-key attempt counters remain L2 evidence and are never summed to infer routed requests. Generation time remains heading metadata and active downstream counts remain in the downstream-token section. Empty storage is visibly degraded/not ready rather than fabricated healthy zero data.
+- Events summarize the newest validated failures, cancellations, and operational changes first. One explicit audit disclosure preserves at most the newest 100 in server order and only ID, request ID, event type, internal resource IDs, outcome/status class, latency, and occurrence time. There are no message, label, body, header, digest, ciphertext, nonce, or path columns.
 - Safe validation errors always show only `invalid_request`, `request validation failed`, and an opaque request ID. Rejected form content and framework validation detail never enter the DOM.
 
 ### Admin login journey
 
 1. `GET /admin` serves the shell, visible non-affiliation notice, short custody explanation, and labeled admin bearer password field. No operational data or secret is present.
-2. Submit copies the field value into one per-tab JavaScript module variable only, clears the field node, and sends an Authorization header to the overview endpoint. It never writes URL, query, cookie, DOM after submit, localStorage, sessionStorage, log, or response cache.
+2. Submit copies the field value into one per-tab JavaScript module variable only, clears the field node, and sends an Authorization header to the canonical dashboard endpoint. It never writes URL, query, cookie, DOM after submit, localStorage, sessionStorage, log, or response cache.
 3. On 401, clear the module variable, restore the password field, show a linked inline error, and focus the error summary. Do not say whether a token prefix or shape was close.
-4. If the first authenticated Overview load returns 503, keep the safe error visible and do not script-focus Retry. Natural Tab order must reach the visible Retry control; Enter retries, and a successful response focuses the dashboard-title H1.
+4. If the first authenticated dashboard load returns 503, keep the safe error visible and do not script-focus Retry. Natural Tab order must reach the visible Retry control; Enter retries, and a successful response focuses the dashboard-title H1.
 5. On immediate success, remove the login form from the rendered DOM, render the dashboard, and focus the dashboard H1 without scrolling it under navigation.
 6. Reload starts unauthenticated because the module variable is gone. Logout aborts pending admin requests, clears the variable and any ephemeral credential state, returns to login, and focuses the bearer field.
 
 ### Dashboard journey
 
-1. Read gateway health, readiness, freshness, and eligible/cooling counts.
-2. Take the smallest safe action from the relevant section. Actions never appear only on row hover.
-3. Add an upstream key in a password field. It is created disabled. On 201, Cancel, Escape, logout, or reload, erase the value from the live field value, serialized DOM and attributes, and every ephemeral JavaScript reference before showing or capturing anything else. The success state shows only internal ID, short fingerprint, state, and counters.
-4. Probe, enable, disable, or delete through row-local actions. Delete is blocked for an enabled key. Confirmation names only internal ID and fingerprint.
-5. Issue a one-time downstream token after choosing exact scopes. The token appears once in the one-time credential dialog, is never recoverable, and is never included in screenshot, HAR, console, or response-body logging.
+1. Read the five-cell gateway snapshot and the decision brief that states freshness, impact, and the one recommended next action.
+2. Follow add -> probe -> enable -> issue in server-confirmed order. The recommended step is the sole strongest action; section and row controls remain visible and never hover-only.
+3. Add an upstream key in a password field. It is created disabled. Cancel or Escape
+   before submission erases the field. Once sent, Cancel and Escape are disabled until
+   the response establishes a result; logout/reload clear credential memory and require
+   reauthentication plus a full refresh. A lost response is `unknown`, never assumed
+   failed. The success state shows only the stable handle, state, and disclosed evidence.
+4. Probe, enable, disable, or delete through row-local actions. Enable is blocked until a current successful probe leaves the key healthy with no quarantine or active cooldown. Delete is blocked for an enabled key. Confirmation names only the stable short-fingerprint handle and short internal ID.
+5. Issue a one-time downstream token only after at least one upstream key is eligible.
+   The token appears once in the one-time credential dialog, is never recoverable, and
+   is never included in screenshot, HAR, console, or response-body logging. If the issue
+   response is lost but a fresh list finds the new label, revoke that credential as the
+   sole safe action before issuing a replacement.
 6. Copy is an explicit user gesture. Dismissal removes token text from the DOM, clears the module reference, resets the copy control, and performs clipboard cleanup in the same user gesture when copy occurred. If clipboard cleanup is unavailable or fails, the UI says so without echoing the token and the visual capture gate remains blocked until an external secret-safe clipboard check confirms absence.
 7. Revoke a token by internal ID. Revoked remains a visible text state and cannot be used again.
-8. Review recent events last. Event records use request ID, internal key ID, safe outcome class, and timestamp only.
+8. Read the latest attention/change summary last; disclose raw recent events only for audit. Event records retain request ID, internal key ID, safe outcome class, and exact timestamp.
 
 ### Authenticated browser capture contract
 
@@ -352,7 +638,7 @@ Geometry tokens are `--radius-control: 2px`, `--border-hairline: 1px`, and `--bo
 - A native receipt is created only after nested-`finally` cleanup independently observes task-owned browser descendants, Playwright drivers, contexts, pages, persistent profiles, temporary paths, fake-server threads, port listeners, clipboard content, and capture-blackout state all zero. It records contexts/pages started exactly one, maximum live each one, `shared_browser_used:false`, the preference value and `Default/Preferences` file SHA-256 without a temporary path, executable/revision provenance, native metrics, axe/focus/overflow results, and capture IDs. One close failure is aggregated but cannot skip later cleanup. Cleanup values are observations, never hard-coded receipt literals or worker claims.
 - The shell gate persists its initial browser, Playwright-driver, and Lighthouse `(PID, /proc start-time)` identities, and the review request plus both independent reviews bind the baseline receipt SHA-256. Cleanup and visual-review resume both re-observe task-labelled containers, networks, volumes, the loopback listener, task-labelled temporary PostgreSQL images, shell secret/client paths, browser/font/profile/Lighthouse temporary directories, and process identities absent from that baseline. Observer errors are distinct from an empty result and fail closed; resume never replaces observations with literal zeros. Fresh and resume cleanup receipts remain separately preserved while `cleanup.json` mirrors the latest observation. Each phase receipt is written through a noclobber temporary FD; the mirror must succeed first, and only then is the phase receipt renamed as the authoritative completion marker, so a post-cleanup write failure cannot later be promoted by resume.
 - Two fresh task-owned runs must independently reproduce the required capture name/order/count, canonical stable-state DOM hashes, native metrics, preference hash, and zero cleanup observations before determinism is accepted. The DOM hash canonicalization may replace only runtime UUIDs, ISO timestamps, SHA fingerprints, long opaque hexadecimal IDs, and observed latency values; element structure, attributes, state labels, and all other text remain hash-significant. Each state also requires byte-exact raw DOM before/after its stability probes. Receipts are compared by an observer after both runs; a receipt's own assertion is insufficient.
-- HTML, CSS, and JavaScript are only closed `importlib.resources` enum mappings included in the wheel. Browser resources are exactly `/admin`, `/showcase`, `/assets/admin.css`, `/assets/admin.js`, and `/assets/showcase.css`; browser routes cannot select another filename or filesystem path. Wheel-install QA runs outside repository CWD so a source-tree fallback cannot masquerade as packaged delivery.
+- HTML, CSS, and JavaScript are only closed `importlib.resources` enum mappings included in the wheel. Browser resources are exactly `/admin`, `/showcase`, `/assets/admin.css`, `/assets/admin.js`, `/assets/showcase.css`, and `/assets/showcase.js`; browser routes cannot select another filename or filesystem path. The Showcase module owns only responsive disclosure state, current-section semantics, and deterministic section-heading focus; it makes no network request and reads no secret. Wheel-install QA runs outside repository CWD so a source-tree fallback cannot masquerade as packaged delivery.
 
 ### Deterministic focus return
 
@@ -454,7 +740,7 @@ The chosen strategy is mixed borders and tonal shifts. It uses no shadow. The ca
 | Low-vision operator at 200 percent zoom | Completes the same journey without horizontal page scrolling, clipped content, covered focus, or unreadable boundaries |
 | Red-green color-vision deficiency | Distinguishes healthy, degraded, cooldown, disabled, error, stale, and revoked states without relying on hue |
 | Motion-sensitive operator | Encounters no automatic motion and receives the full state model with reduced motion enabled |
-| Distracted operator | Finds one primary action per section, sees the target in every destructive confirmation, and encounters no critical hover-only information |
+| Distracted operator | Finds one primary action for the current page state, sees the target in every destructive confirmation, and encounters no critical hover-only information |
 
 A persona failure is a blocking defect. It is not converted into minor debt without an explicit owner decision, affected-user record, exact remediation, and a new review.
 

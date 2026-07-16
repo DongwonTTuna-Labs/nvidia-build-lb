@@ -4,18 +4,25 @@ from typing import Literal, final
 from uuid import UUID
 
 from nvidia_build_lb.admin.schemas import (
+    AdminDashboardEventListResponse,
+    AdminDashboardRead,
     AdminEventListResponse,
+    AdminLedgerRead,
     AdminOverviewRead,
+    CapacityBlocker,
     DownstreamTokenIssued,
     DownstreamTokenIssueRequest,
     DownstreamTokenListResponse,
+    LedgerStatus,
+    ReadinessCause,
+    RuntimeState,
     UpstreamKeyCreateRequest,
     UpstreamKeyListResponse,
     UpstreamKeyRead,
     UpstreamProbeResponse,
 )
 
-from .fake_admin_models import FakeAdminData, FakeAdminError
+from .fake_admin_models import BASE_TIME, FakeAdminData, FakeAdminError
 from .fake_admin_tokens import issue_token, revoke_token
 from .fake_admin_upstreams import UpstreamAction, add_upstream, build_overview, change_upstream
 
@@ -25,6 +32,7 @@ type BoundaryStep = Literal[
     "auth",
     "no_op",
     "options_405",
+    "route:dashboard",
     "route:overview",
     "route:upstream_list",
     "route:upstream_create",
@@ -132,6 +140,37 @@ class FakeAdminState:
         """Return exact aggregates over the current fake rows."""
         with self._lock:
             return build_overview(self._data)
+
+    def dashboard(self) -> AdminDashboardRead:
+        """Return one strict coherent browser snapshot from the locked fake state."""
+        with self._lock:
+            overview = build_overview(self._data)
+            events = AdminDashboardEventListResponse(items=tuple(self._data.events[:100]))
+            return AdminDashboardRead(
+                runtime_state=RuntimeState.OPERATIONAL,
+                readiness_cause=(
+                    ReadinessCause.READY if overview.ready else ReadinessCause.NO_ELIGIBLE_UPSTREAM
+                ),
+                ledger=AdminLedgerRead(
+                    status=LedgerStatus.OK,
+                    capacity_blocker=CapacityBlocker.NONE,
+                    event_rows=len(self._data.events),
+                    reserved_terminal_slots=0,
+                    event_capacity=10_000,
+                    attempt_rows=0,
+                    attempt_capacity=5_000,
+                    last_maintenance_completed_at=BASE_TIME,
+                    last_pruned_event_rows=0,
+                    last_pruned_attempt_rows=0,
+                    oldest_event_at=(
+                        self._data.events[-1].occurred_at if self._data.events else None
+                    ),
+                ),
+                overview=overview,
+                upstream_keys=UpstreamKeyListResponse(items=tuple(self._data.upstreams)),
+                downstream_tokens=DownstreamTokenListResponse(items=tuple(self._data.tokens)),
+                events=events,
+            )
 
     def upstreams(self) -> UpstreamKeyListResponse:
         """Return the current ordered safe upstream collection."""

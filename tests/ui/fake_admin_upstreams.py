@@ -13,6 +13,7 @@ from nvidia_build_lb.admin.schemas import (
     UpstreamKeyCreateRequest,
     UpstreamKeyRead,
     UpstreamProbeResponse,
+    UpstreamRoutingState,
 )
 
 from .fake_admin_models import (
@@ -28,9 +29,12 @@ type UpstreamAction = Literal["enable", "disable", "delete", "probe"]
 
 def build_overview(data: FakeAdminData) -> AdminOverviewRead:
     enabled = sum(item.enabled for item in data.upstreams)
-    cooling = sum(item.cooldown_until is not None for item in data.upstreams)
+    cooling = sum(
+        item.enabled and item.routing_state is UpstreamRoutingState.COOLDOWN
+        for item in data.upstreams
+    )
     degraded = sum(item.health_state is HealthState.DEGRADED for item in data.upstreams)
-    eligible = sum(item.enabled and item.cooldown_until is None for item in data.upstreams)
+    eligible = sum(item.routing_state is UpstreamRoutingState.ELIGIBLE for item in data.upstreams)
     revoked = sum(item.revoked_at is not None for item in data.tokens)
     status = OverviewStatus.OK if eligible else OverviewStatus.DEGRADED
     return AdminOverviewRead.model_validate(
@@ -49,7 +53,14 @@ def build_overview(data: FakeAdminData) -> AdminOverviewRead:
                 "active": len(data.tokens) - revoked,
                 "revoked": revoked,
             },
-            "request_count": sum(item.request_count for item in data.upstreams),
+            "request_count": len(
+                {
+                    item.request_id
+                    for item in data.events
+                    if item.event_type is EventType.UPSTREAM_ATTEMPT
+                    and item.outcome_class is EventOutcome.STARTED
+                }
+            ),
             "last_event_at": data.events[0].occurred_at if data.events else None,
             "generated_at": BASE_TIME,
         }
@@ -64,6 +75,7 @@ def add_upstream(data: FakeAdminData, request: UpstreamKeyCreateRequest) -> Upst
         id=fake_uuid(data.upstream_sequence),
         fingerprint=fingerprint,
         enabled=False,
+        routing_state=UpstreamRoutingState.DISABLED,
         health_state=HealthState.UNKNOWN,
         cooldown_until=None,
         request_count=0,
@@ -105,8 +117,16 @@ def change_upstream(
     match action:
         case "enable" | "disable":
             enabled = action == "enable"
+            if enabled and item.health_state is not HealthState.HEALTHY:
+                raise FakeAdminError(409, "resource_conflict", "probe required before enable")
             data.upstreams[index] = item.model_copy(
-                update={"enabled": enabled, "updated_at": BASE_TIME}
+                update={
+                    "enabled": enabled,
+                    "routing_state": (
+                        UpstreamRoutingState.ELIGIBLE if enabled else UpstreamRoutingState.DISABLED
+                    ),
+                    "updated_at": BASE_TIME,
+                }
             )
             event_type = (
                 EventType.UPSTREAM_KEY_ENABLED if enabled else EventType.UPSTREAM_KEY_DISABLED
@@ -132,6 +152,7 @@ def change_upstream(
                         EventOutcome.SUCCEEDED,
                         item.id,
                         None,
+                        fingerprint=item.fingerprint,
                     )
                 ),
             )
@@ -140,22 +161,37 @@ def change_upstream(
             data.upstreams[index] = item.model_copy(
                 update={
                     "health_state": HealthState.HEALTHY,
+                    "routing_state": (
+                        UpstreamRoutingState.ELIGIBLE
+                        if item.enabled
+                        else UpstreamRoutingState.DISABLED
+                    ),
                     "cooldown_until": None,
                     "last_status_class": LastStatusClass.SUCCESS,
                     "updated_at": BASE_TIME,
                 }
             )
-            data.events.insert(
-                0,
-                data.record_event(
-                    FakeEventSpec(
-                        EventType.UPSTREAM_PROBE,
-                        EventOutcome.SUCCEEDED,
-                        item.id,
-                        None,
-                    )
-                ),
+            request_id = f"request-{data.event_sequence}"
+            started = data.record_event(
+                FakeEventSpec(
+                    EventType.UPSTREAM_PROBE,
+                    EventOutcome.STARTED,
+                    item.id,
+                    None,
+                    request_id=request_id,
+                )
             )
+            terminal = data.record_event(
+                FakeEventSpec(
+                    EventType.UPSTREAM_PROBE,
+                    EventOutcome.SUCCEEDED,
+                    item.id,
+                    None,
+                    attempt_started_event_id=started.id,
+                    request_id=request_id,
+                )
+            )
+            data.events[0:0] = [terminal, started]
             return UpstreamProbeResponse(
                 id=item.id,
                 enabled=item.enabled,

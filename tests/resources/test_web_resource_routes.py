@@ -39,6 +39,7 @@ def client() -> Iterator[TestClient]:
         ("/assets/admin.css", "text/css", WebResource.ADMIN_STYLESHEET),
         ("/assets/admin.js", "text/javascript", WebResource.ADMIN_SCRIPT),
         ("/assets/showcase.css", "text/css", WebResource.SHOWCASE_STYLESHEET),
+        ("/assets/showcase.js", "text/javascript", WebResource.SHOWCASE_SCRIPT),
     ],
 )
 def test_closed_web_resource_route_serves_exact_policy(
@@ -59,7 +60,7 @@ def test_closed_web_resource_route_serves_exact_policy(
 
 
 def test_unknown_asset_fails_closed_without_generic_mount(client: TestClient) -> None:
-    # Given: a filename outside the three asset routes.
+    # Given: a filename outside the four asset routes.
     # When: the unknown asset is requested.
     response = client.get("/assets/admin.map")
 
@@ -67,12 +68,12 @@ def test_unknown_asset_fails_closed_without_generic_mount(client: TestClient) ->
     assert response.status_code == 404
 
 
-def test_browser_resource_route_registry_is_the_exact_closed_five() -> None:
+def test_browser_resource_route_registry_is_the_exact_closed_six() -> None:
     # Given: the production UI-only resource router.
     router = create_admin_resource_router()
 
     # When: registered HTTP paths and methods are projected.
-    assert len(router.routes) == 5
+    assert len(router.routes) == 6
     assert all(isinstance(route, APIRoute) for route in router.routes)
     routes = tuple(
         (route.path, tuple(sorted(route.methods or ())))
@@ -80,12 +81,13 @@ def test_browser_resource_route_registry_is_the_exact_closed_five() -> None:
         if isinstance(route, APIRoute)
     )
 
-    # Then: only the five named GET resources exist.
+    # Then: only the six named GET resources exist.
     assert routes == (
         ("/admin", ("GET",)),
         ("/assets/admin.css", ("GET",)),
         ("/assets/admin.js", ("GET",)),
         ("/showcase", ("GET",)),
         ("/assets/showcase.css", ("GET",)),
+        ("/assets/showcase.js", ("GET",)),
     )
-    assert sum(path.startswith("/assets/") for path, _ in routes) == 3
+    assert sum(path.startswith("/assets/") for path, _ in routes) == 4

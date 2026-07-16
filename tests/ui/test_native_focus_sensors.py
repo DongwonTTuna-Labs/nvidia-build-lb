@@ -1,6 +1,6 @@
 import pytest
 
-from .browser_checks import BrowserAssertionError
+from .browser_checks import BrowserAssertionError, execute_script
 from .browser_focus import keyboard_focus_count
 from .browser_runtime import start_managed_browser, stop_managed_browser
 
@@ -31,6 +31,24 @@ def test_native_focus_sensor_rejects_adversarial_geometry(markup: str, observabl
     try:
         page.set_content(markup)
         with pytest.raises(BrowserAssertionError, match=observable):
+            _ = keyboard_focus_count(page)
+    finally:
+        try:
+            context.close()
+        finally:
+            stop_managed_browser(managed)
+
+
+def test_native_focus_sensor_rejects_an_uncontrolled_modal_escape() -> None:
+    managed = start_managed_browser()
+    context = managed.browser.new_context(viewport={"width": 640, "height": 450})
+    page = context.new_page()
+    try:
+        page.set_content(
+            "<button>Background</button><dialog><input><button>Cancel</button></dialog>"
+        )
+        execute_script(page, "() => document.querySelector('dialog').showModal()")
+        with pytest.raises(BrowserAssertionError, match="escaped the open modal"):
             _ = keyboard_focus_count(page)
     finally:
         try:

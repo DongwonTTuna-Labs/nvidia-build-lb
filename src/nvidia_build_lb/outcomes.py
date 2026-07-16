@@ -18,6 +18,7 @@ from nvidia_build_lb.outcome_transport_mapping import map_transport
 from nvidia_build_lb.outcome_types import (
     DownstreamLoss,
     HttpStatusSignal,
+    LedgerCapacityExhausted,
     NoEligibleKey,
     PollDeadline,
     ProtocolFailure,
@@ -32,6 +33,7 @@ from nvidia_build_lb.outcome_types import (
 __all__ = [
     "DownstreamLoss",
     "HttpStatusSignal",
+    "LedgerCapacityExhausted",
     "NoEligibleKey",
     "PollDeadline",
     "ProtocolFailure",
@@ -146,6 +148,12 @@ def map_public_outcome(signal: SourceSignal) -> PublicOutcome:
             outcome = _public(503, "no_upstream_keys", "no upstream keys available")
         case ReservationFailure():
             outcome = _public(503, "database_unavailable", "database unavailable")
+        case LedgerCapacityExhausted():
+            outcome = _public(
+                503,
+                "ledger_capacity_exhausted",
+                "request evidence capacity exhausted",
+            )
         case HttpStatusSignal(status_code=status_code):
             outcome = _map_http_status(status_code)
         case ProtocolFailure():

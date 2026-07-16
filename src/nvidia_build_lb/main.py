@@ -5,6 +5,7 @@ from fastapi import FastAPI, Response
 
 from nvidia_build_lb.admin_credentials import register_credential_routes
 from nvidia_build_lb.admin_http_errors import register_credential_error_handlers
+from nvidia_build_lb.admin_mutation_boundary import AdminMutationBoundaryMiddleware
 from nvidia_build_lb.api_routes import register_public_routes
 from nvidia_build_lb.api_types import ApplicationServices
 from nvidia_build_lb.auth import CredentialAuthMiddleware
@@ -46,6 +47,12 @@ def create_app(services: ApplicationServices | None = None) -> SafeServerErrorFa
             include_scope_test_routes=False,
         )
         register_public_routes(application, services)
+        application.add_middleware(
+            AdminMutationBoundaryMiddleware,
+            barrier=services.credentials.mutation_barrier,
+            lifecycle=services.credentials.lifecycle,
+            deadline_seconds=services.credentials.admin_mutation_deadline_seconds,
+        )
         application.add_middleware(
             CredentialAuthMiddleware,
             authenticators=services.credentials.authenticators,

@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from nvidia_build_lb.attempt_commit import (
     AttemptCommitUnresolvedError,
@@ -12,7 +12,6 @@ from nvidia_build_lb.attempt_commit import (
     finalize_with_reconciliation,
     reserve_with_reconciliation,
 )
-from nvidia_build_lb.attempt_fail_stop import AttemptFailStop
 from nvidia_build_lb.attempt_reconciliation import reconcile_start, reconcile_terminal
 from nvidia_build_lb.attempt_records import (
     complete_receipt,
@@ -24,6 +23,7 @@ from nvidia_build_lb.attempt_records import (
     started_event,
     terminal_event,
 )
+from nvidia_build_lb.attempt_repository_dependencies import AttemptRepositoryDependencies
 from nvidia_build_lb.attempt_selection import select_attempt_key
 from nvidia_build_lb.attempt_transitions import apply_terminal_transition
 from nvidia_build_lb.attempt_types import (
@@ -34,7 +34,7 @@ from nvidia_build_lb.attempt_types import (
     TerminalCommitted,
     TerminalReconciliation,
 )
-from nvidia_build_lb.credential_types import Clock, ResourceNotFoundError
+from nvidia_build_lb.credential_types import ResourceNotFoundError
 from nvidia_build_lb.db_models import (
     AdminEventRow,
     SchedulerStateRow,
@@ -46,17 +46,9 @@ from nvidia_build_lb.quarantine_recovery import terminal_updates_routing_state
 from nvidia_build_lb.scheduler_lock import lock_scheduler_state
 from nvidia_build_lb.scheduler_state import TerminalOutcome
 from nvidia_build_lb.service_epoch_types import EpochSqlConnection, PriorEpochCleanup
-from nvidia_build_lb.vault import Vault, VaultEnvelope
+from nvidia_build_lb.vault import VaultEnvelope
 
-
-@dataclass(frozen=True, slots=True)
-class AttemptRepositoryDependencies:
-    """Persistence, vault, and time dependencies."""
-
-    sessions: async_sessionmaker[AsyncSession]
-    vault: Vault
-    clock: Clock
-    fail_stop: AttemptFailStop
+__all__ = ["AttemptRepository", "AttemptRepositoryDependencies"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +102,7 @@ class AttemptRepository:
                 key.id,
                 VaultEnvelope(key.vault_version, key.vault_nonce, key.vault_ciphertext),
             )
+            _ = await self.dependencies.resolved_ledger().lock_attempt_admission(session)
             await self._persist_start(session, scheduler, key, command)
             return AttemptLease(
                 command.identity,
@@ -149,6 +142,7 @@ class AttemptRepository:
                     resource="upstream_key",
                     resource_id=receipt.upstream_key_id,
                 )
+            _ = await self.dependencies.resolved_ledger().lock_terminal(session)
             key.success_count += int(command.outcome is TerminalOutcome.SUCCEEDED)
             key.failure_count += int(command.outcome is not TerminalOutcome.SUCCEEDED)
             explicit_probe = receipt.explicit_probe_key_id == key.id
@@ -165,7 +159,7 @@ class AttemptRepository:
                 explicit_probe=explicit_probe,
             )
             complete_receipt(receipt, command)
-            session.add(terminal_event(receipt, command))
+            session.add(terminal_event(receipt, key.fingerprint, command))
             pin = await session.get(UpstreamLivePinRow, receipt.started_event_id)
             if pin is not None:
                 await session.delete(pin)
@@ -236,7 +230,7 @@ class AttemptRepository:
         key.updated_at = command.started_at
         scheduler.cursor_key_id = key.id
         scheduler.updated_at = command.started_at
-        session.add(started_event(key.id, command))
+        session.add(started_event(key.id, key.fingerprint, command))
         session.add(
             pending_receipt(
                 key.id,

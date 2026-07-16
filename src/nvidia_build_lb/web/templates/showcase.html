@@ -7,6 +7,7 @@
   <title>NVIDIA Build LB primitive showcase</title>
   <link href="/showcase" rel="icon" />
   <link href="/assets/showcase.css" rel="stylesheet" />
+  <script src="/assets/showcase.js" type="module"></script>
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to primitive showcase</a>
@@ -14,12 +15,12 @@
     <aside class="rail">
       <header class="identity">
         <p class="product-name">NVIDIA Build LB</p>
-        <p class="notice">NVIDIA Build LB is an independent operations tool. It is not affiliated with, endorsed by, or sponsored by NVIDIA.</p>
+        <p class="notice">Independent operations tool; not affiliated with or endorsed by NVIDIA.</p>
       </header>
-      <details class="navigation-disclosure" open="open">
+      <details class="navigation-disclosure">
         <summary>Showcase sections</summary>
         <nav aria-label="Showcase sections">
-          <a aria-current="page" href="#buttons">Buttons</a>
+          <a aria-current="location" href="#buttons">Buttons</a>
           <a href="#inputs">Inputs</a>
           <a href="#statuses">Statuses</a>
           <a href="#tables">Tables</a>
@@ -44,22 +45,22 @@
 
     <section id="buttons" data-primitive="button" aria-labelledby="button-heading">
       <div class="section-heading">
-        <div><p class="metadata">Primitive</p><h2 id="button-heading">Button</h2></div>
+        <div><p class="metadata">Primitive</p><h2 id="button-heading" tabindex="-1">Button</h2></div>
         <p>Native controls keep actions visible for keyboard, pointer, and touch input.</p>
       </div>
       <div class="specimen-grid">
-        <article class="specimen"><p class="state-label">State: Default</p><button class="control primary" data-state="default" type="button">Run safe probe</button></article>
-        <article class="specimen"><p class="state-label">State: Hover</p><button class="control primary" data-state="hover" type="button">Run safe probe</button></article>
-        <article class="specimen"><p class="state-label">State: Focus</p><button class="control primary" data-state="focus" type="button">Run safe probe</button></article>
-        <article class="specimen"><p class="state-label">State: Active</p><button class="control primary" data-state="active" type="button">Run safe probe</button></article>
+        <article class="specimen"><p class="state-label">State: Default</p><button class="control primary" data-state="default" type="button">Run probe</button></article>
+        <article class="specimen"><p class="state-label">State: Hover</p><button class="control secondary" data-state="hover" type="button">Run probe</button></article>
+        <article class="specimen"><p class="state-label">State: Focus</p><button class="control secondary" data-state="focus" type="button">Run probe</button></article>
+        <article class="specimen"><p class="state-label">State: Active</p><button class="control secondary" data-state="active" type="button">Run probe</button></article>
         <article class="specimen"><p class="state-label">State: Disabled</p><button class="control" data-state="disabled" disabled="disabled" type="button">Enable unavailable</button><p class="reason">Register a key first.</p></article>
-        <article class="specimen"><p class="state-label">State: Loading</p><button class="control primary" data-state="loading" aria-busy="true" disabled="disabled" type="button">Probing synthetic key…</button></article>
+        <article class="specimen"><p class="state-label">State: Loading</p><button class="control secondary" data-state="loading" aria-busy="true" disabled="disabled" type="button">Probing synthetic key…</button></article>
       </div>
     </section>
 
     <section id="inputs" data-primitive="input" aria-labelledby="input-heading">
       <div class="section-heading">
-        <div><p class="metadata">Primitive</p><h2 id="input-heading">Input</h2></div>
+        <div><p class="metadata">Primitive</p><h2 id="input-heading" tabindex="-1">Input</h2></div>
         <p>Every field keeps a visible label, helper, and located state message.</p>
       </div>
       <div class="specimen-grid">
@@ -67,58 +68,64 @@
         <article class="specimen field" data-state="hover"><p class="state-label">State: Hover</p><label for="label-hover">Operator label</label><input id="label-hover" value="Synthetic key beta" /></article>
         <article class="specimen field" data-state="focus"><p class="state-label">State: Focus</p><label for="label-focus">Operator label</label><input id="label-focus" value="Synthetic key gamma" /></article>
         <article class="specimen field" data-state="active"><p class="state-label">State: Active</p><label for="label-active">Scope choice</label><select id="label-active"><option selected="selected">Read models</option><option>Write chat</option></select></article>
-        <article class="specimen field" data-state="disabled"><p class="state-label">State: Disabled</p><label for="label-disabled">Unavailable field</label><input id="label-disabled" disabled="disabled" value="Requires an eligible key" /></article>
+        <article class="specimen field" data-state="disabled"><p class="state-label">State: Disabled</p><label for="label-disabled">Unavailable field</label><input aria-describedby="label-disabled-reason" id="label-disabled" disabled="disabled" value="Unavailable" /><p class="reason" id="label-disabled-reason">Requires at least one eligible key.</p></article>
         <article class="specimen field" data-state="error"><p class="state-label">State: Error</p><label for="label-error">Operator label</label><input id="label-error" aria-describedby="label-error-message" aria-invalid="true" value="" /><p id="label-error-message" class="error-text">Enter a non-secret label.</p></article>
       </div>
     </section>
 
     <section id="statuses" data-primitive="status" aria-labelledby="status-heading">
       <div class="section-heading">
-        <div><p class="metadata">Primitive</p><h2 id="status-heading">Status</h2></div>
+        <div><p class="metadata">Primitive</p><h2 id="status-heading" tabindex="-1">Status</h2></div>
         <p>Words, markers, and time context identify every state without hue alone.</p>
       </div>
       <div class="status-grid">
-        <article class="status" data-status="healthy"><p class="state-label">State: Healthy</p><strong>OK · Ready</strong><span>Observed just now</span></article>
-        <article class="status" data-status="degraded"><p class="state-label">State: Degraded</p><strong>WARN · Degraded</strong><span>No eligible synthetic keys</span></article>
-        <article class="status" data-status="cooldown"><p class="state-label">State: Cooldown</p><strong>COOL · Cooling down</strong><span>Retry window is pending</span></article>
-        <article class="status" data-status="disabled"><p class="state-label">State: Disabled</p><strong>OFF · Disabled</strong><span>Operator action required</span></article>
-        <article class="status" data-status="stale"><p class="state-label">State: Stale</p><strong>STALE · Prior data</strong><span>Refresh is available</span></article>
-        <article class="status" data-status="failed"><p class="state-label">State: Failed</p><strong>ERR · Probe failed</strong><span>Synthetic key remains disabled</span></article>
-        <article class="status" data-status="no-data"><p class="state-label">State: No data</p><strong>NONE · Not available</strong><span>No observation recorded</span></article>
-        <article class="status" data-status="revoked"><p class="state-label">State: Revoked</p><strong>REVOKED · Inactive</strong><span>Cannot be used again</span></article>
+        <article class="status" data-status="healthy"><p class="state-label">State: Healthy</p><strong>Available · Ready for requests</strong><span>No action required</span></article>
+        <article class="status" data-status="degraded"><p class="state-label">State: Degraded</p><strong>Blocked · No eligible key</strong><span>Add or recover an upstream key</span></article>
+        <article class="status" data-status="cooldown"><p class="state-label">State: Cooldown</p><strong>Waiting · Cooldown active</strong><span>Returns automatically when the timer ends</span></article>
+        <article class="status" data-status="disabled"><p class="state-label">State: Disabled</p><strong>Setup · Key disabled</strong><span>Probe before enabling</span></article>
+        <article class="status" data-status="stale"><p class="state-label">State: Stale</p><strong>Stale · Current state unknown</strong><span>Refresh before changing anything</span></article>
+        <article class="status" data-status="failed"><p class="state-label">State: Failed</p><strong>Action needed · Probe failed</strong><span>Correct the cause, then probe again</span></article>
+        <article class="status" data-status="no-data"><p class="state-label">State: No data</p><strong>Unavailable · Not observed</strong><span>Load current state</span></article>
+        <article class="status" data-status="revoked"><p class="state-label">State: Revoked</p><strong>Revoked · Cannot be used</strong><span>No action required</span></article>
       </div>
     </section>
 
     <section id="tables" data-primitive="table" aria-labelledby="table-heading">
       <div class="section-heading">
-        <div><p class="metadata">Primitive</p><h2 id="table-heading">Table</h2></div>
-        <p>Stable columns hold synthetic identifiers, safe state, and time context.</p>
+        <div><p class="metadata">Primitive</p><h2 id="table-heading" tabindex="-1">Table</h2></div>
+        <p>Human-readable judgment comes first; machine evidence stays one disclosure away.</p>
       </div>
       <div class="table-stack">
-        <table><caption>Synthetic upstream keys</caption><thead><tr><th scope="col">Internal ID</th><th scope="col">Fingerprint</th><th scope="col">State</th><th scope="col">Requests</th></tr></thead><tbody><tr><th scope="row" data-label="Internal ID">key-01</th><td data-label="Fingerprint">9F2C…A71B</td><td data-label="State">Healthy</td><td data-label="Requests">128</td></tr></tbody></table>
-        <table><caption>Synthetic downstream tokens</caption><thead><tr><th scope="col">Internal ID</th><th scope="col">Label</th><th scope="col">Scopes</th><th scope="col">State</th></tr></thead><tbody><tr><th scope="row" data-label="Internal ID">token-01</th><td data-label="Label">Hermes synthetic</td><td data-label="Scopes">models:read</td><td data-label="State">Active</td></tr></tbody></table>
-        <table><caption>Synthetic events</caption><thead><tr><th scope="col">Request ID</th><th scope="col">Outcome</th><th scope="col">Status class</th><th scope="col">Observed</th></tr></thead><tbody><tr><th scope="row" data-label="Request ID">request-01</th><td data-label="Outcome">Completed</td><td data-label="Status class">2xx</td><td data-label="Observed">Just now</td></tr></tbody></table>
+        <table><caption>Synthetic upstream keys</caption><thead><tr><th scope="col">Resource</th><th scope="col">State</th><th scope="col">Next action</th><th scope="col">Evidence</th></tr></thead><tbody><tr><th scope="row" data-label="Resource">Key 9f2ca71b</th><td data-label="State">Eligible</td><td data-label="Next action">No action required</td><td data-label="Evidence"><details class="resource-details"><summary>Evidence</summary><p class="machine-id">Synthetic fingerprint prefix 9f2ca71b · 128 requests</p></details></td></tr></tbody></table>
+        <table><caption>Synthetic downstream tokens</caption><thead><tr><th scope="col">Client</th><th scope="col">Access</th><th scope="col">State</th><th scope="col">Evidence</th></tr></thead><tbody><tr><th scope="row" data-label="Client">Hermes synthetic</th><td data-label="Access">Read models</td><td data-label="State">Active</td><td data-label="Evidence"><details class="resource-details"><summary>Evidence</summary><p class="machine-id">Synthetic token ID 01 · used just now</p></details></td></tr></tbody></table>
+        <table><caption>Synthetic events</caption><thead><tr><th scope="col">Change</th><th scope="col">Resource</th><th scope="col">Outcome</th><th scope="col">Evidence</th></tr></thead><tbody><tr><th scope="row" data-label="Change">Probe completed</th><td data-label="Resource">Key 9f2ca71b</td><td data-label="Outcome">Succeeded</td><td data-label="Evidence"><details class="resource-details"><summary>Evidence</summary><p class="machine-id">Synthetic request 01 · just now</p></details></td></tr></tbody></table>
       </div>
     </section>
 
     <section id="dialogs" data-primitive="dialog" aria-labelledby="dialog-section-heading">
       <div class="section-heading">
-        <div><p class="metadata">Primitive</p><h2 id="dialog-section-heading">Dialog</h2></div>
+        <div><p class="metadata">Primitive</p><h2 id="dialog-section-heading" tabindex="-1">Dialog</h2></div>
         <p>A bounded confirmation names its synthetic target and keeps cancel available.</p>
       </div>
       <dialog open="open" aria-labelledby="dialog-heading" aria-describedby="dialog-description">
         <p class="state-label">State: Default</p>
-        <h3 id="dialog-heading">Disable synthetic key key-01?</h3>
-        <p id="dialog-description">New requests will stop selecting this synthetic key.</p>
-        <div class="dialog-actions"><button class="control" type="button">Cancel</button><button class="control destructive" type="button">Disable key-01</button></div>
+        <h3 id="dialog-heading">Disable Key 9f2ca71b?</h3>
+        <p id="dialog-description">Target: Key 9f2ca71b · ID 00000002. New requests will stop selecting it. Existing work is not claimed cancelled.</p>
+        <div class="dialog-actions"><button class="control" type="button">Cancel</button><button class="control destructive" type="button">Disable Key 9f2ca71b</button></div>
       </dialog>
     </section>
 
-    <div id="system-states" class="state-sections">
-      <section data-primitive="loading" data-state="loading" aria-labelledby="loading-heading" aria-busy="true"><p class="state-label">State: Loading</p><h2 id="loading-heading">Loading</h2><p class="skeleton">Loading synthetic events…</p></section>
-      <section data-primitive="empty" data-state="empty" aria-labelledby="empty-heading"><p class="state-label">State: Empty</p><h2 id="empty-heading">Empty</h2><p>No upstream keys registered. Add one in the authenticated product later.</p></section>
-      <section data-primitive="error" data-state="error" aria-labelledby="error-heading"><p class="state-label">State: Error</p><h2 id="error-heading">Error</h2><p><strong>ERR · Showcase recovery example.</strong> Retry after checking the local service.</p><button class="control destructive" type="button">Retry safe request</button></section>
-    </div>
+    <section id="system-states" aria-labelledby="system-states-heading">
+      <div class="section-heading">
+        <div><p class="metadata">Composite states</p><h2 id="system-states-heading" tabindex="-1">System states</h2></div>
+        <p>Loading, empty, and error surfaces preserve the same location and explain the next safe step.</p>
+      </div>
+      <div class="state-sections">
+        <section data-primitive="loading" data-state="loading" aria-labelledby="loading-heading" aria-busy="true"><p class="state-label">State: Loading</p><h3 id="loading-heading">Loading</h3><p class="skeleton">Loading synthetic events…</p></section>
+        <section data-primitive="empty" data-state="empty" aria-labelledby="empty-heading"><p class="state-label">State: Empty</p><h3 id="empty-heading">Empty</h3><p>No upstream keys registered. Add one in the authenticated product later.</p></section>
+        <section data-primitive="error" data-state="error" aria-labelledby="error-heading"><p class="state-label">State: Error</p><h3 id="error-heading">Error</h3><p><strong>Unavailable · Current state could not be loaded.</strong> Check the local service, then refresh.</p><button class="control secondary" type="button">Refresh current state</button><details class="resource-details request-evidence"><summary>Request evidence</summary><div class="request-evidence-body"><p class="request-evidence-message">Synthetic administration state unavailable</p><dl><dt>Code</dt><dd class="machine-id">database_unavailable</dd><dt>Request</dt><dd class="machine-id">synthetic-request-01</dd></dl></div></details></section>
+      </div>
+    </section>
     </main>
   </div>
   <footer><p>Copyright 2026 DongwonTTuna-Labs. Independent implementation; third-party names remain the property of their respective owners.</p></footer>

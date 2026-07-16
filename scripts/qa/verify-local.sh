@@ -388,10 +388,19 @@ uv run basedpyright
 FULL_TEST_EVIDENCE=".omo/evidence/task-4-nvidia-build-lb/runs/todo7-full-$RUN_ID"
 EVIDENCE_DIR="$FULL_TEST_EVIDENCE" uv run pytest -q
 
-NBLB_APP_REGISTRY_DIGEST="${IMAGE_DIGEST#sha256:}" \
-NBLB_POSTGRES_REGISTRY_DIGEST="${POSTGRES_IMAGE_DIGEST#sha256:}" \
-NBLB_SECRET_DIR="$PRIMARY_SECRET_DIR" \
-scripts/ops/production-compose.sh config --quiet
+RUNTIME_CONFIG=$CLIENT_DIR/runtime.env
+RUNTIME_LOCK=$RUNTIME_CONFIG.lock
+printf '%s\n' \
+    "NBLB_APP_REGISTRY_DIGEST=${IMAGE_DIGEST#sha256:}" \
+    "NBLB_POSTGRES_REGISTRY_DIGEST=${POSTGRES_IMAGE_DIGEST#sha256:}" \
+    "NBLB_SECRET_DIR=$PRIMARY_SECRET_DIR" \
+    "NBLB_ADMIN_EVENT_MAX_ROWS=100000" \
+    "NBLB_ADMIN_ATTEMPT_MAX_ROWS=40000" \
+    "NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE=1000" > "$RUNTIME_CONFIG"
+chmod 0600 "$RUNTIME_CONFIG"
+install -m 0600 /dev/null "$RUNTIME_LOCK"
+NBLB_RUNTIME_CONFIG_FILE="$RUNTIME_CONFIG" \
+    scripts/ops/production-compose.sh config --quiet
 primary_compose config --quiet
 restore_compose config --quiet
 

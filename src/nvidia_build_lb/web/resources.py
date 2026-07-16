@@ -15,6 +15,7 @@ class WebResource(StrEnum):
     ADMIN_SCRIPT = "admin-script"
     SHOWCASE_DOCUMENT = "showcase-document"
     SHOWCASE_STYLESHEET = "showcase-stylesheet"
+    SHOWCASE_SCRIPT = "showcase-script"
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +45,10 @@ _RESOURCE_LOCATIONS: Final = MappingProxyType(
         WebResource.SHOWCASE_STYLESHEET: _ResourceLocation(
             package="nvidia_build_lb.web.static",
             filename="showcase.css",
+        ),
+        WebResource.SHOWCASE_SCRIPT: _ResourceLocation(
+            package="nvidia_build_lb.web.static",
+            filename="showcase.js",
         ),
     }
 )

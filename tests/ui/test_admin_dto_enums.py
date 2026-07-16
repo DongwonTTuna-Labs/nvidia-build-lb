@@ -7,9 +7,11 @@ from pydantic import JsonValue, TypeAdapter
 
 from .test_admin_dto_script import (
     ADMIN_SCRIPT,
+    DASHBOARD_DTO,
     DOWNSTREAM_DTO,
     ERROR_DETAIL_DTO,
     EVENT_DTO,
+    LEDGER_DTO,
     NODE_EXECUTABLE,
     OVERVIEW_DTO,
     PROBE_DTO,
@@ -23,7 +25,7 @@ _STRING_MATRIX = TypeAdapter(list[list[str]])
 _ORDER_HARNESS = r"""
 import {readFileSync} from "node:fs";
 const source = readFileSync(process.argv[1], "utf8");
-const boundary = source.indexOf('byId("add-upstream")');
+const boundary = source.indexOf("function initializeAdmin");
 if (boundary < 0) throw new Error("admin initialization boundary missing");
 const declarations = source.slice(0, boundary);
 const encoded = Buffer.from(`${declarations}\nexport {parseAdminDto};`).toString("base64");
@@ -47,9 +49,19 @@ def _ordered_ids(cases: Sequence[tuple[str, JsonValue]]) -> list[list[str]]:
     return _STRING_MATRIX.validate_json(completed.stdout)
 
 
+def _dashboard_field(field: str, value: JsonValue) -> dict[str, JsonValue]:
+    return {**DASHBOARD_DTO, field: value}
+
+
+def _dashboard_ledger_field(field: str, value: JsonValue) -> dict[str, JsonValue]:
+    ledger: dict[str, JsonValue] = {**LEDGER_DTO, field: value}
+    return {**DASHBOARD_DTO, "ledger": ledger}
+
+
 def test_admin_script_accepts_every_value_in_each_closed_enum() -> None:
     # Given: every positive value from every administration response enum.
     health_states = ("unknown", "healthy", "degraded")
+    routing_states = ("disabled", "eligible", "cooldown", "quarantined")
     status_classes = (
         "success",
         "invalid_credential",
@@ -98,9 +110,16 @@ def test_admin_script_accepts_every_value_in_each_closed_enum() -> None:
         "upstream_unavailable",
         "upstream_protocol_error",
         "poll_timeout",
+        "admin_read_timeout",
+        "admin_mutation_timeout",
+        "admin_mutation_response_invalid",
+        "admin_mutation_settling",
+        "runtime_unavailable",
+        "ledger_capacity_exhausted",
     )
     cases: list[tuple[str, JsonValue]] = []
     cases.extend(("upstream", {**UPSTREAM_DTO, "health_state": value}) for value in health_states)
+    cases.extend(("upstream", {**UPSTREAM_DTO, "routing_state": value}) for value in routing_states)
     cases.extend(
         ("upstream", {**UPSTREAM_DTO, "last_status_class": value}) for value in status_classes
     )
@@ -116,6 +135,39 @@ def test_admin_script_accepts_every_value_in_each_closed_enum() -> None:
         ("eventList", {"items": [{**EVENT_DTO, "status_class": value}]}) for value in status_classes
     )
     cases.extend(("error", {"error": {**ERROR_DETAIL_DTO, "code": value}}) for value in safe_codes)
+    cases.extend(
+        ("dashboard", _dashboard_field("runtime_state", value))
+        for value in ("operational", "unavailable")
+    )
+    cases.extend(
+        ("dashboard", _dashboard_field("readiness_cause", value))
+        for value in (
+            "ready",
+            "runtime_unavailable",
+            "ledger_capacity_exhausted",
+            "no_eligible_upstream",
+        )
+    )
+    cases.extend(
+        ("dashboard", _dashboard_ledger_field("status", value))
+        for value in (
+            "ok",
+            "maintenance_overdue",
+            "capacity_exhausted_recovering",
+            "capacity_blocked",
+        )
+    )
+    cases.extend(
+        ("dashboard", _dashboard_ledger_field("capacity_blocker", value))
+        for value in (
+            "none",
+            "active_attempts",
+            "reconciliation_grace",
+            "lock_contention",
+            "orphaned_pending",
+            "legacy_unlinked",
+        )
+    )
 
     # When: the production JavaScript boundary parses the complete positive matrix.
     accepted = accepted_cases(cases)

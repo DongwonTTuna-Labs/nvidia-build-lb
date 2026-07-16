@@ -33,6 +33,16 @@ class HealthState(StrEnum):
 
 
 @unique
+class UpstreamRoutingState(StrEnum):
+    """Operator-safe reason a persisted key is or is not selectable."""
+
+    DISABLED = "disabled"
+    ELIGIBLE = "eligible"
+    COOLDOWN = "cooldown"
+    QUARANTINED = "quarantined"
+
+
+@unique
 class LastStatusClass(StrEnum):
     """Safe terminal classifications shared by keys and events."""
 
@@ -74,6 +84,46 @@ class OverviewStatus(StrEnum):
 
     OK = "ok"
     DEGRADED = "degraded"
+
+
+@unique
+class RuntimeState(StrEnum):
+    """Process-lifecycle state sampled around one dashboard snapshot."""
+
+    OPERATIONAL = "operational"
+    UNAVAILABLE = "unavailable"
+
+
+@unique
+class ReadinessCause(StrEnum):
+    """Single highest-priority reason for the dashboard readiness value."""
+
+    READY = "ready"
+    RUNTIME_UNAVAILABLE = "runtime_unavailable"
+    LEDGER_CAPACITY_EXHAUSTED = "ledger_capacity_exhausted"
+    NO_ELIGIBLE_UPSTREAM = "no_eligible_upstream"
+
+
+@unique
+class LedgerStatus(StrEnum):
+    """Closed capacity and maintenance states for the administration ledger."""
+
+    OK = "ok"
+    MAINTENANCE_OVERDUE = "maintenance_overdue"
+    CAPACITY_EXHAUSTED_RECOVERING = "capacity_exhausted_recovering"
+    CAPACITY_BLOCKED = "capacity_blocked"
+
+
+@unique
+class CapacityBlocker(StrEnum):
+    """Exact reason a successful maintenance assessment could not recover capacity."""
+
+    NONE = "none"
+    ACTIVE_ATTEMPTS = "active_attempts"
+    RECONCILIATION_GRACE = "reconciliation_grace"
+    LOCK_CONTENTION = "lock_contention"
+    ORPHANED_PENDING = "orphaned_pending"
+    LEGACY_UNLINKED = "legacy_unlinked"
 
 
 @unique

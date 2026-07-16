@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from nvidia_build_lb.admin.schemas import LastStatusClass, UpstreamKeyCreateRequest
+from nvidia_build_lb.admin.schemas import HealthState, LastStatusClass, UpstreamKeyCreateRequest
 from nvidia_build_lb.attempt_commit import (
     AttemptCommitUnresolvedError,
     StartConflictError,
@@ -76,6 +76,10 @@ async def _enabled_key(
         UpstreamKeyCreateRequest(key=credential),
         request_id=f"create-{credential}",
     )
+    async with sessions.begin() as session:
+        row = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert row is not None
+        row.health_state = HealthState.HEALTHY.value
     await upstream.enable(created.id, request_id=f"enable-{credential}")
     return created.id
 

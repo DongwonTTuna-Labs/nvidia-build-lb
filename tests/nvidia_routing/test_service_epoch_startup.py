@@ -126,6 +126,31 @@ class _Cleaner:
         return PriorEpochCleanup(0)
 
 
+class _PrePublish:
+    events: list[str]
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def __call__(self, epoch: UUID) -> None:
+        del epoch
+        self.events.append("startup maintenance")
+
+
+class _FailingPrePublish(_PrePublish):
+    error: Exception
+
+    def __init__(self, events: list[str], error: Exception) -> None:
+        super().__init__(events)
+        self.error = error
+
+    @override
+    async def __call__(self, epoch: UUID) -> None:
+        del epoch
+        self.events.append("startup maintenance failure")
+        raise self.error
+
+
 class _PrimaryFailingCleaner(_Cleaner):
     error: RuntimeError
 
@@ -218,6 +243,7 @@ async def _startup_observation() -> tuple[list[str], int, UUID]:
             uuid_source=uuids,
             publisher=_Publisher(events),
             readiness=_Readiness(events),
+            pre_publish=_PrePublish(events),
         )
     )
     observed_epoch: UUID | None = None
@@ -238,12 +264,13 @@ async def test_startup_uses_locked_connection_and_publishes_ready_last() -> None
 
     assert epoch == _EPOCH
     assert uuid_calls == 1
-    assert events[:7] == [
+    assert events[:8] == [
         "open dedicated connection",
         "acquire lock once",
         "create UUIDv4",
         "same-connection transaction cleans prior epoch pins",
         "commit cleanup",
+        "startup maintenance",
         "publish epoch",
         "ready true",
     ]
@@ -260,6 +287,7 @@ async def test_startup_failure_preserves_primary_and_attempts_all_cleanup() -> N
             uuid_source=_UuidSource(events),
             publisher=_Publisher(events),
             readiness=_FailingReadiness(events),
+            pre_publish=_PrePublish(events),
         )
     )
 
@@ -273,6 +301,60 @@ async def test_startup_failure_preserves_primary_and_attempts_all_cleanup() -> N
     assert events[-4:] == ["primary cleanup failure", "ready false", "unlock", "close"]
 
 
+async def test_startup_maintenance_failure_never_publishes_epoch_monitor_or_readiness() -> None:
+    events: list[str] = []
+    connection = _Connection(events)
+    primary = RuntimeError()
+    coordinator = ServiceEpochCoordinator(
+        ServiceEpochDependencies(
+            connection_factory=_Factory(connection, events),
+            pin_cleaner=_Cleaner(events),
+            uuid_source=_UuidSource(events),
+            publisher=_Publisher(events),
+            readiness=_Readiness(events),
+            pre_publish=_FailingPrePublish(events, primary),
+        )
+    )
+
+    captured: pytest.ExceptionInfo[RuntimeError] | None = None
+    async with anyio.create_task_group() as tasks:
+        with pytest.raises(RuntimeError) as captured:
+            _ = await coordinator.start(tasks, _Submitter())
+
+    assert captured is not None
+    assert captured.value is primary
+    assert "publish epoch" not in events
+    assert "ready true" not in events
+    assert events[-4:] == ["startup maintenance failure", "ready false", "unlock", "close"]
+
+
+async def test_startup_maintenance_timeout_never_publishes_epoch_or_readiness() -> None:
+    events: list[str] = []
+    connection = _Connection(events)
+    timeout = TimeoutError()
+    coordinator = ServiceEpochCoordinator(
+        ServiceEpochDependencies(
+            connection_factory=_Factory(connection, events),
+            pin_cleaner=_Cleaner(events),
+            uuid_source=_UuidSource(events),
+            publisher=_Publisher(events),
+            readiness=_Readiness(events),
+            pre_publish=_FailingPrePublish(events, timeout),
+        )
+    )
+
+    captured: pytest.ExceptionInfo[TimeoutError] | None = None
+    async with anyio.create_task_group() as tasks:
+        with pytest.raises(TimeoutError) as captured:
+            _ = await coordinator.start(tasks, _Submitter())
+
+    assert captured is not None
+    assert captured.value is timeout
+    assert "publish epoch" not in events
+    assert "ready true" not in events
+    assert events[-4:] == ["startup maintenance failure", "ready false", "unlock", "close"]
+
+
 async def test_readiness_publish_failure_joins_monitor_before_unlock_and_close() -> None:
     events: list[str] = []
     connection = _Connection(events)
@@ -284,6 +366,7 @@ async def test_readiness_publish_failure_joins_monitor_before_unlock_and_close()
             uuid_source=_UuidSource(events),
             publisher=_Publisher(events),
             readiness=_PublishFailingReadiness(events, primary),
+            pre_publish=_PrePublish(events),
         )
     )
     captured: pytest.ExceptionInfo[RuntimeError] | None = None
@@ -311,6 +394,7 @@ async def test_startup_cleanup_inner_shields_are_hard_bounded(
             uuid_source=_UuidSource(events),
             publisher=_Publisher(events),
             readiness=_Readiness(events),
+            pre_publish=_PrePublish(events),
         )
     )
     captured: pytest.ExceptionInfo[RuntimeError] | None = None
@@ -371,6 +455,7 @@ async def test_invalid_open_connection_close_inner_shield_is_hard_bounded(
             uuid_source=_UuidSource(events),
             publisher=_Publisher(events),
             readiness=_Readiness(events),
+            pre_publish=_PrePublish(events),
         )
     )
 
@@ -404,6 +489,7 @@ async def test_invalid_open_metadata_exception_still_closes_connection(
             uuid_source=_UuidSource(events),
             publisher=_Publisher(events),
             readiness=_Readiness(events),
+            pre_publish=_PrePublish(events),
         )
     )
 
@@ -418,7 +504,7 @@ async def test_invalid_open_metadata_exception_still_closes_connection(
 _AXES = (
     "service_epoch_epoch_count_per_process",
     "service_epoch_epoch_kind",
-    *(f"service_epoch_startup_order_{index}" for index in range(7)),
+    *(f"service_epoch_startup_order_{index}" for index in range(8)),
 )
 
 
@@ -428,7 +514,7 @@ async def test_atomic_accepted_axis(axis: str) -> None:
     observations: dict[str, object] = {
         "service_epoch_epoch_count_per_process": uuid_calls,
         "service_epoch_epoch_kind": "UUIDv4" if epoch.version == 4 else "other",
-        **{f"service_epoch_startup_order_{index}": value for index, value in enumerate(events[:7])},
+        **{f"service_epoch_startup_order_{index}": value for index, value in enumerate(events[:8])},
     }
     expected: dict[str, object] = {
         "service_epoch_epoch_count_per_process": 1,
@@ -442,6 +528,7 @@ async def test_atomic_accepted_axis(axis: str) -> None:
                     "create UUIDv4",
                     "same-connection transaction cleans prior epoch pins",
                     "commit cleanup",
+                    "startup maintenance",
                     "publish epoch",
                     "ready true",
                 )

@@ -1,16 +1,21 @@
 """Public durable scheduler commands, leases, and safe errors."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from datetime import datetime
 from enum import StrEnum, unique
-from typing import override
-from uuid import UUID
+from typing import TYPE_CHECKING, override
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+if TYPE_CHECKING:
+    from datetime import datetime
+    from uuid import UUID
 
-from nvidia_build_lb.admin.schemas import LastStatusClass
-from nvidia_build_lb.credential_types import Clock
-from nvidia_build_lb.db_models import SchedulerStateRow, UpstreamKeyRow
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from nvidia_build_lb.admin.schemas import LastStatusClass
+    from nvidia_build_lb.admin_ledger import AdminLedger
+    from nvidia_build_lb.credential_types import Clock
+    from nvidia_build_lb.db_models import SchedulerStateRow, UpstreamKeyRow
 
 
 @unique
@@ -49,6 +54,7 @@ class SchedulerDependencies:
 
     sessions: async_sessionmaker[AsyncSession]
     clock: Clock
+    ledger: AdminLedger | None = None
 
 
 @dataclass(frozen=True, slots=True)

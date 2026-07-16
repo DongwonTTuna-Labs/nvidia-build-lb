@@ -7,54 +7,30 @@ from uuid import UUID, uuid4
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from nvidia_build_lb.admin.schemas import (
-    EventOutcome,
     EventType,
     HealthState,
-    LastStatusClass,
     ProbeStatus,
     UpstreamKeyCreateRequest,
     UpstreamKeyListResponse,
     UpstreamKeyRead,
     UpstreamProbeResponse,
 )
-from nvidia_build_lb.credential_types import Clock, ResourceConflictError, ResourceNotFoundError
+from nvidia_build_lb.credential_types import ResourceConflictError, ResourceNotFoundError
 from nvidia_build_lb.db_models import (
+    EVENT_WRITER_GENERATION,
     AdminEventRow,
     UpstreamKeyRow,
     UpstreamLivePinRow,
 )
 from nvidia_build_lb.scheduler_lock import lock_scheduler_state
-from nvidia_build_lb.vault import Vault, VaultEnvelope
+from nvidia_build_lb.upstream_key_dependencies import UpstreamKeyDependencies
+from nvidia_build_lb.upstream_key_events import upstream_key_event
+from nvidia_build_lb.upstream_key_views import upstream_key_read
+from nvidia_build_lb.vault import VaultEnvelope
 
-
-@dataclass(frozen=True, slots=True)
-class UpstreamKeyDependencies:
-    """Concrete persistence, encryption, and time dependencies."""
-
-    sessions: async_sessionmaker[AsyncSession]
-    vault: Vault
-    clock: Clock
-
-
-def _to_read(row: UpstreamKeyRow) -> UpstreamKeyRead:
-    last_status = None if row.last_status_class is None else LastStatusClass(row.last_status_class)
-    return UpstreamKeyRead(
-        id=row.id,
-        fingerprint=f"sha256:{row.fingerprint}",
-        enabled=row.enabled,
-        health_state=HealthState(row.health_state),
-        cooldown_until=row.cooldown_until,
-        request_count=row.request_count,
-        success_count=row.success_count,
-        failure_count=row.failure_count,
-        last_status_class=last_status,
-        last_used_at=row.last_used_at,
-        created_at=row.created_at,
-        updated_at=row.updated_at,
-    )
+__all__ = ["UpstreamKeyDependencies", "UpstreamKeyRepository"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,26 +72,24 @@ class UpstreamKeyRepository:
         )
         try:
             async with self.dependencies.sessions.begin() as session:
+                _ = await self.dependencies.resolved_ledger().lock_mutation_admission(session)
                 session.add(row)
                 session.add(
-                    AdminEventRow(
-                        id=uuid4(),
+                    upstream_key_event(
                         request_id=request_id,
-                        event_type=EventType.UPSTREAM_KEY_CREATED.value,
-                        upstream_key_id=row_id,
-                        downstream_token_id=None,
-                        outcome_class=EventOutcome.SUCCEEDED.value,
-                        status_class=None,
-                        latency_ms=None,
+                        event_type=EventType.UPSTREAM_KEY_CREATED,
+                        key_id=row_id,
+                        fingerprint=fingerprint,
                         occurred_at=now,
                     )
                 )
         except IntegrityError:
             raise ResourceConflictError(resource="upstream_key") from None
-        return _to_read(row)
+        return upstream_key_read(row, now)
 
     async def list_all(self) -> UpstreamKeyListResponse:
         """Return every current key in the contract's stable order."""
+        now = self.dependencies.clock.now()
         async with self.dependencies.sessions() as session:
             rows = tuple(
                 (
@@ -127,7 +101,7 @@ class UpstreamKeyRepository:
                     )
                 ).all()
             )
-        return UpstreamKeyListResponse(items=tuple(_to_read(row) for row in rows))
+        return UpstreamKeyListResponse(items=tuple(upstream_key_read(row, now) for row in rows))
 
     async def secret_for(self, key_id: UUID) -> SecretStr:
         """Decrypt one key only for the internal NVIDIA adapter boundary."""
@@ -170,18 +144,22 @@ class UpstreamKeyRepository:
                 raise ResourceNotFoundError(resource="upstream_key", resource_id=key_id)
             if row.enabled:
                 return
+            now = self.dependencies.clock.now()
+            if (
+                row.health_state != HealthState.HEALTHY.value
+                or row.quarantined
+                or (row.cooldown_until is not None and row.cooldown_until > now)
+            ):
+                raise ResourceConflictError(resource="upstream_key")
+            _ = await self.dependencies.resolved_ledger().lock_mutation_admission(session)
             row.enabled = True
-            row.updated_at = self.dependencies.clock.now()
+            row.updated_at = now
             session.add(
-                AdminEventRow(
-                    id=uuid4(),
+                upstream_key_event(
                     request_id=request_id,
-                    event_type=EventType.UPSTREAM_KEY_ENABLED.value,
-                    upstream_key_id=key_id,
-                    downstream_token_id=None,
-                    outcome_class=EventOutcome.SUCCEEDED.value,
-                    status_class=None,
-                    latency_ms=None,
+                    event_type=EventType.UPSTREAM_KEY_ENABLED,
+                    key_id=key_id,
+                    fingerprint=row.fingerprint,
                     occurred_at=row.updated_at,
                 )
             )
@@ -195,18 +173,15 @@ class UpstreamKeyRepository:
                 raise ResourceNotFoundError(resource="upstream_key", resource_id=key_id)
             if not row.enabled:
                 return
+            _ = await self.dependencies.resolved_ledger().lock_mutation_admission(session)
             row.enabled = False
             row.updated_at = self.dependencies.clock.now()
             session.add(
-                AdminEventRow(
-                    id=uuid4(),
+                upstream_key_event(
                     request_id=request_id,
-                    event_type=EventType.UPSTREAM_KEY_DISABLED.value,
-                    upstream_key_id=key_id,
-                    downstream_token_id=None,
-                    outcome_class=EventOutcome.SUCCEEDED.value,
-                    status_class=None,
-                    latency_ms=None,
+                    event_type=EventType.UPSTREAM_KEY_DISABLED,
+                    key_id=key_id,
+                    fingerprint=row.fingerprint,
                     occurred_at=row.updated_at,
                 )
             )
@@ -227,16 +202,29 @@ class UpstreamKeyRepository:
             )
             if live_pin is not None:
                 raise ResourceConflictError(resource="upstream_key")
+            legacy_events = tuple(
+                (
+                    await session.scalars(
+                        select(AdminEventRow)
+                        .where(
+                            AdminEventRow.upstream_key_id == key_id,
+                            AdminEventRow.writer_generation.is_(None),
+                        )
+                        .order_by(AdminEventRow.id.asc())
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            _ = await self.dependencies.resolved_ledger().lock_mutation_admission(session)
+            for legacy_event in legacy_events:
+                legacy_event.upstream_key_fingerprint = row.fingerprint
+                legacy_event.writer_generation = EVENT_WRITER_GENERATION
             session.add(
-                AdminEventRow(
-                    id=uuid4(),
+                upstream_key_event(
                     request_id=request_id,
-                    event_type=EventType.UPSTREAM_KEY_DELETED.value,
-                    upstream_key_id=key_id,
-                    downstream_token_id=None,
-                    outcome_class=EventOutcome.SUCCEEDED.value,
-                    status_class=None,
-                    latency_ms=None,
+                    event_type=EventType.UPSTREAM_KEY_DELETED,
+                    key_id=key_id,
+                    fingerprint=row.fingerprint,
                     occurred_at=self.dependencies.clock.now(),
                 )
             )

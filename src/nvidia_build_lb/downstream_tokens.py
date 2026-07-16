@@ -20,6 +20,7 @@ from nvidia_build_lb.admin.schemas import (
     EventOutcome,
     EventType,
 )
+from nvidia_build_lb.admin_ledger import AdminLedger, default_admin_ledger
 from nvidia_build_lb.credential_types import (
     AuthenticationRejectedError,
     AuthRealm,
@@ -29,7 +30,11 @@ from nvidia_build_lb.credential_types import (
     ResourceConflictError,
     ResourceNotFoundError,
 )
-from nvidia_build_lb.db_models import AdminEventRow, DownstreamTokenRow
+from nvidia_build_lb.db_models import (
+    EVENT_WRITER_GENERATION,
+    AdminEventRow,
+    DownstreamTokenRow,
+)
 
 
 class TokenHexSource(Protocol):
@@ -56,6 +61,15 @@ class DownstreamTokenDependencies:
     sessions: async_sessionmaker[AsyncSession]
     clock: Clock
     token_hex: TokenHexSource
+    ledger: AdminLedger | None = None
+
+    def resolved_ledger(self) -> AdminLedger:
+        """Return the shared production ledger or an isolated-test default."""
+        return (
+            self.ledger
+            if self.ledger is not None
+            else default_admin_ledger(self.sessions, self.clock)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +101,7 @@ class DownstreamTokenRepository:
         )
         try:
             async with self.dependencies.sessions.begin() as session:
+                _ = await self.dependencies.resolved_ledger().lock_mutation_admission(session)
                 session.add(row)
                 session.add(
                     AdminEventRow(
@@ -94,11 +109,13 @@ class DownstreamTokenRepository:
                         request_id=request_id,
                         event_type=EventType.DOWNSTREAM_ISSUED.value,
                         upstream_key_id=None,
+                        upstream_key_fingerprint=None,
                         downstream_token_id=token_id,
                         outcome_class=EventOutcome.SUCCEEDED.value,
                         status_class=None,
                         latency_ms=None,
                         occurred_at=now,
+                        writer_generation=EVENT_WRITER_GENERATION,
                     )
                 )
         except IntegrityError:
@@ -127,7 +144,7 @@ class DownstreamTokenRepository:
                     )
                 ).all()
             )
-        return DownstreamTokenListResponse(items=tuple(_to_read(row) for row in rows))
+        return DownstreamTokenListResponse(items=tuple(downstream_token_read(row) for row in rows))
 
     async def find_exact_label(self, label: str) -> DownstreamTokenRead | None:
         """Reconcile one issuance identity without recovering its bearer."""
@@ -135,7 +152,7 @@ class DownstreamTokenRepository:
             row = await session.scalar(
                 select(DownstreamTokenRow).where(DownstreamTokenRow.label_bytes == label.encode())
             )
-        return None if row is None else _to_read(row)
+        return None if row is None else downstream_token_read(row)
 
     async def revoke(self, token_id: UUID, request_id: str) -> None:
         """Revoke one active token and reject unknown or repeated revocation."""
@@ -143,6 +160,7 @@ class DownstreamTokenRepository:
             row = await session.get(DownstreamTokenRow, token_id, with_for_update=True)
             if row is None or row.revoked_at is not None:
                 raise ResourceNotFoundError(resource="downstream_token", resource_id=token_id)
+            _ = await self.dependencies.resolved_ledger().lock_mutation_admission(session)
             row.revoked_at = self.dependencies.clock.now()
             session.add(
                 AdminEventRow(
@@ -150,11 +168,13 @@ class DownstreamTokenRepository:
                     request_id=request_id,
                     event_type=EventType.DOWNSTREAM_REVOKED.value,
                     upstream_key_id=None,
+                    upstream_key_fingerprint=None,
                     downstream_token_id=token_id,
                     outcome_class=EventOutcome.SUCCEEDED.value,
                     status_class=None,
                     latency_ms=None,
                     occurred_at=row.revoked_at,
+                    writer_generation=EVENT_WRITER_GENERATION,
                 )
             )
 
@@ -195,7 +215,8 @@ def _scopes(row: DownstreamTokenRow) -> tuple[DownstreamScope, ...]:
     )
 
 
-def _to_read(row: DownstreamTokenRow) -> DownstreamTokenRead:
+def downstream_token_read(row: DownstreamTokenRow) -> DownstreamTokenRead:
+    """Project one digest-free downstream row for list/dashboard reuse."""
     return DownstreamTokenRead(
         id=row.id,
         label=row.label,

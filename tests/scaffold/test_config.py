@@ -145,3 +145,28 @@ def test_settings_reject_an_invalid_log_level(tmp_path: Path) -> None:
 
     # Then: it returns the stable invalid-level classification.
     assert captured.value.code is ConfigurationErrorCode.LOG_LEVEL_INVALID
+
+
+def test_prune_batch_must_fit_one_complete_two_attempt_group(tmp_path: Path) -> None:
+    source = _valid_source(tmp_path)
+
+    accepted = load_settings(source.model_copy(update={"admin_ledger_prune_batch_size": 6}))
+    assert accepted.admin_ledger_prune_batch_size == 6
+
+    rejected = source.model_copy(update={"admin_ledger_prune_batch_size": 5})
+    with pytest.raises(ConfigurationError) as captured:
+        _ = load_settings(rejected)
+    assert captured.value.code is ConfigurationErrorCode.ADMIN_LEDGER_INVALID
+
+
+def test_attempt_capacity_preserves_newest_event_reserve(tmp_path: Path) -> None:
+    source = _valid_source(tmp_path).model_copy(
+        update={
+            "admin_attempt_max_rows": 500,
+            "admin_event_max_rows": 1_099,
+        }
+    )
+
+    with pytest.raises(ConfigurationError) as captured:
+        _ = load_settings(source)
+    assert captured.value.code is ConfigurationErrorCode.ADMIN_LEDGER_INVALID

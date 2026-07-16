@@ -120,9 +120,9 @@ class ProductionNetworkAudit:
             raise AssertionError(reason)
         failed = [item for item in items if item.failed]
         expected_failures = {
-            ("auth_initial_offline", "GET", "/admin/api/v1/overview"),
-            ("offline_refresh", "GET", "/admin/api/v1/overview"),
-            ("native-offline_refresh", "GET", "/admin/api/v1/overview"),
+            ("auth_initial_offline", "GET", "/admin/api/v1/dashboard"),
+            ("offline_refresh", "GET", "/admin/api/v1/dashboard"),
+            ("native-offline_refresh", "GET", "/admin/api/v1/dashboard"),
         }
         observed_failures = {(item.phase, item.method, item.path) for item in failed}
         if observed_failures != expected_failures or len(failed) != len(expected_failures):

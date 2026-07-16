@@ -3,10 +3,7 @@ import xml.etree.ElementTree as ET
 
 from fastapi.testclient import TestClient
 
-_NOTICE = (
-    "NVIDIA Build LB is an independent operations tool. It is not affiliated with, "
-    "endorsed by, or sponsored by NVIDIA."
-)
+_NOTICE = "Independent operations tool; not affiliated with or endorsed by NVIDIA."
 _PRIMITIVES = {"button", "input", "status", "table", "dialog", "loading", "empty", "error"}
 _STATES = {
     "Default",
@@ -75,7 +72,7 @@ def test_document_uses_one_native_disclosure_for_navigation_when_rendered(
     assert len(disclosures) == 1
     assert len(navigations) == 1
     disclosure = disclosures[0]
-    assert disclosure.attrib == {"class": "navigation-disclosure", "open": "open"}
+    assert disclosure.attrib == {"class": "navigation-disclosure"}
     summary = disclosure.find("summary")
     assert summary is not None
     assert "".join(summary.itertext()).strip() == "Showcase sections"
@@ -91,6 +88,8 @@ def test_document_uses_one_native_disclosure_for_navigation_when_rendered(
         ("System states", "#system-states"),
     ]
     assert len({link.attrib["href"] for link in links}) == len(links)
+    assert links[0].attrib["aria-current"] == "location"
+    assert all("aria-current" not in link.attrib for link in links[1:])
     assert all(root.find(f".//*[@id='{link.attrib['href'][1:]}']") is not None for link in links)
 
 
@@ -149,7 +148,52 @@ def test_document_contains_notice_tables_and_copyright_boundary_when_rendered(
     assert "Synthetic non-secret examples" in text
 
 
-def test_document_has_no_inline_executable_or_brand_asset_when_rendered(
+def test_disabled_input_and_error_primitive_expose_reason_and_safe_evidence(
+    showcase_client: TestClient,
+) -> None:
+    _, root = _document(showcase_client)
+
+    disabled = root.find(".//input[@id='label-disabled']")
+    assert disabled is not None
+    assert disabled.attrib["disabled"] == "disabled"
+    assert disabled.attrib["aria-describedby"] == "label-disabled-reason"
+    reason = root.find(".//*[@id='label-disabled-reason']")
+    assert reason is not None
+    assert "Requires at least one eligible key" in "".join(reason.itertext())
+
+    error = root.find(".//section[@data-primitive='error']")
+    assert error is not None
+    evidence = error.find("details[@class='resource-details request-evidence']")
+    assert evidence is not None
+    assert "open" not in evidence.attrib
+    summary = evidence.find("summary")
+    assert summary is not None
+    assert "Request evidence" in "".join(summary.itertext())
+    body = evidence.find("div[@class='request-evidence-body']")
+    assert body is not None
+    message = body.find("p[@class='request-evidence-message']")
+    assert message is not None
+    assert "Synthetic administration state unavailable" in "".join(message.itertext())
+    terms = ["".join(term.itertext()).strip() for term in body.findall("dl/dt")]
+    values = body.findall("dl/dd")
+    assert terms == ["Code", "Request"]
+    assert ["".join(value.itertext()).strip() for value in values] == [
+        "database_unavailable",
+        "synthetic-request-01",
+    ]
+    assert all(value.attrib["class"] == "machine-id" for value in values)
+
+
+def test_showcase_exposes_only_one_primary_action_emphasis(showcase_client: TestClient) -> None:
+    _, root = _document(showcase_client)
+
+    primary = root.findall(".//button[@class='control primary']")
+
+    assert len(primary) == 1
+    assert "".join(primary[0].itertext()).strip() == "Run probe"
+
+
+def test_document_has_only_the_closed_external_module_and_no_brand_asset_when_rendered(
     showcase_client: TestClient,
 ) -> None:
     # Given: the raw static document.
@@ -159,9 +203,9 @@ def test_document_has_no_inline_executable_or_brand_asset_when_rendered(
     # When: executable, embedded, and brand-asset surfaces are searched.
     attributes = [attribute for element in root.iter() for attribute in element.attrib]
 
-    # Then: only the external same-origin stylesheet provides presentation.
+    # Then: only closed same-origin CSS and module resources provide presentation and behavior.
     assert "<style" not in lowered
-    assert "<script" not in lowered
+    assert "<script>" not in lowered
     assert "<svg" not in lowered
     assert "<img" not in lowered
     assert "logo" not in lowered
@@ -172,6 +216,11 @@ def test_document_has_no_inline_executable_or_brand_asset_when_rendered(
         {"href": "/showcase", "rel": "icon"},
         {"href": "/assets/showcase.css", "rel": "stylesheet"},
     ]
+    scripts = root.findall("head/script")
+    assert [script.attrib for script in scripts] == [
+        {"src": "/assets/showcase.js", "type": "module"}
+    ]
+    assert all(not (script.text or "").strip() for script in scripts)
 
 
 def test_document_contains_no_secret_shaped_text_when_rendered(showcase_client: TestClient) -> None:

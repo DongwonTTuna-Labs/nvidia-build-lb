@@ -5,6 +5,14 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from nvidia_build_lb.admin.schemas import AdminValidationErrorResponse
+from nvidia_build_lb.admin_deadlines import (
+    AdminMutationSettlingError,
+    AdminReadTimeoutError,
+)
+from nvidia_build_lb.admin_ledger import (
+    LedgerCapacityExhaustedError,
+    LedgerStateUnavailableError,
+)
 from nvidia_build_lb.credential_types import (
     InvalidAdminRequestError,
     ResourceConflictError,
@@ -21,6 +29,8 @@ from nvidia_build_lb.server_error_boundary import (
 
 def register_credential_error_handlers(app: FastAPI) -> None:
     """Register only fixed safe administration error projections."""
+    _register_ledger_error_handlers(app)
+    _register_read_error_handlers(app)
 
     @app.exception_handler(ResourceNotFoundError)
     async def _not_found(request: Request, error: ResourceNotFoundError) -> Response:
@@ -89,6 +99,54 @@ def register_credential_error_handlers(app: FastAPI) -> None:
         _database_connect_unavailable,
         _internal_server_error,
     )
+
+
+def _register_ledger_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(LedgerCapacityExhaustedError)
+    async def _ledger_capacity(request: Request, error: LedgerCapacityExhaustedError) -> Response:
+        del error
+        return safe_credential_error(
+            503,
+            "ledger_capacity_exhausted",
+            "request evidence capacity exhausted",
+            request_id_from(request),
+        )
+
+    @app.exception_handler(LedgerStateUnavailableError)
+    async def _ledger_unavailable(request: Request, error: LedgerStateUnavailableError) -> Response:
+        del error
+        return safe_credential_error(
+            503,
+            "database_unavailable",
+            "database unavailable",
+            request_id_from(request),
+        )
+
+    _ = (_ledger_capacity, _ledger_unavailable)
+
+
+def _register_read_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AdminReadTimeoutError)
+    async def _read_timeout(request: Request, error: AdminReadTimeoutError) -> Response:
+        del error
+        return safe_credential_error(
+            504,
+            "admin_read_timeout",
+            "current snapshot not confirmed",
+            request_id_from(request),
+        )
+
+    @app.exception_handler(AdminMutationSettlingError)
+    async def _mutation_settling(request: Request, error: AdminMutationSettlingError) -> Response:
+        del error
+        return safe_credential_error(
+            503,
+            "admin_mutation_settling",
+            "mutation settlement not confirmed",
+            request_id_from(request),
+        )
+
+    _ = (_read_timeout, _mutation_settling)
 
 
 def safe_credential_error(

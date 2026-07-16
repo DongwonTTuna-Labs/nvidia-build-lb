@@ -20,6 +20,7 @@ class LogEventName(StrEnum):
     """Whitelisted stable event names."""
 
     CONFIGURATION_REJECTED = "configuration.rejected"
+    MAINTENANCE_FAILED = "maintenance.failed"
     SERVICE_STARTED = "service.started"
     REQUEST_COMPLETED = "request.completed"
     UPSTREAM_STATE_CHANGED = "upstream.state_changed"

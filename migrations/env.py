@@ -13,7 +13,10 @@ _CONFIG = context.config
 _URL_OPTION: Final = "sqlalchemy.url"
 _MIGRATION_LOCK_KEY_ONE: Final = 1_312_967_746
 _MIGRATION_LOCK_KEY_TWO: Final = 2
-_MIGRATION_LOCK_TIMEOUT_MS: Final = 120_000
+_RUNTIME_LOCK_KEY_TWO: Final = 1
+_MIGRATION_LOCK_TIMEOUT_MS: Final = 5_000
+_MIGRATION_STATEMENT_TIMEOUT_MS: Final = 120_000
+_RUNTIME_LOCK_UNAVAILABLE: Final = "runtime_lock_unavailable"
 
 
 def run_migrations_offline() -> None:
@@ -30,10 +33,15 @@ def run_migrations_offline() -> None:
 
 
 def _run_migrations(connection: Connection) -> None:
-    acquired = False
+    migration_acquired = False
+    runtime_acquired = False
     try:
         _ = connection.execute(
             text("SELECT set_config('statement_timeout', :timeout_ms, false)"),
+            {"timeout_ms": str(_MIGRATION_STATEMENT_TIMEOUT_MS)},
+        )
+        _ = connection.execute(
+            text("SELECT set_config('lock_timeout', :timeout_ms, false)"),
             {"timeout_ms": str(_MIGRATION_LOCK_TIMEOUT_MS)},
         )
         _ = connection.execute(
@@ -43,8 +51,19 @@ def _run_migrations(connection: Connection) -> None:
                 "second_key": _MIGRATION_LOCK_KEY_TWO,
             },
         )
-        acquired = True
-        _ = connection.execute(text("SELECT set_config('statement_timeout', '0', false)"))
+        migration_acquired = True
+        runtime_acquired = (
+            connection.scalar(
+                text("SELECT pg_try_advisory_lock(:first_key, :second_key)"),
+                {
+                    "first_key": _MIGRATION_LOCK_KEY_ONE,
+                    "second_key": _RUNTIME_LOCK_KEY_TWO,
+                },
+            )
+            is True
+        )
+        if not runtime_acquired:
+            raise RuntimeError(_RUNTIME_LOCK_UNAVAILABLE)
         connection.commit()
         context.configure(
             connection=connection,
@@ -54,7 +73,15 @@ def _run_migrations(connection: Connection) -> None:
         with context.begin_transaction():
             context.run_migrations()
     finally:
-        if acquired:
+        if runtime_acquired:
+            _ = connection.execute(
+                text("SELECT pg_advisory_unlock(:first_key, :second_key)"),
+                {
+                    "first_key": _MIGRATION_LOCK_KEY_ONE,
+                    "second_key": _RUNTIME_LOCK_KEY_TWO,
+                },
+            )
+        if migration_acquired:
             _ = connection.execute(
                 text("SELECT pg_advisory_unlock(:first_key, :second_key)"),
                 {

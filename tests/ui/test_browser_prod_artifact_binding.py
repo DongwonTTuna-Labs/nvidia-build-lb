@@ -9,7 +9,9 @@ import pytest
 from .browser_evidence import CaptureIndex, CaptureRecord
 from .browser_prod_verify import (
     _fresh_cleanup_binding,  # pyright: ignore[reportPrivateUsage]
+    _immutable_review_request,  # pyright: ignore[reportPrivateUsage]
     _review_is_valid,  # pyright: ignore[reportPrivateUsage]
+    _ReviewRequest,  # pyright: ignore[reportPrivateUsage]
     _RunArtifactBinding,  # pyright: ignore[reportPrivateUsage]
     _RunArtifactHashes,  # pyright: ignore[reportPrivateUsage]
     _verified_capture_index,  # pyright: ignore[reportPrivateUsage]
@@ -167,6 +169,7 @@ def test_visual_review_is_bound_to_both_capture_index_hashes(tmp_path: Path) -> 
         postgres_image_digest="sha256:" + "7" * 64,
         lane="objective-visual",
         process_baseline_sha256="f" * 64,
+        review_request_sha256="8" * 64,
         run_artifact_sha256=binding,
         schema_version=2,
         source_tree_sha256="d" * 64,
@@ -186,6 +189,8 @@ def test_visual_review_is_bound_to_both_capture_index_hashes(tmp_path: Path) -> 
     assert not _review_is_valid(path, changed_baseline)
     changed_cleanup = review.model_copy(update={"fresh_cleanup_sha256": "1" * 64})
     assert not _review_is_valid(path, changed_cleanup)
+    changed_request = review.model_copy(update={"review_request_sha256": "9" * 64})
+    assert not _review_is_valid(path, changed_request)
 
     for stale_binding in (
         {"run-a": binding["run-a"]},
@@ -211,6 +216,7 @@ def test_visual_review_symlink_is_never_accepted(tmp_path: Path) -> None:
         postgres_image_digest="sha256:" + "7" * 64,
         lane="objective-visual",
         process_baseline_sha256="f" * 64,
+        review_request_sha256="8" * 64,
         run_artifact_sha256={"run-a": run_hashes, "run-b": run_hashes},
         schema_version=2,
         source_tree_sha256="d" * 64,
@@ -222,6 +228,42 @@ def test_visual_review_symlink_is_never_accepted(tmp_path: Path) -> None:
     _ = path.symlink_to(outside)
 
     assert not _review_is_valid(path, review)
+
+
+def test_review_request_is_created_once_and_resume_never_rewrites_it(tmp_path: Path) -> None:
+    run_hashes = _RunArtifactHashes(
+        adversarial="a" * 64,
+        candidate="b" * 64,
+        capture_index="c" * 64,
+        lighthouse="d" * 64,
+        manual_qa="e" * 64,
+        stack_cleanup="f" * 64,
+    )
+    request = _ReviewRequest(
+        fresh_cleanup_sha256=None,
+        image_digest="sha256:" + "1" * 64,
+        postgres_image_digest="sha256:" + "2" * 64,
+        process_baseline_sha256="3" * 64,
+        run_artifact_sha256={"run-a": run_hashes, "run-b": run_hashes},
+        schema_version=2,
+        source_tree_sha256="4" * 64,
+        status="REVIEW_REQUIRED",
+    )
+
+    observed, initial_sha = _immutable_review_request(tmp_path, request, resume=False)
+    path = tmp_path / "review-request.json"
+    initial_bytes = path.read_bytes()
+    resumed, resumed_sha = _immutable_review_request(tmp_path, request, resume=True)
+
+    assert observed == request
+    assert resumed == request
+    assert resumed_sha == initial_sha
+    assert path.read_bytes() == initial_bytes
+
+    _ = path.write_bytes(initial_bytes + b"\n")
+    _, drifted_sha = _immutable_review_request(tmp_path, request, resume=True)
+    assert drifted_sha != initial_sha
+    assert path.read_bytes() == initial_bytes + b"\n"
 
 
 def test_fresh_cleanup_binding_requires_pass_and_exact_zero_observations(tmp_path: Path) -> None:

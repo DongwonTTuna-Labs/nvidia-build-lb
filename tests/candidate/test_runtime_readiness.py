@@ -3,9 +3,16 @@
 from dataclasses import dataclass
 from uuid import uuid4
 
+import anyio
 import pytest
 
-from nvidia_build_lb.admin.schemas import OverviewStatus
+from nvidia_build_lb.admin.schemas import (
+    AdminDashboardRead,
+    AdminOperatorReadinessRead,
+    OverviewStatus,
+    ReadinessCause,
+    RuntimeState,
+)
 from nvidia_build_lb.runtime_readiness import (
     MONITOR_FATAL_GRACE_SECONDS,
     GatedCredentialRepositories,
@@ -19,7 +26,7 @@ from nvidia_build_lb.service_epoch_monitor import (
     MonitorFatalClass,
     MonitorHealthy,
 )
-from tests.contracts.fakes import contract_services
+from tests.contracts.fakes import FakeCredentialRepositories, contract_services
 
 pytestmark = pytest.mark.anyio
 
@@ -73,13 +80,81 @@ async def test_lifecycle_gate_forces_admin_overview_degraded_until_epoch_ready()
     repositories = GatedCredentialRepositories(services.credentials.repositories, gate)
 
     closed = await repositories.overview()
+    closed_operator = await repositories.operator_readiness()
     gate.set_ready(True)
     opened = await repositories.overview()
+    opened_operator = await repositories.operator_readiness()
 
     assert closed.ready is False
     assert closed.status is OverviewStatus.DEGRADED
     assert opened.ready is True
     assert opened.status is OverviewStatus.OK
+    assert closed_operator.runtime_state is RuntimeState.UNAVAILABLE
+    assert closed_operator.readiness_cause is ReadinessCause.RUNTIME_UNAVAILABLE
+    assert opened_operator.runtime_state is RuntimeState.OPERATIONAL
+    assert opened_operator.readiness_cause is ReadinessCause.READY
+
+
+async def test_lifecycle_withdrawal_during_both_coherent_reads_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    services, repository_ready = contract_services()
+    repository_ready.set_ready(True)
+    inner = services.credentials.repositories
+    assert isinstance(inner, FakeCredentialRepositories)
+    gate = RuntimeReadinessGate()
+    gate.set_ready(True)
+    repositories = GatedCredentialRepositories(inner, gate)
+    dashboard_started = anyio.Event()
+    operator_started = anyio.Event()
+    release_reads = anyio.Event()
+    original_dashboard = FakeCredentialRepositories.dashboard
+    original_operator = FakeCredentialRepositories.operator_readiness
+
+    async def pausing_dashboard(
+        fake: FakeCredentialRepositories,
+    ) -> AdminDashboardRead:
+        dashboard_started.set()
+        await release_reads.wait()
+        return await original_dashboard(fake)
+
+    async def pausing_operator(
+        fake: FakeCredentialRepositories,
+    ) -> AdminOperatorReadinessRead:
+        operator_started.set()
+        await release_reads.wait()
+        return await original_operator(fake)
+
+    monkeypatch.setattr(FakeCredentialRepositories, "dashboard", pausing_dashboard)
+    monkeypatch.setattr(
+        FakeCredentialRepositories,
+        "operator_readiness",
+        pausing_operator,
+    )
+    dashboards: list[AdminDashboardRead] = []
+    operator_reads: list[AdminOperatorReadinessRead] = []
+
+    async def read_dashboard() -> None:
+        dashboards.append(await repositories.dashboard())
+
+    async def read_operator() -> None:
+        operator_reads.append(await repositories.operator_readiness())
+
+    async with anyio.create_task_group() as tasks:
+        _ = tasks.start_soon(read_dashboard)
+        _ = tasks.start_soon(read_operator)
+        await dashboard_started.wait()
+        await operator_started.wait()
+        gate.set_ready(False)
+        release_reads.set()
+
+    assert len(dashboards) == 1
+    assert dashboards[0].runtime_state is RuntimeState.UNAVAILABLE
+    assert dashboards[0].readiness_cause is ReadinessCause.RUNTIME_UNAVAILABLE
+    assert dashboards[0].overview.ready is False
+    assert len(operator_reads) == 1
+    assert operator_reads[0].runtime_state is RuntimeState.UNAVAILABLE
+    assert operator_reads[0].readiness_cause is ReadinessCause.RUNTIME_UNAVAILABLE
 
 
 async def test_repository_degradation_still_wins_when_lifecycle_is_ready() -> None:

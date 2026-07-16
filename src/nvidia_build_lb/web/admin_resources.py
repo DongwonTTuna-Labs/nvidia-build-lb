@@ -52,6 +52,10 @@ def _get_showcase_stylesheet() -> Response:
     return _resource_response(WebResource.SHOWCASE_STYLESHEET, "text/css")
 
 
+def _get_showcase_script() -> Response:
+    return _resource_response(WebResource.SHOWCASE_SCRIPT, "text/javascript")
+
+
 def create_admin_resource_router() -> APIRouter:
     """Build the closed unauthenticated shell and asset route set."""
     router = APIRouter()
@@ -86,6 +90,13 @@ def create_admin_resource_router() -> APIRouter:
     router.add_api_route(
         "/assets/showcase.css",
         _get_showcase_stylesheet,
+        methods=["GET"],
+        include_in_schema=False,
+        response_class=Response,
+    )
+    router.add_api_route(
+        "/assets/showcase.js",
+        _get_showcase_script,
         methods=["GET"],
         include_in_schema=False,
         response_class=Response,

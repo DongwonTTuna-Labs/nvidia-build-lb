@@ -15,7 +15,7 @@ from .browser_evidence import CaptureSpec, ManualScenario
 from .browser_prod_context import ProductionJourney
 from .browser_runtime import UI_ORIGIN
 
-_OVERVIEW = f"{UI_ORIGIN}/admin/api/v1/overview"
+_DASHBOARD = f"{UI_ORIGIN}/admin/api/v1/dashboard"
 
 
 def _phase(journey: ProductionJourney, name: str) -> None:
@@ -48,26 +48,41 @@ def _install_empty_projection(session: AuthenticatedSession) -> None:
         "last_event_at": None,
         "generated_at": "2026-01-01T00:00:00Z",
     }
-    routes: dict[str, Mapping[str, object]] = {
-        "/overview": overview,
-        "/upstream-keys": empty,
-        "/downstream-tokens": empty,
-        "/events": empty,
+    dashboard: dict[str, object] = {
+        "runtime_state": "operational",
+        "readiness_cause": "no_eligible_upstream",
+        "ledger": {
+            "status": "ok",
+            "capacity_blocker": "none",
+            "event_rows": 0,
+            "reserved_terminal_slots": 0,
+            "event_capacity": 10_000,
+            "attempt_rows": 0,
+            "attempt_capacity": 5_000,
+            "last_maintenance_completed_at": "2026-01-01T00:00:00Z",
+            "last_pruned_event_rows": 0,
+            "last_pruned_attempt_rows": 0,
+            "oldest_event_at": None,
+        },
+        "overview": overview,
+        "upstream_keys": empty,
+        "downstream_tokens": empty,
+        "events": empty,
     }
-    for suffix, body in routes.items():
-        _ = page.route(f"{UI_ORIGIN}/admin/api/v1{suffix}", _fulfill(body), times=1)
+    _ = page.route(_DASHBOARD, _fulfill(dashboard), times=1)
 
 
 def run_production_state_recovery(journey: ProductionJourney) -> None:
     page = journey.session.page
     prefix = journey.capture_prefix
     _phase(journey, f"{prefix}offline_refresh")
-    _ = page.route(_OVERVIEW, _abort, times=1)
+    _ = page.route(_DASHBOARD, _abort, times=1)
     page.locator("#refresh-dashboard").focus()
     page.keyboard.press("Enter")
-    expect(page.locator("#stale-warning")).to_be_visible()
-    expect(page.locator("#refresh-dashboard")).to_be_enabled()
-    expect(page.locator("#refresh-dashboard")).to_be_focused()
+    expect(page.locator("#decision-brief")).to_be_hidden()
+    expect(page.locator("#refresh-dashboard")).to_be_hidden()
+    expect(page.locator("#retry-dashboard")).to_be_visible()
+    expect(page.locator("#global-error")).to_be_focused()
     journey.qa.recorder.capture(
         page,
         CaptureSpec(
@@ -78,12 +93,14 @@ def run_production_state_recovery(journey: ProductionJourney) -> None:
         ),
     )
     _phase(journey, f"{prefix}offline_recovery")
+    page.locator("#retry-dashboard").focus()
     page.keyboard.press("Enter")
-    expect(page.locator("#stale-warning")).to_be_hidden()
+    expect(page.locator("#decision-brief")).to_be_visible()
     expect(page.locator("#refresh-dashboard")).to_be_enabled()
-    expect(page.locator("#refresh-dashboard")).to_be_focused()
+    expect(page.locator("#dashboard-title")).to_be_focused()
     _phase(journey, f"{prefix}empty_projection")
     _install_empty_projection(journey.session)
+    page.locator("#refresh-dashboard").focus()
     page.keyboard.press("Enter")
     expect(page.locator("#upstream-body")).to_contain_text("No upstream keys registered")
     expect(page.locator("#downstream-body")).to_contain_text("No downstream tokens issued")
@@ -108,7 +125,7 @@ def run_production_state_recovery(journey: ProductionJourney) -> None:
     journey.qa.recorder.add_scenario(
         ManualScenario(
             name=f"{prefix or 'ordinary '}production state recovery",
-            actions=("Abort one overview", "Recover", "Inject one empty safe projection"),
+            actions=("Abort one dashboard", "Recover", "Inject one empty safe projection"),
             observables=("Stale data retained", "Actual data restored", "No horizontal overflow"),
         )
     )

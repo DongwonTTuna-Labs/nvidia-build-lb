@@ -82,6 +82,46 @@ def test_browser_prod_gate_has_closed_entrypoint_and_dependency_surface() -> Non
     assert lock.packages[""].dev_dependencies == {"lighthouse": "13.4.0"}
 
 
+def test_browser_gate_accepts_only_default_or_fresh_final_browser_leaf() -> None:
+    script_path = _ROOT / "scripts/qa/test-browser-prod.sh"
+    accepted = (
+        ".omo/evidence/task-6b-nvidia-build-lb",
+        ".omo/evidence/final-20260715T123456Z-deadbeef/browser",
+    )
+    rejected = (
+        ".omo/evidence/task-6b-release",
+        ".omo/evidence/final-20260715T123456Z-deadbeef",
+        ".omo/evidence/final-20260715T123456Z-deadbeef/verify",
+        ".omo/evidence/final-20260715T123456Z-DEADBEEF/browser",
+        ".omo/evidence/final-20260715T123456-deadbeef/browser",
+        ".omo/evidence/final-20260715T123456Z-deadbeef/browser/nested",
+    )
+
+    for evidence in accepted:
+        completed = subprocess.run(  # noqa: S603 - fixed repository gate entrypoint.
+            [script_path],
+            cwd=_ROOT,
+            env=os.environ | {"EVIDENCE_DIR": evidence},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 64
+        assert completed.stderr == "invalid_image_digest\n"
+
+    for evidence in rejected:
+        completed = subprocess.run(  # noqa: S603 - fixed repository gate entrypoint.
+            [script_path],
+            cwd=_ROOT,
+            env=os.environ | {"EVIDENCE_DIR": evidence},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 64
+        assert completed.stderr == "invalid_evidence_directory\n"
+
+
 def test_browser_prod_gate_reports_secret_safe_exception_phases() -> None:
     audit = PageAudit()
     audit.runtime_exceptions.extend(("upstream_enable_401", "upstream_probe_503"))

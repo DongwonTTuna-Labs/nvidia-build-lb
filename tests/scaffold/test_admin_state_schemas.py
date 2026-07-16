@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from nvidia_build_lb.admin.schemas import (
+    AdminDashboardRead,
     AdminEventListResponse,
     AdminEventRead,
     AdminOverviewRead,
@@ -12,6 +13,105 @@ from nvidia_build_lb.admin.schemas import (
     EventType,
     OverviewStatus,
 )
+
+
+def test_admin_dashboard_has_one_exact_coherent_wire_shape() -> None:
+    raw: dict[str, object] = {
+        "runtime_state": "operational",
+        "readiness_cause": "no_eligible_upstream",
+        "ledger": {
+            "status": "ok",
+            "capacity_blocker": "none",
+            "event_rows": 0,
+            "reserved_terminal_slots": 0,
+            "event_capacity": 100000,
+            "attempt_rows": 0,
+            "attempt_capacity": 40000,
+            "last_maintenance_completed_at": "2026-07-12T01:02:03Z",
+            "last_pruned_event_rows": 0,
+            "last_pruned_attempt_rows": 0,
+            "oldest_event_at": None,
+        },
+        "overview": {
+            "status": "degraded",
+            "ready": False,
+            "upstream_keys": {
+                "total": 0,
+                "enabled": 0,
+                "eligible": 0,
+                "cooling": 0,
+                "degraded": 0,
+            },
+            "downstream_tokens": {"total": 0, "active": 0, "revoked": 0},
+            "request_count": 0,
+            "last_event_at": None,
+            "generated_at": "2026-07-12T01:02:04Z",
+        },
+        "upstream_keys": {"items": []},
+        "downstream_tokens": {"items": []},
+        "events": {"items": []},
+    }
+
+    response = AdminDashboardRead.model_validate_json(json.dumps(raw))
+
+    assert response.model_dump(mode="json") == raw
+
+
+def test_admin_dashboard_rejects_legacy_event_shape_without_exact_identity_fields() -> None:
+    raw: dict[str, object] = {
+        "runtime_state": "operational",
+        "readiness_cause": "ready",
+        "ledger": {
+            "status": "ok",
+            "capacity_blocker": "none",
+            "event_rows": 1,
+            "reserved_terminal_slots": 0,
+            "event_capacity": 100000,
+            "attempt_rows": 0,
+            "attempt_capacity": 40000,
+            "last_maintenance_completed_at": None,
+            "last_pruned_event_rows": 0,
+            "last_pruned_attempt_rows": 0,
+            "oldest_event_at": "2026-07-12T01:02:03Z",
+        },
+        "overview": {
+            "status": "ok",
+            "ready": True,
+            "upstream_keys": {
+                "total": 0,
+                "enabled": 0,
+                "eligible": 0,
+                "cooling": 0,
+                "degraded": 0,
+            },
+            "downstream_tokens": {"total": 0, "active": 0, "revoked": 0},
+            "request_count": 0,
+            "last_event_at": "2026-07-12T01:02:03Z",
+            "generated_at": "2026-07-12T01:02:04Z",
+        },
+        "upstream_keys": {"items": []},
+        "downstream_tokens": {"items": []},
+        "events": {
+            "items": [
+                {
+                    "id": "00000000-0000-4000-8000-00000000abcd",
+                    "request_id": "opaque-request",
+                    "event_type": "upstream_attempt",
+                    "upstream_key_id": None,
+                    "downstream_token_id": None,
+                    "outcome_class": "started",
+                    "status_class": None,
+                    "latency_ms": None,
+                    "occurred_at": "2026-07-12T01:02:03Z",
+                }
+            ]
+        },
+    }
+
+    with pytest.raises(ValidationError) as captured:
+        _ = AdminDashboardRead.model_validate_json(json.dumps(raw))
+
+    assert captured.value.error_count() == 2
 
 
 def test_admin_overview_has_the_exact_aggregate_shape() -> None:

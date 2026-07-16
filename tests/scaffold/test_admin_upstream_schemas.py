@@ -11,6 +11,7 @@ from nvidia_build_lb.admin.schemas import (
     UpstreamKeyListResponse,
     UpstreamKeyRead,
     UpstreamProbeResponse,
+    UpstreamRoutingState,
 )
 
 
@@ -71,6 +72,7 @@ def test_upstream_key_read_has_the_exact_safe_wire_shape() -> None:
         "id": "00000000-0000-4000-8000-00000000ABCD",
         "fingerprint": f"sha256:{'a' * 64}",
         "enabled": False,
+        "routing_state": "disabled",
         "health_state": "unknown",
         "cooldown_until": None,
         "request_count": 0,
@@ -101,6 +103,7 @@ def test_upstream_key_read_rejects_noncanonical_fingerprints(fingerprint: str) -
         "id": "00000000-0000-4000-8000-00000000abcd",
         "fingerprint": fingerprint,
         "enabled": False,
+        "routing_state": "disabled",
         "health_state": "unknown",
         "cooldown_until": None,
         "request_count": 0,
@@ -143,6 +146,7 @@ def test_upstream_admin_enums_are_exactly_closed() -> None:
     # Given: the approved route-visible upstream states.
     expected_health = {"unknown", "healthy", "degraded"}
     expected_probe = {"valid", "invalid_credential", "rate_limited", "upstream_unavailable"}
+    expected_routing = {"disabled", "eligible", "cooldown", "quarantined"}
     expected_status = {
         "success",
         "invalid_credential",
@@ -161,9 +165,11 @@ def test_upstream_admin_enums_are_exactly_closed() -> None:
     # When: consumers enumerate the closed wire values.
     health = {item.value for item in HealthState}
     probe = {item.value for item in ProbeStatus}
+    routing = {item.value for item in UpstreamRoutingState}
     status = {item.value for item in LastStatusClass}
 
     # Then: no routing or probe state is added or omitted.
     assert health == expected_health
     assert probe == expected_probe
+    assert routing == expected_routing
     assert status == expected_status

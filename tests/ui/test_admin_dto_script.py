@@ -20,7 +20,7 @@ NODE_EXECUTABLE: Final = _node
 _NODE_HARNESS: Final = r"""
 import {readFileSync} from "node:fs";
 const source = readFileSync(process.argv[1], "utf8");
-const boundary = source.indexOf('byId("add-upstream")');
+const boundary = source.indexOf("function initializeAdmin");
 if (boundary < 0) throw new Error("admin initialization boundary missing");
 const declarations = source.slice(0, boundary);
 const moduleSource = `${declarations}\nexport {parseAdminDto, parseJson};`;
@@ -42,6 +42,7 @@ _UPSTREAM: Final[dict[str, JsonValue]] = {
     "id": _UUID,
     "fingerprint": f"sha256:{'a' * 64}",
     "enabled": False,
+    "routing_state": "disabled",
     "health_state": "unknown",
     "cooldown_until": None,
     "request_count": 0,
@@ -72,6 +73,11 @@ _EVENT: Final[dict[str, JsonValue]] = {
     "latency_ms": None,
     "occurred_at": _TIME,
 }
+_DASHBOARD_EVENT: Final[dict[str, JsonValue]] = {
+    **_EVENT,
+    "upstream_key_fingerprint": f"sha256:{'a' * 64}",
+    "attempt_started_event_id": None,
+}
 _UPSTREAM_COUNTS: Final[dict[str, JsonValue]] = {
     "total": 2,
     "enabled": 2,
@@ -88,6 +94,41 @@ _OVERVIEW: Final[dict[str, JsonValue]] = {
     "request_count": 42,
     "last_event_at": _TIME,
     "generated_at": _TIME,
+}
+_DASHBOARD_OVERVIEW: Final[dict[str, JsonValue]] = {
+    **_OVERVIEW,
+    "status": "degraded",
+    "ready": False,
+    "upstream_keys": {
+        "total": 1,
+        "enabled": 0,
+        "eligible": 0,
+        "cooling": 0,
+        "degraded": 0,
+    },
+    "downstream_tokens": {"total": 1, "active": 1, "revoked": 0},
+}
+_LEDGER: Final[dict[str, JsonValue]] = {
+    "status": "ok",
+    "capacity_blocker": "none",
+    "event_rows": 1,
+    "reserved_terminal_slots": 0,
+    "event_capacity": 100,
+    "attempt_rows": 0,
+    "attempt_capacity": 50,
+    "last_maintenance_completed_at": _TIME,
+    "last_pruned_event_rows": 0,
+    "last_pruned_attempt_rows": 0,
+    "oldest_event_at": _TIME,
+}
+_DASHBOARD: Final[dict[str, JsonValue]] = {
+    "runtime_state": "operational",
+    "readiness_cause": "no_eligible_upstream",
+    "ledger": _LEDGER,
+    "overview": _DASHBOARD_OVERVIEW,
+    "upstream_keys": {"items": [_UPSTREAM]},
+    "downstream_tokens": {"items": [_DOWNSTREAM]},
+    "events": {"items": [_DASHBOARD_EVENT]},
 }
 _PROBE: Final[dict[str, JsonValue]] = {
     "id": _UUID,
@@ -128,6 +169,9 @@ ADMIN_SCRIPT: Final = _ADMIN_SCRIPT
 UPSTREAM_DTO: Final = _UPSTREAM
 DOWNSTREAM_DTO: Final = _DOWNSTREAM
 EVENT_DTO: Final = _EVENT
+DASHBOARD_DTO: Final = _DASHBOARD
+DASHBOARD_EVENT_DTO: Final = _DASHBOARD_EVENT
+LEDGER_DTO: Final = _LEDGER
 OVERVIEW_DTO: Final = _OVERVIEW
 PROBE_DTO: Final = _PROBE
 ERROR_DETAIL_DTO: Final = _ERROR_DETAIL
@@ -148,6 +192,7 @@ def _field_variants(
 def test_admin_script_accepts_only_exact_success_and_error_dtos() -> None:
     # Given: one canonical payload for every administration response projection.
     cases: list[tuple[str, JsonValue]] = [
+        ("dashboard", _DASHBOARD),
         ("overview", _OVERVIEW),
         ("upstream", _UPSTREAM),
         ("upstreamList", {"items": [_UPSTREAM]}),
@@ -170,6 +215,7 @@ def test_admin_script_rejects_missing_extra_and_wrong_type_fields() -> None:
     # Given: missing, extra, and wrong-type variants at every closed DTO layer.
     cases: list[tuple[str, JsonValue]] = []
     exact_shapes: tuple[tuple[str, dict[str, JsonValue], str, JsonValue], ...] = (
+        ("dashboard", _DASHBOARD, "runtime_state", 7),
         ("overview", _OVERVIEW, "ready", "true"),
         ("upstream", _UPSTREAM, "enabled", 0),
         ("probe", _PROBE, "enabled", "false"),
@@ -197,6 +243,21 @@ def test_admin_script_rejects_missing_extra_and_wrong_type_fields() -> None:
             ("overview", {**_OVERVIEW, field: variant})
             for variant in _field_variants(nested, next(iter(nested)), "invalid")
         )
+    cases.extend(
+        ("dashboard", {**_DASHBOARD, "ledger": variant})
+        for variant in _field_variants(_LEDGER, "status", "healthy")
+    )
+    cases.extend(
+        (
+            "dashboard",
+            {**_DASHBOARD, "events": {"items": [variant]}},
+        )
+        for variant in _field_variants(
+            _DASHBOARD_EVENT,
+            "attempt_started_event_id",
+            "not-a-uuid",
+        )
+    )
     cases.extend(("error", variant) for variant in _field_variants(_ERROR, "error", "unsafe"))
     cases.extend(
         ("error", {"error": variant}) for variant in _field_variants(_ERROR_DETAIL, "code", 7)
@@ -222,6 +283,9 @@ def test_admin_script_rejects_noncanonical_scalar_and_collection_values() -> Non
     event_items: list[JsonValue] = []
     event_items.extend([_EVENT] * 101)
     too_many_events: dict[str, JsonValue] = {"items": event_items}
+    dashboard_event_items: list[JsonValue] = []
+    dashboard_event_items.extend([_DASHBOARD_EVENT] * 101)
+    too_many_dashboard_events: dict[str, JsonValue] = {"items": dashboard_event_items}
     cases: list[tuple[str, JsonValue]] = [
         ("overview", {**_OVERVIEW, "status": "healthy"}),
         ("overview", {**_OVERVIEW, "request_count": -1}),
@@ -231,6 +295,7 @@ def test_admin_script_rejects_noncanonical_scalar_and_collection_values() -> Non
         ("upstream", {**_UPSTREAM, "id": _UUID.upper()}),
         ("upstream", {**_UPSTREAM, "fingerprint": f"sha256:{'A' * 64}"}),
         ("upstream", {**_UPSTREAM, "health_state": "disabled"}),
+        ("upstream", {**_UPSTREAM, "routing_state": "enabled"}),
         ("upstream", {**_UPSTREAM, "last_status_class": "other"}),
         ("probe", {**_PROBE, "probe_status": "healthy"}),
         ("downstreamList", {"items": [{**_DOWNSTREAM, "label": " trailing "}]}),
@@ -240,6 +305,13 @@ def test_admin_script_rejects_noncanonical_scalar_and_collection_values() -> Non
         ("eventList", {"items": [{**_EVENT, "event_type": "message"}]}),
         ("eventList", {"items": [{**_EVENT, "outcome_class": "pending"}]}),
         ("eventList", too_many_events),
+        ("dashboard", {**_DASHBOARD, "runtime_state": "ready"}),
+        ("dashboard", {**_DASHBOARD, "readiness_cause": "unknown"}),
+        ("dashboard", {**_DASHBOARD, "ledger": {**_LEDGER, "event_rows": -1}}),
+        (
+            "dashboard",
+            {**_DASHBOARD, "events": too_many_dashboard_events},
+        ),
         ("error", {"error": {**_ERROR_DETAIL, "code": "unknown_code"}}),
         (
             "validationError",
@@ -281,11 +353,22 @@ def test_admin_response_consumers_parse_before_rendering() -> None:
     script = _ADMIN_SCRIPT.read_text()
     required_consumers = (
         "parseAdminDto(kind, payload).error",
-        'parseAdminDto("overview", parseJson(await response.text()))',
-        "parseAdminDto(kinds[index], parseJson(await response.text()))",
-        'parseAdminDto("probe", parseJson(await response.text()))',
-        'parseAdminDto("upstream", parseJson(await response.text()))',
-        'parseAdminDto("issued", parseJson(await response.text()))',
+        "const source = await response.text()",
+        "problem: parseResponseProblem(path, response.status, source)",
+        "value: parseAdminResponse(kind, source)",
+        'api("/dashboard", {}, "dashboard", readDeadlineMs)',
+        (
+            'api(`/upstream-keys/${item.id}/${action}`, {method: "POST"}, '
+            'action === "probe" ? "probe" : null, mutationDeadlineMs)'
+        ),
+        (
+            'api("/upstream-keys", {method: "POST", headers: '
+            '{"Content-Type": "application/json"}, body}, "upstream", mutationDeadlineMs)'
+        ),
+        (
+            'api("/downstream-tokens", {method: "POST", headers: '
+            '{"Content-Type": "application/json"}, body}, "issued", mutationDeadlineMs)'
+        ),
     )
 
     # When: permissive JSON consumers and strict projection calls are enumerated.

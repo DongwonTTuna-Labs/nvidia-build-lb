@@ -10,6 +10,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from nvidia_build_lb.admin.schemas import (
+    HealthState,
     LastStatusClass,
     UpstreamKeyCreateRequest,
     UpstreamKeyRead,
@@ -21,6 +22,7 @@ from nvidia_build_lb.attempt_repository import (
 )
 from nvidia_build_lb.attempt_types import AttemptFinalizeCommand, AttemptStartCommand
 from nvidia_build_lb.credential_types import Clock
+from nvidia_build_lb.db_models import UpstreamKeyRow
 from nvidia_build_lb.scheduler_state import (
     AttemptTerminal,
     SchedulerDependencies,
@@ -90,6 +92,10 @@ async def _created_key(
         UpstreamKeyCreateRequest(key=credential),
         request_id=f"create-{credential}",
     )
+    async with sessions.begin() as session:
+        row = await session.get(UpstreamKeyRow, created.id, with_for_update=True)
+        assert row is not None
+        row.health_state = HealthState.HEALTHY.value
     return repository, created
 
 

@@ -3,6 +3,7 @@
 from math import ceil
 
 import anyio
+from anyio.lowlevel import checkpoint_if_cancelled
 
 from nvidia_build_lb.admin.schemas import LastStatusClass
 from nvidia_build_lb.attempt_types import (
@@ -56,6 +57,25 @@ async def finalize_cancelled_shielded(
             terminal_committed_at=clock.now(),
         ),
     )
+
+
+async def checkpoint_before_network(
+    dependencies: RoutingCoordinatorDependencies,
+    lease: AttemptLease,
+    started_monotonic: float,
+) -> None:
+    """Commit cancellation before a reserved attempt reaches the network."""
+    try:
+        await checkpoint_if_cancelled()
+    except anyio.get_cancelled_exc_class():
+        _ = await finalize_cancelled_shielded(
+            dependencies.attempts,
+            lease,
+            dependencies.clock,
+            dependencies.monotonic_clock,
+            started_monotonic,
+        )
+        raise
 
 
 async def finalize_success_shielded(

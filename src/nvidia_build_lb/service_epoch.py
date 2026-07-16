@@ -11,7 +11,6 @@ from anyio.abc import TaskGroup
 from nvidia_build_lb.service_epoch_cleanup import (
     CleanupDependencies,
     CleanupResult,
-    cleanup_service_epoch,
 )
 from nvidia_build_lb.service_epoch_connection_validation import is_valid_epoch_connection
 from nvidia_build_lb.service_epoch_monitor import (
@@ -26,6 +25,7 @@ from nvidia_build_lb.service_epoch_startup_cleanup import (
     close_invalid_connection,
     stop_startup_monitor,
 )
+from nvidia_build_lb.service_epoch_supervision import supervise_epoch_cleanup
 from nvidia_build_lb.service_epoch_types import (
     EpochConnectionFactory,
     EpochSqlConnection,
@@ -91,6 +91,14 @@ class EpochPublisher(Protocol):
         ...
 
 
+class PrePublishHook(Protocol):
+    """Run required startup maintenance before epoch publication."""
+
+    async def __call__(self, epoch: UUID) -> None:
+        """Complete one startup pass or fail startup."""
+        ...
+
+
 class ReadinessGate(Protocol):
     """Control intake readiness."""
 
@@ -117,6 +125,7 @@ class ServiceEpochDependencies:
     uuid_source: UuidSource
     publisher: EpochPublisher
     readiness: ReadinessGate
+    pre_publish: PrePublishHook
     sleeper: Sleeper = field(default_factory=AnyioSleeper)
 
 
@@ -181,6 +190,7 @@ class ServiceEpochCoordinator:
             locked = True
             epoch = self.start_epoch()
             _ = await self.dependencies.pin_cleaner.cleanup_prior_epoch_pins(connection, epoch)
+            await self.dependencies.pre_publish(epoch)
             self.dependencies.publisher.publish(epoch)
             clean_stop = CleanStopState()
             scope = anyio.CancelScope()
@@ -231,13 +241,8 @@ async def run_supervised_epoch_subprocess(
     dependencies: CleanupDependencies,
 ) -> CleanupResult:
     """Clean-cancel and join the monitor before the final DB/unlock/close sequence."""
-    runtime.clean_stop.request(dependencies.nonce)
-    runtime.monitor_scope.cancel()
-    result: CleanupResult | None = None
-    with anyio.CancelScope(shield=True):
-        with anyio.fail_after(MONITOR_JOIN_TIMEOUT_SECONDS):
-            await runtime.monitor_joined.wait()
-        result = await cleanup_service_epoch(runtime, dependencies)
-    if result is None:
-        raise RuntimeError
-    return result
+    return await supervise_epoch_cleanup(
+        runtime,
+        dependencies,
+        join_timeout_seconds=MONITOR_JOIN_TIMEOUT_SECONDS,
+    )

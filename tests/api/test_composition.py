@@ -7,7 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 
-from nvidia_build_lb.admin.schemas import AdminOverviewRead, LastStatusClass, OverviewStatus
+from nvidia_build_lb.admin.schemas import (
+    AdminOperatorReadinessRead,
+    AdminOverviewRead,
+    LastStatusClass,
+    OverviewStatus,
+)
 from nvidia_build_lb.api_types import RepositoryReadinessProbe
 from nvidia_build_lb.logging import StructuredLogLine
 from nvidia_build_lb.main import create_app
@@ -33,6 +38,11 @@ from tests.contracts._support import (
     assert_error,
     assert_security_headers,
     bearer,
+)
+from tests.contracts.fakes import (
+    FakeCredentialRepositories,
+    FakeDownstreamRepository,
+    FakeUpstreamRepository,
 )
 
 from .fakes import ApiHarness
@@ -72,6 +82,25 @@ def test_health_and_static_admin_are_composed(api_client: ContractClient) -> Non
         headers=bearer(ADMIN_TOKEN),
     )
     assert admin.status_code == 200
+
+
+def test_operator_readiness_is_one_authenticated_closed_read(
+    api_client: ContractClient,
+) -> None:
+    path = "/admin/api/v1/operator-readiness"
+
+    missing = api_client.request("GET", path)
+    response = api_client.request("GET", path, headers=bearer(ADMIN_TOKEN))
+    query = api_client.request("GET", f"{path}?expand=true", headers=bearer(ADMIN_TOKEN))
+    wrong_method = api_client.request("POST", path, headers=bearer(ADMIN_TOKEN))
+
+    readiness = AdminOperatorReadinessRead.model_validate_json(response.content)
+    assert missing.status_code == 401
+    assert response.status_code == 200
+    assert readiness.runtime_state.value == "operational"
+    assert query.status_code == 422
+    assert wrong_method.status_code == 405
+    assert wrong_method.headers["allow"] == "GET"
 
 
 @pytest.mark.parametrize("ready", [True, False], ids=("ready", "degraded"))
@@ -130,6 +159,68 @@ def test_health_database_failure_is_exact_minimal_degraded_body(
         create_app(services),
         base_url="http://127.0.0.1:2456",
     ) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.content == b'{"status":"degraded","ready":false}'
+
+
+@pytest.mark.parametrize(
+    ("path", "owner", "method"),
+    [
+        ("/admin/api/v1/dashboard", FakeCredentialRepositories, "dashboard"),
+        (
+            "/admin/api/v1/operator-readiness",
+            FakeCredentialRepositories,
+            "operator_readiness",
+        ),
+        ("/admin/api/v1/overview", FakeCredentialRepositories, "overview"),
+        ("/admin/api/v1/events", FakeCredentialRepositories, "events"),
+        ("/admin/api/v1/upstream-keys", FakeUpstreamRepository, "list_all"),
+        ("/admin/api/v1/downstream-tokens", FakeDownstreamRepository, "list_all"),
+    ],
+)
+def test_every_supported_admin_read_has_the_same_server_deadline(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    owner: type[object],
+    method: str,
+) -> None:
+    async def never_returns(*_args: object) -> object:
+        await anyio.sleep_forever()
+        raise AssertionError
+
+    monkeypatch.setattr(owner, method, never_returns)
+    credentials = replace(
+        api_harness.services.credentials,
+        admin_read_deadline_seconds=0.01,
+    )
+    services = replace(api_harness.services, credentials=credentials)
+
+    with TestClient(create_app(services), base_url="http://127.0.0.1:2456") as client:
+        response = client.get(path, headers=bearer(ADMIN_TOKEN))
+
+    assert_error(response, status_code=504, code="admin_read_timeout")
+
+
+def test_health_converges_to_bounded_degraded_when_repository_read_stalls(
+    api_harness: ApiHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repositories = api_harness.services.credentials.repositories
+
+    async def never_returns(_repositories: object) -> AdminOverviewRead:
+        await anyio.sleep_forever()
+        raise AssertionError
+
+    monkeypatch.setattr(type(repositories), "overview", never_returns)
+    services = replace(
+        api_harness.services,
+        readiness=RepositoryReadinessProbe(repositories, deadline_seconds=0.01),
+    )
+
+    with TestClient(create_app(services), base_url="http://127.0.0.1:2456") as client:
         response = client.get("/health")
 
     assert response.status_code == 503

@@ -43,6 +43,7 @@ _INSTALLED_RESOURCE_PROBE: Final = dedent(
         WebResource.ADMIN_SCRIPT: "static/admin.js",
         WebResource.SHOWCASE_DOCUMENT: "templates/showcase.html",
         WebResource.SHOWCASE_STYLESHEET: "static/showcase.css",
+        WebResource.SHOWCASE_SCRIPT: "static/showcase.js",
     }
     assert set(expected_paths) == set(WebResource), "WebResource allowlist is not closed"
     browser_roots = (web_root / "static", web_root / "templates")
@@ -108,6 +109,7 @@ class _ResourceProvenance(_StrictModel):
         _PackagedResource,
         _PackagedResource,
         _PackagedResource,
+        _PackagedResource,
     ]
     forbidden_browser_files: tuple[str, ...]
 
@@ -118,6 +120,7 @@ def _source_manifest(repository_root: Path) -> tuple[_PackagedResource, ...]:
         "static/admin.css",
         "static/admin.js",
         "static/showcase.css",
+        "static/showcase.js",
         "templates/admin.html",
         "templates/showcase.html",
     )
@@ -214,13 +217,14 @@ def test_built_wheel_loads_only_closed_web_resources_outside_source_tree() -> No
             environment=environment,
         )
 
-        # Then: all five exact mappings have wheel-backed provenance and no adjacent asset.
+        # Then: all six exact mappings have wheel-backed provenance and no adjacent asset.
         receipt = _ResourceProvenance.model_validate_json(receipt_text)
         assert receipt.resources == _source_manifest(repository_root)
         assert tuple(item.path for item in receipt.resources) == (
             "static/admin.css",
             "static/admin.js",
             "static/showcase.css",
+            "static/showcase.js",
             "templates/admin.html",
             "templates/showcase.html",
         )

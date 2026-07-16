@@ -18,7 +18,11 @@ _POLICY = {
 
 @pytest.mark.parametrize(
     ("path", "media_type"),
-    [("/showcase", "text/html"), ("/assets/showcase.css", "text/css")],
+    [
+        ("/showcase", "text/html"),
+        ("/assets/showcase.css", "text/css"),
+        ("/assets/showcase.js", "text/javascript"),
+    ],
 )
 def test_exact_get_route_returns_packaged_content_when_requested(
     showcase_client: TestClient,
@@ -35,7 +39,7 @@ def test_exact_get_route_returns_packaged_content_when_requested(
     assert response.content
 
 
-@pytest.mark.parametrize("path", ["/showcase", "/assets/showcase.css"])
+@pytest.mark.parametrize("path", ["/showcase", "/assets/showcase.css", "/assets/showcase.js"])
 def test_showcase_response_has_exact_security_policy_when_served(
     showcase_client: TestClient,
     path: str,
@@ -52,7 +56,6 @@ def test_showcase_response_has_exact_security_policy_when_served(
 @pytest.mark.parametrize(
     "path",
     [
-        "/assets/showcase.js",
         "/assets/showcase.css.map",
         "/assets/unknown.css",
         "/assets/templates/showcase.html",
@@ -70,7 +73,7 @@ def test_unknown_asset_is_not_resolved_when_name_is_unlisted(
     assert response.status_code == 404
 
 
-@pytest.mark.parametrize("path", ["/showcase", "/assets/showcase.css"])
+@pytest.mark.parametrize("path", ["/showcase", "/assets/showcase.css", "/assets/showcase.js"])
 def test_showcase_route_rejects_post_when_only_get_is_allowed(
     showcase_client: TestClient,
     path: str,
@@ -88,9 +91,10 @@ def test_application_starts_without_runtime_configuration_or_database_access() -
     # When: a fresh application shell is created.
     app = create_app()
 
-    # Then: the closed five-resource shell plus degraded health exist without DB bootstrap.
+    # Then: the closed six-resource shell plus degraded health exist without DB bootstrap.
     assert app.url_path_for("_get_showcase_document") == "/showcase"
     assert app.url_path_for("_get_showcase_stylesheet") == "/assets/showcase.css"
+    assert app.url_path_for("_get_showcase_script") == "/assets/showcase.js"
     assert app.url_path_for("_get_admin_document") == "/admin"
     assert app.url_path_for("_health") == "/health"
     with TestClient(app, base_url="http://127.0.0.1:2456") as client:

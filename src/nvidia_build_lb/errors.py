@@ -15,6 +15,7 @@ class ConfigurationErrorCode(StrEnum):
     VAULT_KEY_INVALID = "config_vault_key_invalid"
     ADMIN_CREDENTIAL_UNAVAILABLE = "config_admin_token_unavailable"
     ADMIN_CREDENTIAL_INVALID = "config_admin_token_invalid"
+    ADMIN_LEDGER_INVALID = "config_admin_ledger_invalid"
     ADMIN_TOKEN_UNAVAILABLE = ADMIN_CREDENTIAL_UNAVAILABLE
     ADMIN_TOKEN_INVALID = ADMIN_CREDENTIAL_INVALID
 
@@ -43,6 +44,8 @@ class ConfigurationError(Exception):
                 message = "admin token is unavailable"
             case ConfigurationErrorCode.ADMIN_CREDENTIAL_INVALID:
                 message = "admin token format is invalid"
+            case ConfigurationErrorCode.ADMIN_LEDGER_INVALID:
+                message = "admin ledger settings are invalid"
             case _:
                 assert_never(self.code)
         return message

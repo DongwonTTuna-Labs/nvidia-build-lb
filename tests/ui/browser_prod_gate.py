@@ -55,6 +55,7 @@ _REQUIRED_CAPTURES = (
     "showcase-reduced-motion",
     "admin-empty",
     "admin-dashboard-post-login-cleanup-375",
+    "admin-upstream-form-375",
     "admin-dashboard-post-login-cleanup-768",
     "admin-login-error",
     "admin-login-offline",
@@ -62,7 +63,9 @@ _REQUIRED_CAPTURES = (
     "admin-dashboard-post-login-cleanup",
     "admin-action-probe-503",
     "admin-action-enable-401",
+    "admin-destructive-confirmation-1280",
     "admin-upstream-post-cleanup",
+    "admin-downstream-form-1280",
     "admin-downstream-post-cleanup",
     "admin-cjk-xss-safe",
     "admin-stale-offline",
@@ -221,7 +224,7 @@ def _adversarial() -> AdversarialReceipt:
             AdversarialProbe(
                 probe_class="offline_and_empty",
                 status="passed",
-                observable="one aborted overview and one body-free safe empty projection recovered",
+                observable="one aborted dashboard and one strict safe empty projection recovered",
             ),
             AdversarialProbe(
                 probe_class="management_action_503_and_401",

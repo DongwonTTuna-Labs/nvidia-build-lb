@@ -9,9 +9,15 @@ from uuid import UUID
 from pydantic import SecretStr
 
 from nvidia_build_lb.admin.schemas import (
+    AdminDashboardEventListResponse,
+    AdminDashboardEventRead,
+    AdminDashboardRead,
     AdminEventListResponse,
     AdminEventRead,
+    AdminLedgerRead,
+    AdminOperatorReadinessRead,
     AdminOverviewRead,
+    CapacityBlocker,
     DownstreamScope,
     DownstreamTokenIssued,
     DownstreamTokenIssueRequest,
@@ -22,13 +28,17 @@ from nvidia_build_lb.admin.schemas import (
     EventType,
     HealthState,
     LastStatusClass,
+    LedgerStatus,
     OverviewStatus,
     ProbeStatus,
+    ReadinessCause,
+    RuntimeState,
     UpstreamKeyCreateRequest,
     UpstreamKeyListResponse,
     UpstreamKeyOverview,
     UpstreamKeyRead,
     UpstreamProbeResponse,
+    UpstreamRoutingState,
 )
 from nvidia_build_lb.admin_credentials import CredentialServices
 from nvidia_build_lb.api_types import ApplicationServices, StreamLogContext
@@ -87,6 +97,7 @@ def _upstream(key_id: str, *, enabled: bool) -> UpstreamKeyRead:
         id=UUID(key_id),
         fingerprint=f"sha256:{key_id.replace('-', '') * 2}",
         enabled=enabled,
+        routing_state=(UpstreamRoutingState.ELIGIBLE if enabled else UpstreamRoutingState.DISABLED),
         health_state=HealthState.UNKNOWN,
         cooldown_until=None,
         request_count=0,
@@ -203,6 +214,65 @@ class FakeCredentialRepositories:
             request_count=42,
             last_event_at=_NOW,
             generated_at=_NOW + timedelta(seconds=1),
+        )
+
+    async def dashboard(self) -> AdminDashboardRead:
+        """Return one internally coherent deterministic dashboard fixture."""
+        overview = await self.overview()
+        upstream = await self.upstream.list_all()
+        downstream = await self.downstream.list_all()
+        legacy_events = await self.events()
+        fingerprint = upstream.items[0].fingerprint
+        events = AdminDashboardEventListResponse(
+            items=tuple(
+                AdminDashboardEventRead(
+                    id=event.id,
+                    request_id=event.request_id,
+                    event_type=event.event_type,
+                    upstream_key_id=event.upstream_key_id,
+                    downstream_token_id=event.downstream_token_id,
+                    outcome_class=event.outcome_class,
+                    status_class=event.status_class,
+                    latency_ms=event.latency_ms,
+                    occurred_at=event.occurred_at,
+                    upstream_key_fingerprint=fingerprint,
+                    attempt_started_event_id=None,
+                )
+                for event in legacy_events.items
+            )
+        )
+        runtime_state = RuntimeState.OPERATIONAL if overview.ready else RuntimeState.UNAVAILABLE
+        return AdminDashboardRead(
+            runtime_state=runtime_state,
+            readiness_cause=(
+                ReadinessCause.READY if overview.ready else ReadinessCause.RUNTIME_UNAVAILABLE
+            ),
+            ledger=AdminLedgerRead(
+                status=LedgerStatus.OK,
+                capacity_blocker=CapacityBlocker.NONE,
+                event_rows=len(events.items),
+                reserved_terminal_slots=0,
+                event_capacity=10_000,
+                attempt_rows=0,
+                attempt_capacity=5_000,
+                last_maintenance_completed_at=_NOW,
+                last_pruned_event_rows=0,
+                last_pruned_attempt_rows=0,
+                oldest_event_at=events.items[-1].occurred_at,
+            ),
+            overview=overview,
+            upstream_keys=upstream,
+            downstream_tokens=downstream,
+            events=events,
+        )
+
+    async def operator_readiness(self) -> AdminOperatorReadinessRead:
+        ready = await self.readiness.is_ready()
+        return AdminOperatorReadinessRead(
+            runtime_state=RuntimeState.OPERATIONAL if ready else RuntimeState.UNAVAILABLE,
+            readiness_cause=(ReadinessCause.READY if ready else ReadinessCause.RUNTIME_UNAVAILABLE),
+            ledger_status=LedgerStatus.OK,
+            capacity_blocker=CapacityBlocker.NONE,
         )
 
     async def events(self) -> AdminEventListResponse:

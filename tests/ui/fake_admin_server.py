@@ -10,6 +10,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.types import ASGIApp
 
 from nvidia_build_lb.admin.schemas import (
+    AdminDashboardRead,
     AdminEventListResponse,
     AdminOverviewRead,
     DownstreamTokenIssued,
@@ -138,6 +139,11 @@ class _FakeAdminController:
     def __init__(self, state_store: FakeAdminState) -> None:
         self._state_store = state_store
 
+    async def dashboard(self) -> AdminDashboardRead:
+        self._state_store.record_boundary("route:dashboard")
+        self._state_store.check_available("/admin/api/v1/dashboard")
+        return self._state_store.dashboard()
+
     async def overview(self) -> AdminOverviewRead:
         self._state_store.record_boundary("route:overview")
         self._state_store.check_available("/admin/api/v1/overview")
@@ -185,6 +191,7 @@ class _FakeAdminController:
         request: DownstreamTokenIssueRequest,
     ) -> DownstreamTokenIssued:
         self._state_store.record_boundary("route:downstream_issue")
+        self._state_store.check_available("/admin/api/v1/downstream-tokens")
         return self._state_store.issue_token(request)
 
     async def downstream_revoke(self, item_id: UUID) -> Response:
@@ -200,6 +207,7 @@ class _FakeAdminController:
 
 def _create_api_router(controller: _FakeAdminController) -> APIRouter:
     router = APIRouter(prefix="/admin/api/v1")
+    router.add_api_route("/dashboard", controller.dashboard, methods=["GET"])
     router.add_api_route("/overview", controller.overview, methods=["GET"])
     router.add_api_route("/upstream-keys", controller.upstream_list, methods=["GET"])
     router.add_api_route(

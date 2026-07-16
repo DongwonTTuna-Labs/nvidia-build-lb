@@ -39,9 +39,24 @@ regular_file_no_symlink() {
     [ -f "$1" ] && [ ! -L "$1" ] && assert_no_symlink_components "$1"
 }
 
-expected_evidence=$(realpath -ms "$ROOT/.omo/evidence/task-6b-nvidia-build-lb")
-actual_evidence=$(realpath -ms "$EVIDENCE_DIR")
-[ "$actual_evidence" = "$expected_evidence" ] || {
+validate_evidence_directory() {
+    local actual_evidence
+    local relative_evidence
+
+    actual_evidence=$(realpath -ms "$1") || return 1
+    case "$actual_evidence" in
+        "$ROOT"/.omo/evidence/*)
+            relative_evidence=${actual_evidence#"$ROOT"/}
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    [ "$relative_evidence" = .omo/evidence/task-6b-nvidia-build-lb ] \
+        || [[ "$relative_evidence" =~ ^\.omo/evidence/final-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}/browser$ ]]
+}
+
+validate_evidence_directory "$EVIDENCE_DIR" || {
     printf '%s\n' 'invalid_evidence_directory' >&2
     exit 64
 }

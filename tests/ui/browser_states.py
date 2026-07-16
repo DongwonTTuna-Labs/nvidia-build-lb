@@ -1,4 +1,4 @@
-from playwright.sync_api import Route, expect
+from playwright.sync_api import Page, Route, expect
 
 from .browser_auth import AuthenticatedSession
 from .browser_checks import assert_no_page_overflow, clipboard_is_empty, script_flag_is_false
@@ -17,6 +17,15 @@ def _abort(route: Route) -> None:
     route.abort()
 
 
+def _activate_copy_with_keyboard(page: Page) -> None:
+    expect(page.locator("#credential-title")).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(page.locator("#one-time-token")).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(page.locator("#copy-token")).to_be_focused()
+    page.keyboard.press("Enter")
+
+
 def run_state_recovery(
     session: AuthenticatedSession,
     recorder: EvidenceRecorder,
@@ -26,12 +35,13 @@ def run_state_recovery(
 ) -> None:
     page = session.page
     session.audit.set_phase("offline_refresh")
-    overview_pattern = f"{UI_ORIGIN}/admin/api/v1/overview"
-    _ = page.route(overview_pattern, _abort)
+    dashboard_pattern = f"{UI_ORIGIN}/admin/api/v1/dashboard"
+    _ = page.route(dashboard_pattern, _abort)
     page.locator("#refresh-dashboard").focus()
     page.keyboard.press("Enter")
-    expect(page.locator("#stale-warning")).to_be_visible()
-    expect(page.locator("#refresh-dashboard")).to_be_focused()
+    expect(page.locator("#global-error")).to_be_focused()
+    expect(page.locator("#decision-brief")).to_be_hidden()
+    expect(page.locator("#retry-dashboard")).to_be_visible()
     recorder.capture(
         page,
         CaptureSpec(
@@ -41,14 +51,16 @@ def run_state_recovery(
             native_zoom=native_zoom,
         ),
     )
-    page.unroute(overview_pattern, _abort)
+    page.unroute(dashboard_pattern, _abort)
     session.audit.set_phase("offline_recovery")
+    page.locator("#retry-dashboard").focus()
     page.keyboard.press("Enter")
-    expect(page.locator("#stale-warning")).to_be_hidden()
-    expect(page.locator("#refresh-dashboard")).to_be_focused()
+    expect(page.locator("#decision-brief")).to_be_visible()
+    expect(page.locator("#dashboard-title")).to_be_focused()
 
     state.set_empty()
     session.audit.set_phase("empty_state")
+    page.locator("#refresh-dashboard").focus()
     page.keyboard.press("Enter")
     expect(page.locator("#upstream-body")).to_contain_text("No upstream keys registered")
     expect(page.locator("#downstream-body")).to_contain_text("No downstream tokens issued")
@@ -65,10 +77,11 @@ def run_state_recovery(
 
     state.reset()
     session.audit.set_phase("cjk_xss_state")
+    page.locator("#refresh-dashboard").focus()
     page.keyboard.press("Enter")
     expect(
         page.locator(
-            "#downstream-body td[data-label='Client']",
+            "#downstream-body th[scope='row'][data-label='Client']",
             has_text=_LONG_CJK_LABEL,
         )
     ).to_be_visible()
@@ -85,16 +98,20 @@ def run_state_recovery(
             native_zoom=native_zoom,
         ),
     )
+    prerequisite = next(item for item in state.upstreams().items if not item.enabled)
+    page.locator(f"#key-{prerequisite.id}-probe").click()
+    page.locator(f"#key-{prerequisite.id}-toggle").click()
+    expect(page.locator("#issue-downstream")).to_be_enabled()
     recorder.add_scenario(
         ManualScenario(
             name="offline stale empty and untrusted-text recovery",
             actions=(
-                "Abort only GET /admin/api/v1/overview and press #refresh-dashboard",
-                "Remove abort route and press #refresh-dashboard again",
+                "Abort only GET /admin/api/v1/dashboard and activate the recommended refresh",
+                "Remove abort route and activate the single error recovery refresh",
                 "Switch same-contract fake to empty then populated state and refresh",
             ),
             observables=(
-                "Prior data becomes explicitly STALE and recovers without focus theft",
+                "Prior data becomes explicitly stale and recovers with deterministic focus",
                 "All three empty tables retain headings and explanatory rows",
                 "Long CJK, English, XSS, and instruction-shaped label renders only as text",
             ),
@@ -133,12 +150,13 @@ Object.defineProperty(navigator, "clipboard", {configurable: true, value: {
     recorder.begin_blackout("one-time token during clipboard denial")
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_visible()
-    page.keyboard.press("Tab")
-    page.keyboard.press("Enter")
+    _activate_copy_with_keyboard(page)
     expect(page.locator("#clipboard-error")).to_be_visible()
-    expect(page.locator("#clipboard-error")).to_have_text(
-        "Clipboard cleanup failed. Clear the clipboard before visual capture or logout."
+    clipboard_error_prefix = (
+        "Copy or clipboard access failed. Restore clipboard access before dismissal"
     )
+    expected_clipboard_error = f"{clipboard_error_prefix} so cleanup can be verified."
+    expect(page.locator("#clipboard-error")).to_have_text(expected_clipboard_error)
     dismiss = page.locator("#dismiss-token")
     dismiss.focus()
     page.keyboard.press("Enter")
@@ -161,10 +179,8 @@ delete globalThis.__nblbClipboardDescriptor;
     dismiss.focus()
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_hidden()
-    expect(page.locator("#clipboard-recovery")).to_be_visible()
-    expect(page.locator("#clipboard-recovery")).to_contain_text(
-        "RECOVERED · Clipboard custody restored."
-    )
+    expect(page.locator("#last-result")).to_contain_text("clipboard was verified empty")
+    assert page.locator("#clipboard-recovery").count() == 0
     assert_secret_absent(page, state.issued_bearer)
     assert clipboard_is_empty(page)
     expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
@@ -191,7 +207,7 @@ delete globalThis.__nblbClipboardDescriptor;
                 "Clipboard denial produces a safe non-echoing message",
                 "Failed cleanup keeps the credential dialog and screenshot blackout active",
                 "No credential remains in rendered text or form controls",
-                "A non-secret recovery notice remains after safe cleanup",
+                "Last confirmed result preserves the non-secret cleanup outcome",
                 "Screenshot blackout remains active until dismissal absence proof",
             ),
         )

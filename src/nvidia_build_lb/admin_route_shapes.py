@@ -4,10 +4,12 @@ from typing import Final
 
 _ADMIN_PREFIX: Final = "/admin/api/v1"
 _EXACT_METHODS: Final = {
+    "/admin/api/v1/dashboard": frozenset({"GET"}),
     "/admin/api/v1/overview": frozenset({"GET"}),
     "/admin/api/v1/upstream-keys": frozenset({"GET", "POST"}),
     "/admin/api/v1/downstream-tokens": frozenset({"GET", "POST"}),
     "/admin/api/v1/events": frozenset({"GET"}),
+    "/admin/api/v1/operator-readiness": frozenset({"GET"}),
 }
 
 
@@ -41,3 +43,26 @@ def requires_admin_authentication(method: str, path: str) -> bool:
     if allowed is not None:
         return method in allowed
     return method != "OPTIONS" and (path == _ADMIN_PREFIX or path.startswith(f"{_ADMIN_PREFIX}/"))
+
+
+def is_admin_mutation(method: str, path: str) -> bool:
+    """Recognize only the seven authenticated event-producing operations."""
+    if method not in {"POST", "DELETE"}:
+        return False
+    match method, path.split("/"):
+        case "POST", ["", "admin", "api", "v1", "upstream-keys"]:
+            mutation = True
+        case "POST", ["", "admin", "api", "v1", "downstream-tokens"]:
+            mutation = True
+        case "DELETE", ["", "admin", "api", "v1", "upstream-keys", resource_id]:
+            mutation = bool(resource_id)
+        case "DELETE", ["", "admin", "api", "v1", "downstream-tokens", resource_id]:
+            mutation = bool(resource_id)
+        case (
+            "POST",
+            ["", "admin", "api", "v1", "upstream-keys", resource_id, action],
+        ):
+            mutation = bool(resource_id) and action in {"enable", "disable", "probe"}
+        case _:
+            mutation = False
+    return mutation

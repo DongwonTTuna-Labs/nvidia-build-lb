@@ -17,6 +17,7 @@ pytestmark = pytest.mark.vault_auth
 
 _DOMAIN_TABLES = {
     "admin_events",
+    "admin_ledger_state",
     "downstream_tokens",
     "scheduler_state",
     "upstream_attempt_receipts",
@@ -74,25 +75,25 @@ def test_empty_database_upgrades_to_credential_head(empty_database: SecretStr) -
 
     # Then: the domain head and all credential and verifier tables exist.
     revision, tables = anyio.run(_schema_snapshot, empty_database)
-    assert revision == "0004_vault_key_verifier"
+    assert revision == "0005_admin_dashboard_ledger"
     assert tables >= _DOMAIN_TABLES
 
 
 def test_credential_migration_round_trips_through_baseline(empty_database: SecretStr) -> None:
     # Given: a real PostgreSQL 17 database upgraded to the credential head.
     config: Config = alembic_config(empty_database)
-    migrate(config, "0004_vault_key_verifier")
+    migrate(config, "0005_admin_dashboard_ledger")
 
     # When: the domain migration is downgraded and upgraded once.
     downgrade(config, "0001_baseline")
     baseline_revision, baseline_tables = anyio.run(_schema_snapshot, empty_database)
-    migrate(config, "0004_vault_key_verifier")
+    migrate(config, "0005_admin_dashboard_ledger")
 
     # Then: downgrade removes only domain state and the upgrade restores the head.
     head_revision, head_tables = anyio.run(_schema_snapshot, empty_database)
     assert baseline_revision == "0001_baseline"
     assert _DOMAIN_TABLES.isdisjoint(baseline_tables)
-    assert head_revision == "0004_vault_key_verifier"
+    assert head_revision == "0005_admin_dashboard_ledger"
     assert head_tables >= _DOMAIN_TABLES
 
 
@@ -103,7 +104,7 @@ def test_credential_schema_has_only_encrypted_or_digest_secret_storage(
     config = alembic_config(empty_database)
 
     # When: the credential schema is migrated to its head.
-    migrate(config, "0004_vault_key_verifier")
+    migrate(config, "0005_admin_dashboard_ledger")
 
     # Then: secret columns are encrypted or digests and critical identities are unique.
     columns, unique_columns = anyio.run(_storage_contract, empty_database)

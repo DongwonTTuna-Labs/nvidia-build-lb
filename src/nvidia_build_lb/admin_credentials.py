@@ -1,15 +1,13 @@
 """Uncomposed credential API factory for isolated Todo 2 verification."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID
 
 from fastapi import FastAPI, Request, Response
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from nvidia_build_lb import credential_repositories
 from nvidia_build_lb.admin.schemas import (
-    AdminEventListResponse,
-    AdminOverviewRead,
     DownstreamTokenIssued,
     DownstreamTokenIssueRequest,
     DownstreamTokenListResponse,
@@ -18,39 +16,24 @@ from nvidia_build_lb.admin.schemas import (
     UpstreamKeyRead,
     UpstreamProbeResponse,
 )
+from nvidia_build_lb.admin_deadlines import run_admin_read
 from nvidia_build_lb.admin_http_errors import register_credential_error_handlers
-from nvidia_build_lb.admin_queries import read_events, read_overview
+from nvidia_build_lb.admin_mutation_barrier import AdminMutationBarrier
+from nvidia_build_lb.admin_mutation_boundary import (
+    AdminMutationBoundaryMiddleware,
+    AlwaysOperationalLifecycle,
+    LifecycleAvailability,
+)
 from nvidia_build_lb.admin_read_routes import register_admin_read_routes
+from nvidia_build_lb.admin_scope_test_routes import register_scope_test_routes
 from nvidia_build_lb.auth import CredentialAuthenticators, CredentialAuthMiddleware
 from nvidia_build_lb.canonical_uuid import parse_canonical_uuid
 from nvidia_build_lb.credential_protocols import CredentialRepositorySurface
-from nvidia_build_lb.credential_types import (
-    Clock,
-    InvalidAdminRequestError,
-)
-from nvidia_build_lb.downstream_tokens import DownstreamTokenRepository
+from nvidia_build_lb.credential_types import InvalidAdminRequestError
 from nvidia_build_lb.request_boundary import RequestBoundaryMiddleware
 from nvidia_build_lb.request_id import RequestIdMiddleware, request_id_from
-from nvidia_build_lb.schemas import ModelListResponse
-from nvidia_build_lb.upstream_keys import UpstreamKeyRepository
 
-
-@dataclass(frozen=True, slots=True)
-class CredentialRepositories:
-    """Bundle database-backed credential reads and writes."""
-
-    upstream: UpstreamKeyRepository
-    downstream: DownstreamTokenRepository
-    sessions: async_sessionmaker[AsyncSession]
-    clock: Clock
-
-    async def overview(self) -> AdminOverviewRead:
-        """Project the exact secret-free administration aggregate."""
-        return await read_overview(self.sessions, self.clock)
-
-    async def events(self) -> AdminEventListResponse:
-        """Project the exact newest-one-hundred safe event collection."""
-        return await read_events(self.sessions)
+CredentialRepositories = credential_repositories.CredentialRepositories
 
 
 class ProbeExecutor(Protocol):
@@ -68,6 +51,10 @@ class CredentialServices:
     repositories: CredentialRepositorySurface
     authenticators: CredentialAuthenticators
     probe: ProbeExecutor
+    lifecycle: LifecycleAvailability = field(default_factory=AlwaysOperationalLifecycle)
+    mutation_barrier: AdminMutationBarrier = field(default_factory=AdminMutationBarrier)
+    admin_read_deadline_seconds: float = 5
+    admin_mutation_deadline_seconds: int = 125
 
 
 def _reject_query(request: Request) -> None:
@@ -79,7 +66,8 @@ def _register_upstream_routes(app: FastAPI, services: CredentialServices) -> Non
     @app.get("/admin/api/v1/upstream-keys")
     async def _upstream_list(request: Request) -> UpstreamKeyListResponse:
         _reject_query(request)
-        return await services.repositories.upstream.list_all()
+        operation = services.repositories.upstream.list_all
+        return await run_admin_read(operation, services.admin_read_deadline_seconds)
 
     @app.post(
         "/admin/api/v1/upstream-keys",
@@ -141,7 +129,8 @@ def _register_downstream_routes(app: FastAPI, services: CredentialServices) -> N
     @app.get("/admin/api/v1/downstream-tokens")
     async def _downstream_list(request: Request) -> DownstreamTokenListResponse:
         _reject_query(request)
-        return await services.repositories.downstream.list_all()
+        operation = services.repositories.downstream.list_all
+        return await run_admin_read(operation, services.admin_read_deadline_seconds)
 
     @app.post(
         "/admin/api/v1/downstream-tokens",
@@ -166,18 +155,6 @@ def _register_downstream_routes(app: FastAPI, services: CredentialServices) -> N
     _ = (_downstream_list, _downstream_issue, _downstream_revoke)
 
 
-def _register_scope_test_routes(app: FastAPI) -> None:
-    @app.get("/v1/models")
-    async def _models() -> ModelListResponse:
-        return ModelListResponse.fixed_model()
-
-    @app.post("/v1/chat/completions", status_code=204)
-    async def _chat_scope_only() -> Response:
-        return Response(status_code=204)
-
-    _ = (_models, _chat_scope_only)
-
-
 def register_credential_routes(
     app: FastAPI,
     services: CredentialServices,
@@ -187,9 +164,13 @@ def register_credential_routes(
     """Register admin routes and optional Todo 2 public auth probes."""
     _register_upstream_routes(app, services)
     _register_downstream_routes(app, services)
-    register_admin_read_routes(app, services.repositories)
+    register_admin_read_routes(
+        app,
+        services.repositories,
+        deadline_seconds=services.admin_read_deadline_seconds,
+    )
     if include_scope_test_routes:
-        _register_scope_test_routes(app)
+        register_scope_test_routes(app)
 
 
 def create_credential_test_app(services: CredentialServices) -> FastAPI:
@@ -204,6 +185,12 @@ def create_credential_test_app(services: CredentialServices) -> FastAPI:
     register_credential_error_handlers(app)
     register_credential_routes(app, services, include_scope_test_routes=True)
 
+    app.add_middleware(
+        AdminMutationBoundaryMiddleware,
+        barrier=services.mutation_barrier,
+        lifecycle=services.lifecycle,
+        deadline_seconds=services.admin_mutation_deadline_seconds,
+    )
     app.add_middleware(
         CredentialAuthMiddleware,
         authenticators=services.authenticators,

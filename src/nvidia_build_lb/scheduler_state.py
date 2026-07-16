@@ -7,8 +7,14 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 
 from nvidia_build_lb.admin.schemas import EventOutcome, EventType
+from nvidia_build_lb.admin_ledger import AdminLedger, default_admin_ledger
 from nvidia_build_lb.credential_types import ResourceConflictError, ResourceNotFoundError
-from nvidia_build_lb.db_models import AdminEventRow, SchedulerStateRow, UpstreamKeyRow
+from nvidia_build_lb.db_models import (
+    EVENT_WRITER_GENERATION,
+    AdminEventRow,
+    SchedulerStateRow,
+    UpstreamKeyRow,
+)
 from nvidia_build_lb.quarantine_recovery import terminal_updates_routing_state
 from nvidia_build_lb.scheduler_lock import lock_scheduler_state
 from nvidia_build_lb.scheduler_outcomes import outcome_change
@@ -41,6 +47,13 @@ class SchedulerStateRepository:
 
     dependencies: SchedulerDependencies
 
+    def _ledger(self) -> AdminLedger:
+        return (
+            self.dependencies.ledger
+            if self.dependencies.ledger is not None
+            else default_admin_ledger(self.dependencies.sessions, self.dependencies.clock)
+        )
+
     async def begin_next_attempt(self, request_id: str) -> AttemptLease:
         """Select and commit the next eligible key in one locked transaction."""
         now = self.dependencies.clock.now()
@@ -68,6 +81,7 @@ class SchedulerStateRepository:
             key = await session.get(UpstreamKeyRow, selected.id, with_for_update=True)
             if key is None:
                 raise ResourceNotFoundError(resource="upstream_key", resource_id=selected.id)
+            _ = await self._ledger().lock_attempt_admission(session)
             return _start_attempt(
                 LockedAttempt(session, scheduler, key),
                 request_id,
@@ -83,6 +97,7 @@ class SchedulerStateRepository:
             key = await session.get(UpstreamKeyRow, key_id, with_for_update=True)
             if key is None:
                 raise ResourceNotFoundError(resource="upstream_key", resource_id=key_id)
+            _ = await self._ledger().lock_attempt_admission(session)
             return _start_attempt(
                 LockedAttempt(session, scheduler, key),
                 request_id,
@@ -110,11 +125,16 @@ class SchedulerStateRepository:
                     resource_id=lease.key_id,
                 )
             started = await session.get(AdminEventRow, lease.started_event_id, with_for_update=True)
+            event_type = (
+                EventType.UPSTREAM_PROBE.value
+                if lease.explicit_probe
+                else EventType.UPSTREAM_ATTEMPT.value
+            )
             if (
                 started is None
                 or started.request_id != lease.request_id
                 or started.upstream_key_id != lease.key_id
-                or started.event_type != EventType.UPSTREAM_ATTEMPT.value
+                or started.event_type != event_type
                 or started.outcome_class != EventOutcome.STARTED.value
             ):
                 raise ResourceConflictError(resource="upstream_attempt")
@@ -123,13 +143,14 @@ class SchedulerStateRepository:
                 .where(
                     AdminEventRow.request_id == lease.request_id,
                     AdminEventRow.upstream_key_id == lease.key_id,
-                    AdminEventRow.event_type == EventType.UPSTREAM_ATTEMPT.value,
+                    AdminEventRow.event_type == event_type,
                     AdminEventRow.outcome_class != EventOutcome.STARTED.value,
                 )
                 .limit(1)
             )
             if prior_terminal is not None:
                 raise ResourceConflictError(resource="upstream_attempt")
+            _ = await self._ledger().lock_terminal(session)
             change = outcome_change(terminal.outcome)
             key.success_count += change.success_delta
             key.failure_count += change.failure_delta
@@ -149,13 +170,15 @@ class SchedulerStateRepository:
                 AdminEventRow(
                     id=uuid4(),
                     request_id=lease.request_id,
-                    event_type=EventType.UPSTREAM_ATTEMPT.value,
+                    event_type=event_type,
                     upstream_key_id=lease.key_id,
+                    upstream_key_fingerprint=key.fingerprint,
                     downstream_token_id=None,
                     outcome_class=change.event_outcome.value,
                     status_class=terminal.status_class.value,
                     latency_ms=terminal.latency_ms,
                     occurred_at=now,
+                    writer_generation=EVENT_WRITER_GENERATION,
                 )
             )
 
@@ -173,17 +196,22 @@ def _start_attempt(
     locked.key.updated_at = now
     locked.scheduler.cursor_key_id = locked.key.id
     locked.scheduler.updated_at = now
+    event_type = (
+        EventType.UPSTREAM_PROBE.value if explicit_probe else EventType.UPSTREAM_ATTEMPT.value
+    )
     locked.session.add(
         AdminEventRow(
             id=event_id,
             request_id=request_id,
-            event_type=EventType.UPSTREAM_ATTEMPT.value,
+            event_type=event_type,
             upstream_key_id=locked.key.id,
+            upstream_key_fingerprint=locked.key.fingerprint,
             downstream_token_id=None,
             outcome_class=EventOutcome.STARTED.value,
             status_class=None,
             latency_ms=None,
             occurred_at=now,
+            writer_generation=EVENT_WRITER_GENERATION,
         )
     )
     return AttemptLease(locked.key.id, request_id, event_id, now, explicit_probe)

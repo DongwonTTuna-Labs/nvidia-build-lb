@@ -39,6 +39,7 @@ handle upstream credentials.
 | `GET /assets/admin.css` | Explicit unauthenticated no-op | `200 text/css` | `404` |
 | `GET /assets/admin.js` | Explicit unauthenticated no-op | `200 text/javascript` | `404` |
 | `GET /assets/showcase.css` | Explicit unauthenticated no-op | `200 text/css` | `404` |
+| `GET /assets/showcase.js` | Explicit unauthenticated no-op | `200 text/javascript` | `404` |
 
 No other asset route exists. In particular, `/assets/{path}` is not a generic
 filesystem mount: every other asset name is `404`. A method not listed for a
@@ -61,10 +62,12 @@ Every route in this table requires the distinct admin bearer.
 
 | Method and path | Successful result |
 | --- | --- |
+| `GET /admin/api/v1/dashboard` | `200 application/json` canonical transactionally coherent dashboard |
+| `GET /admin/api/v1/operator-readiness` | `200 application/json` bounded host-operator readiness |
 | `GET /admin/api/v1/overview` | `200 application/json` safe overview |
 | `GET /admin/api/v1/upstream-keys` | `200 application/json` safe key list |
 | `POST /admin/api/v1/upstream-keys` | `201 application/json`; new key is disabled |
-| `POST /admin/api/v1/upstream-keys/{id}/enable` | Idempotent `204`, empty body |
+| `POST /admin/api/v1/upstream-keys/{id}/enable` | Idempotent `204` after current successful verification |
 | `POST /admin/api/v1/upstream-keys/{id}/disable` | Idempotent `204`, empty body |
 | `POST /admin/api/v1/upstream-keys/{id}/probe` | `200 application/json` single-key probe result |
 | `DELETE /admin/api/v1/upstream-keys/{id}` | `204` only while disabled |
@@ -73,9 +76,14 @@ Every route in this table requires the distinct admin bearer.
 | `DELETE /admin/api/v1/downstream-tokens/{id}` | `204`, revoking that token |
 | `GET /admin/api/v1/events` | `200 application/json` safe event list |
 
-Duplicate upstream fingerprint is `409`. Deleting an enabled key is `409`.
+Duplicate upstream fingerprint, enabling an unverified/cooling/quarantined key,
+and deleting an enabled key are `409`.
 Deleting an unknown or already deleted key is `404`. Repeated downstream revoke
-is `404`. Boundary validation is `422`; an unavailable database is `503`.
+is `404`. Boundary validation is `422`; an unavailable database is `503`. Every
+supported admin GET uses the same configured `1..5` second server deadline and
+returns safe `504 admin_read_timeout` when the database does not settle. Health
+uses the same repository-read budget and converges to the exact minimal degraded
+503 response rather than waiting without bound.
 
 Probe never chooses another key and never changes `enabled`. Its response has
 only `id`, `enabled`, `probe_status`, and `observed_at`, where `probe_status` is
@@ -85,7 +93,7 @@ negative probe applies the same-key transition in section 6.
 
 Admin list fields are closed allowlists:
 
-- Upstream: `id`, `fingerprint`, `enabled`, `health_state`, `cooldown_until`,
+- Upstream: `id`, `fingerprint`, `enabled`, `routing_state`, `health_state`, `cooldown_until`,
   `request_count`, `success_count`, `failure_count`, `last_status_class`,
   `last_used_at`, `created_at`, `updated_at`.
 - Downstream: `id`, `label`, `scopes`, `revoked_at`, `request_count`,
@@ -143,6 +151,7 @@ The `201` creation response and every list item have this exact shape:
   "id": "00000000-0000-4000-8000-000000000001",
   "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "enabled": false,
+  "routing_state": "disabled",
   "health_state": "unknown",
   "cooldown_until": null,
   "request_count": 0,
@@ -155,14 +164,16 @@ The `201` creation response and every list item have this exact shape:
 }
 ```
 
-`health_state` is exactly `unknown`, `healthy`, or `degraded`. Disabled,
-cooldown, and quarantine causes are represented by `enabled`, `cooldown_until`,
-and `last_status_class`, not extra health values. `last_status_class` is null or
+`routing_state` is exactly `disabled`, `eligible`, `cooldown`, or `quarantined`
+and is computed from the same scheduler-selection fields at read time.
+`health_state` is exactly `unknown`, `healthy`, or `degraded`.
+`last_status_class` is null or
 one of `success`, `invalid_credential`, `credits_exhausted`, `rate_limited`,
 `request_rejected`, `timeout`, `upstream_unavailable`,
 `upstream_bad_gateway`, `upstream_internal_error`, `upstream_protocol_error`,
 `delivery_failed`, or `cancelled`. A new row has every initial value shown above and
-`created_at == updated_at`.
+`created_at == updated_at`. Enable requires healthy state, no quarantine, and no
+active cooldown; otherwise it returns `409 resource_conflict` without mutation.
 
 `GET /admin/api/v1/upstream-keys` returns exactly
 `{"items":[<UpstreamKeyRead>,...]}`. It returns every nondeleted row ordered by
@@ -224,6 +235,24 @@ A list item is that shape with only `token` removed. The list response is
 
 #### Overview and event DTOs
 
+`GET /admin/api/v1/operator-readiness` returns exactly:
+
+```json
+{
+  "runtime_state": "operational",
+  "readiness_cause": "ready",
+  "ledger_status": "ok",
+  "capacity_blocker": "none"
+}
+```
+
+This endpoint is intentionally independent of dashboard collection size. One
+read-only repeatable snapshot reads the ledger singleton, actual event/attempt/
+pending counts, and one SQL eligible-key count. It never loads upstream key,
+downstream token, or event rows as collections. Lifecycle readiness is sampled
+before and after that snapshot, and an overlapping admin mutation fails through
+the bounded admin-read error contract instead of publishing mixed evidence.
+
 `GET /admin/api/v1/overview` returns exactly:
 
 ```json
@@ -245,7 +274,9 @@ A list item is that shape with only `token` removed. The list response is
 ```
 
 `status` is exactly `ok` or `degraded`, and it and `ready` reuse the `/health`
-calculation. `request_count` is the sum of upstream logical attempts. An empty
+calculation. `request_count` is the count of distinct routed `request_id`
+values; multiple key attempts during one bounded failover still count as one
+logical request, and explicit probes do not count. An empty
 database reports every count as zero, `last_event_at:null`, `status:"degraded"`,
 and `ready:false`.
 
@@ -623,7 +654,7 @@ Static DOM/CSS assertions and computed-browser assertions both verify geometry,
 visibility, section spans, labels, and order.
 
 Admin Overview contains exactly five cells in this order: `Gateway readiness`,
-`Eligible keys`, `Cooling keys`, `Logical attempts`, `Last event/freshness`.
+`Eligible keys`, `Cooling keys`, `Logical requests`, `Last event/freshness`.
 `generated_at` is heading metadata, not a sixth cell. Active downstream counts
 stay in the downstream-token section. Showcase contains zero operational
 Overview cells. Its rail contains exactly `Buttons`, `Inputs`, `Statuses`,
@@ -709,7 +740,7 @@ installed distribution, and loading both showcase HTML and CSS through the
 public resource loader. Later admin resources join the same explicit allowlist
 and wheel-install proof; no generic static mount is introduced. The browser
 resource set is exactly `/admin`, `/showcase`, `/assets/admin.css`,
-`/assets/admin.js`, and `/assets/showcase.css`; an extra browser asset or route
+`/assets/admin.js`, `/assets/showcase.css`, and `/assets/showcase.js`; an extra browser asset or route
 fails the closed-set assertion.
 
 ### 9.4 Browser evidence integrity and cleanup
@@ -774,6 +805,46 @@ capabilities and supplementary groups cleared. App and database cannot read
 each other's runtime files. Stop/reboot destroys tmpfs copies. Rotation is an
 atomic canonical-file replace plus restart of only the consuming service.
 
+Non-secret production authority is the root-owned, non-writable
+`/etc/nvidia-build-lb/runtime.env`. It contains the exact app/PostgreSQL registry
+digests, canonical secret-directory path, and three ledger-cap values. The
+production wrapper parses a closed key set on every invocation and overwrites
+transient image/cap environment values before Compose runs. Its atomic update
+commands preserve every unrelated field, so credential rotation, rollback, and
+capacity recovery cannot silently reset caps or drift an image reference. A
+stable root-owned `runtime.env.lock` inode serializes all writers and excludes
+Compose readers during a write. Each replacement is also a SHA-256 compare-and-
+swap against the generation loaded under that lock. Ledger-capacity recovery is
+one exclusive operation: it verifies the current immutable app reference and
+image ID even when a prior failed attempt left the app stopped, recreates that
+same image with candidate caps, and verifies the new container still uses it. It
+then polls the bearer-authenticated bounded operator-readiness endpoint over host
+loopback with the root-owned canonical token file until the runtime is operational and the ledger
+is nonblocked, accepting both ready and no-eligible-key states, and only then
+commits the runtime file. The host-owned probe is independent of the target app
+image. It connects to any selected loopback port with the canonical service
+`Host`, and caps every response with a two-second absolute deadline and 2 MiB
+body limit. Current responses must satisfy the exact four-field DTO and closed
+runtime/readiness/ledger coherence. Runtime mode is used by backup, restore, and
+rollback. Only an operator-readiness `404` permits the exact authenticated legacy
+overview: a ready result passes immediately; degraded/no-key must remain exact
+and reachable in a second sample 30 seconds later on the same container ID and
+Docker `StartedAt` generation, beyond the prior image's fatal grace plus bounded
+retirement budget. Ledger-capacity mode has no
+fallback and additionally requires a nonblocked ledger. Paired receipts bind
+the restored ledger state, so these flows accept intentional degraded states
+without accepting a database or lifecycle outage. Any post-recreation failure
+or signal stops the app so the candidate generation cannot continue accepting
+traffic without durable config; a later invocation can safely reenter that
+same-image withdrawn state.
+
+Ledger row capacity and durable evidence health are separate admission terms.
+`orphaned_pending` and `legacy_unlinked` persist as hard admission blockers even
+when later cap values leave free rows. Dashboard readiness uses the same
+predicate. Only a reviewed forward repair followed by a successful maintenance
+assessment that observes the anomaly absent may clear the persisted blocker;
+cap changes, restarts, and projection logic cannot clear it.
+
 Migration `0004_vault_key_verifier` adds one singleton database binding for the
 vault key. The binding is a fresh 32-byte salt plus HMAC-SHA-256 over the fixed
 `nvidia-build-lb:vault-key-verifier:v1` context; it is not a plaintext key or a
@@ -784,10 +855,13 @@ not match, including a different but correctly sized 32-byte value.
 
 ## 11. PostgreSQL migration and backup custody
 
-The current Alembic head is `0004_vault_key_verifier`: `0001_baseline` remains
+The current Alembic head is `0005_admin_dashboard_ledger`: `0001_baseline` remains
 schema-neutral, `0002_vault_auth` adds encrypted vault/auth tables,
 `0003_nvidia_routing` adds durable routing state, and
-`0004_vault_key_verifier` adds the singleton vault-key binding.
+`0004_vault_key_verifier` adds the singleton vault-key binding. Complete 0004 is
+the legacy V2 backup/restore shape only. `0005_admin_dashboard_ledger` adds the
+canonical dashboard ledger, exact attempt-terminal linkage, bounded evidence
+retention, and the current V3 backup/restore shape.
 
 Backups are three separately custodied root-only artifacts:
 
@@ -929,6 +1003,13 @@ vault-verifier salt/digest. Before copying the key, backup verifies it against
 that database binding inside a network-disabled helper. The manifest contains no
 plaintext credential, ciphertext, nonce, raw downstream digest, DB password, or
 provider payload.
+
+The state oracle dispatches strictly between V2 for the complete 0004 schema
+and V3 for the complete 0005 schema; any partial shape fails closed. V3 hashes
+fixed-position, compact ASCII JSON projections of every event, exact attempt
+receipt, live pin, and the ledger singleton, and separately binds their counts,
+pending attempts, and the routed-request rollup. Restore compares the exact
+field set for the captured version, so a same-count identity change cannot pass.
 
 Restore is forbidden against a database unless it is running, empty of all user
 schemas, relations, functions, and types, and explicitly labeled

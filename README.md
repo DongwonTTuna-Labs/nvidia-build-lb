@@ -41,7 +41,8 @@ Operational documentation:
 
 The supplied Compose surface binds only `127.0.0.1:2456`; it intentionally
 does not create public DNS, tunnel, or reverse-proxy ingress. This project is
-invoked through `scripts/ops/production-compose.sh`, which accepts only raw
-64-hex GHCR registry digests and rejects mutable image tags before Compose
-runs. This project is independent and is not affiliated with NVIDIA
-Corporation.
+invoked through `scripts/ops/production-compose.sh`, which reloads a canonical
+root-owned runtime file on every call, accepts only raw 64-hex GHCR registry
+digests, serializes that file through a stable lock, and rejects mutable image
+tags before Compose runs. This project is independent and is not affiliated
+with NVIDIA Corporation.

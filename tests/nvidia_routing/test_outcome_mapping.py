@@ -6,6 +6,7 @@ from nvidia_build_lb.admin.schemas import LastStatusClass
 from nvidia_build_lb.outcomes import (
     DownstreamLoss,
     HttpStatusSignal,
+    LedgerCapacityExhausted,
     NoEligibleKey,
     PollDeadline,
     ProtocolFailure,
@@ -40,6 +41,16 @@ pytestmark = pytest.mark.nvidia_routing
                 http_status=503,
                 code="database_unavailable",
                 message="database unavailable",
+                persisted_status=None,
+                alternate_eligible=False,
+            ),
+        ),
+        (
+            LedgerCapacityExhausted(),
+            PublicOutcome(
+                http_status=503,
+                code="ledger_capacity_exhausted",
+                message="request evidence capacity exhausted",
                 persisted_status=None,
                 alternate_eligible=False,
             ),

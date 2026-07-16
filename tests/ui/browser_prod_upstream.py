@@ -2,7 +2,7 @@ import json
 from collections.abc import Callable
 from hashlib import sha256
 
-from playwright.sync_api import Route, expect
+from playwright.sync_api import Page, Route, expect
 
 from .browser_auth import AuthenticatedSession
 from .browser_checks import assert_no_page_overflow
@@ -47,6 +47,35 @@ def _confirm(session: AuthenticatedSession) -> None:
     assert page.locator(":focus").get_attribute("id") == "confirm-action"
     page.keyboard.press("Enter")
     expect(page.locator("#confirm-dialog")).to_be_hidden()
+
+
+def _delete_focus_candidate_ids(page: Page, item_id: str) -> tuple[str, ...]:
+    rows = page.locator("#upstream-body tr")
+    row_ids: list[str] = []
+    target_index: int | None = None
+    for index in range(rows.count()):
+        probe_id = rows.nth(index).locator("[data-mutation][id$='-probe']").get_attribute("id")
+        assert probe_id is not None
+        assert probe_id.startswith("key-")
+        assert probe_id.endswith("-probe")
+        row_id = probe_id.removeprefix("key-").removesuffix("-probe")
+        row_ids.append(row_id)
+        if row_id == item_id:
+            target_index = index
+    assert target_index is not None
+    return tuple(row_ids[target_index + 1 :] + list(reversed(row_ids[:target_index])))
+
+
+def _expected_delete_focus_id(page: Page, candidate_ids: tuple[str, ...]) -> str:
+    for candidate_id in candidate_ids:
+        probe = page.locator(f"#key-{candidate_id}-probe")
+        row = page.locator("#upstream-body tr", has=probe)
+        action = row.locator("[data-mutation]:not(:disabled)").first
+        if action.count():
+            action_id = action.get_attribute("id")
+            assert action_id is not None
+            return action_id
+    return "upstream-heading"
 
 
 def _cancel_and_escape(journey: ProductionJourney) -> None:
@@ -98,7 +127,7 @@ def _probe_once(journey: ProductionJourney, item_id: str) -> tuple[str, str]:
     assert len(held) == 1
     held[0].continue_()
     row = page.locator("#upstream-body tr", has_text=item_id)
-    expect(row.locator("td[data-label='Health']")).to_have_text("healthy · success")
+    expect(row.locator("td[data-label='Health']")).to_have_text("Verified · Last check succeeded")
     expect(page.locator(f"#{probe_id}")).to_be_enabled()
     page.unroute(pattern, hold)
     return toggle_id, f"key-{item_id}-delete"
@@ -124,10 +153,19 @@ def _exercise_action_failures(journey: ProductionJourney, item_id: str) -> None:
     page.locator(f"#{probe_id}").focus()
     page.keyboard.press("Enter")
     expect(page.locator("#global-error")).to_be_visible()
-    expect(page.locator("#stale-warning")).to_be_visible()
+    expect(page.locator("#decision-brief")).to_be_hidden()
     expect(page.locator("#global-error")).to_be_focused()
-    expect(page.locator("#global-error-message")).to_have_text(
-        "database_unavailable · administration state unavailable · Request browser-prod-probe-503"
+    expect(page.locator("#global-error-message")).to_contain_text(
+        "did not complete. Success was not assumed. Database unavailable."
+    )
+    expect(page.locator("#global-error-evidence .request-evidence-message")).to_have_text(
+        "administration state unavailable"
+    )
+    expect(page.locator("#global-error-evidence dd.machine-id").nth(0)).to_have_text(
+        "database_unavailable"
+    )
+    expect(page.locator("#global-error-evidence dd.machine-id").nth(1)).to_have_text(
+        "browser-prod-probe-503"
     )
     journey.qa.recorder.capture(
         page,
@@ -142,9 +180,14 @@ def _exercise_action_failures(journey: ProductionJourney, item_id: str) -> None:
     page.locator("#retry-dashboard").focus()
     page.keyboard.press("Enter")
     expect(page.locator("#global-error")).to_be_hidden()
-    expect(page.locator("#stale-warning")).to_be_hidden()
+    expect(page.locator("#decision-brief")).to_be_visible()
     expect(page.locator("#refresh-dashboard")).to_be_enabled()
     expect(page.locator(f"#{toggle_id}")).to_have_text("Enable")
+    expect(page.locator(f"#{toggle_id}")).to_be_disabled()
+
+    _phase(journey, f"{prefix}upstream_probe_before_enable_401")
+    page.locator(f"#{probe_id}").click()
+    expect(page.locator(f"#{toggle_id}")).to_be_enabled()
 
     _phase(journey, f"{prefix}upstream_enable_401")
     _ = page.route(
@@ -194,17 +237,25 @@ def _disable_and_delete(
     page.keyboard.press("Enter")
     expect(page.locator(f"#{toggle_id}")).to_have_text("Disable")
     page.keyboard.press("Enter")
+    if not journey.native_zoom:
+        journey.qa.recorder.capture(
+            page,
+            CaptureSpec(
+                name="admin-destructive-confirmation-1280",
+                state="actual disable-key confirmation at 1280px",
+                viewport="1280x900",
+            ),
+        )
     _confirm(journey.session)
     expect(page.locator(f"#{toggle_id}")).to_have_text("Enable")
+    delete_focus_candidate_ids = _delete_focus_candidate_ids(page, item_id)
     page.locator(f"#{delete_id}").focus()
     page.keyboard.press("Enter")
     _confirm(journey.session)
     expect(page.locator(f"#{delete_id}")).to_have_count(0)
-    focused = page.locator(":focus").get_attribute("id") or ""
-    focus_is_valid = focused == "upstream-heading" or (
-        focused.startswith("key-") and focused.endswith("-toggle")
-    )
-    assert focus_is_valid
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+    expected_focus_id = _expected_delete_focus_id(page, delete_focus_candidate_ids)
+    expect(page.locator(f"#{expected_focus_id}")).to_be_focused()
     assert item_id not in {str(item.id) for item in journey.qa.client.upstreams().items}
 
 

@@ -31,6 +31,7 @@ def test_health_degraded_contract(contract_client: ContractClient) -> None:
         pytest.param("/assets/admin.css", "text/css", id="admin-css"),
         pytest.param("/assets/admin.js", "text/javascript", id="admin-js"),
         pytest.param("/assets/showcase.css", "text/css", id="showcase-css"),
+        pytest.param("/assets/showcase.js", "text/javascript", id="showcase-js"),
     ],
 )
 def test_exact_shell_and_asset_get_contract(

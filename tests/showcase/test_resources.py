@@ -13,6 +13,7 @@ from nvidia_build_lb.web.resources import WebResource, load_web_resource
     [
         (WebResource.SHOWCASE_DOCUMENT, "<!doctype html>"),
         (WebResource.SHOWCASE_STYLESHEET, ":root"),
+        (WebResource.SHOWCASE_SCRIPT, "syncShowcaseNavigation"),
     ],
 )
 def test_allowlisted_package_resource_is_read_when_requested(
@@ -68,4 +69,5 @@ def test_application_creation_does_not_read_resource_content(
     # Then: startup is import-safe and registers the closed shell plus degraded health.
     assert application.url_path_for("_get_showcase_document") == "/showcase"
     assert application.url_path_for("_get_showcase_stylesheet") == "/assets/showcase.css"
+    assert application.url_path_for("_get_showcase_script") == "/assets/showcase.js"
     assert application.url_path_for("_health") == "/health"

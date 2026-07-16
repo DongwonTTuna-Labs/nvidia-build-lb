@@ -44,24 +44,25 @@ def register_public_routes(app: FastAPI, services: ApplicationServices) -> None:
         if payload.model != NVIDIA_MODEL:
             return model_not_found(request_id)
         body = orjson.dumps(payload.model_dump(mode="json", exclude_unset=True))
-        routed = await services.routing.execute(
-            request_id=request_id,
-            body=body,
-            requested_stream=payload.stream,
-        )
-        _log_completed_attempts(services, request_id, routed)
-        if isinstance(routed, RoutedFailure):
-            return routed_failure(routed.terminal, request_id)
-        stream_log = (
-            StreamLogContext(routed.lease.key_id, routed.attempt_count)
-            if isinstance(routed, RoutedStream)
-            else None
-        )
-        return RoutedChatResponse(
-            routed,
-            services.responders.create(stream_log),
-            requested_stream=payload.stream,
-        )
+        with services.active_requests.track(request_id):
+            routed = await services.routing.execute(
+                request_id=request_id,
+                body=body,
+                requested_stream=payload.stream,
+            )
+            _log_completed_attempts(services, request_id, routed)
+            if isinstance(routed, RoutedFailure):
+                return routed_failure(routed.terminal, request_id)
+            stream_log = (
+                StreamLogContext(routed.lease.key_id, routed.attempt_count)
+                if isinstance(routed, RoutedStream)
+                else None
+            )
+            return RoutedChatResponse(
+                routed,
+                services.responders.create(stream_log),
+                requested_stream=payload.stream,
+            )
 
     _ = (_health, _models, _chat)
 
