@@ -202,9 +202,12 @@ function showProblem(problem, context = "Refreshing administration state", snaps
   const unconfirmedBeforeRefresh = snapshotOnly && operationStatus;
   const knownActionFailure = !snapshotOnly && knownNoSuccess;
   const settling = snapshotOnly && problem.code === "admin_mutation_settling";
+  const settlingContext = settling ? unresolvedRecoveryContext() : null;
   const incompatible = snapshotOnly && problem.code === "incompatible_service";
   const message = settling
-    ? "The previous request is still settling. Do not repeat it. Refresh again after settlement completes."
+    ? settlingContext
+      ? `${settlingContext} remains unconfirmed. The service reports that an administration change is still settling, but cannot identify whether it is the same change. Do not repeat the unconfirmed action. Refresh after settlement completes.`
+      : "The service reports that an administration change is still settling. Its target is not available in this tab. Do not start another change. Refresh after settlement completes."
     : incompatible
       ? "This service version does not provide the required coherent dashboard. Upgrade the service; legacy reads are not used as a fallback."
       : unconfirmedBeforeRefresh
@@ -216,7 +219,7 @@ function showProblem(problem, context = "Refreshing administration state", snaps
       : knownActionFailure
         ? `${context} did not complete. The service confirmed no successful result. ${humanize(problem.code)}. Refresh current state before retrying.`
       : `${context} did not complete. Success was not assumed. ${humanize(problem.code)}. Refresh current state before retrying.`;
-  const state = settling ? "Action still settling" : incompatible ? "Incompatible service" : unconfirmedBeforeRefresh ? "Action not confirmed" : hasConfirmedResult ? "Snapshot refresh not confirmed" : snapshotOnly ? "Current state not confirmed" : knownActionFailure ? "Action failed" : "Action not confirmed";
+  const state = settling ? "Administration change settling" : incompatible ? "Incompatible service" : unconfirmedBeforeRefresh ? "Action not confirmed" : hasConfirmedResult ? "Snapshot refresh not confirmed" : snapshotOnly ? "Current state not confirmed" : knownActionFailure ? "Action failed" : "Action not confirmed";
   setText("global-error-state", state);
   setText("global-error-message", message);
   const globalEvidence = byId("global-error-evidence").closest("details");

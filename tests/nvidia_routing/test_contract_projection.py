@@ -8,11 +8,11 @@ import pytest
 
 pytestmark = pytest.mark.nvidia_routing
 
-_ROOT = Path(__file__).resolve().parents[2]
-_DIRECTORY = _ROOT / ".omo/evidence/task-3-nvidia-build-lb"
+_DIRECTORY = Path(__file__).resolve().parents[1] / "fixtures/nvidia-routing-v15"
 _CONTRACT = _DIRECTORY / "contract-v15.json"
-_VERIFIER = _DIRECTORY / "verify-v15-contract.py"
+_VERIFIER = _DIRECTORY / "verify-v15-contract.py.snapshot"
 _CONTRACT_SHA256 = "38ba64a99cc53873b043ae56c62eb3f23a9573d25246ceac25efcf1482c1cebe"
+_VERIFIER_SHA256 = "dcb75c561f066a4317c3a2431ef9ce58b50f51badec1111196d38f75c45c0fb9"
 _MUTATIONS = (
     "stale_version",
     "coherent_selection_change",
@@ -43,10 +43,15 @@ from pathlib import Path
 contract = Path(sys.argv[1])
 verifier = Path(sys.argv[2])
 expected = sys.argv[3]
+verifier_expected = sys.argv[4]
 raw = contract.read_bytes()
-assert hashlib.sha256(raw).hexdigest() == expected
+verifier_raw = verifier.read_bytes()
+if hashlib.sha256(raw).hexdigest() != expected:
+    raise SystemExit("contract_fixture_hash_mismatch")
+if hashlib.sha256(verifier_raw).hexdigest() != verifier_expected:
+    raise SystemExit("verifier_fixture_hash_mismatch")
 namespace = {"__name__": "v15_projection_probe"}
-exec(compile(verifier.read_bytes(), str(verifier), "exec"), namespace)
+exec(compile(verifier_raw, str(verifier), "exec"), namespace)
 document = json.loads(raw)
 for row in namespace["semantic_mutation_rows"](document):
     assert row["expected_failure_locations"]
@@ -64,6 +69,7 @@ def rejected_mutations() -> frozenset[str]:
             str(_CONTRACT),
             str(_VERIFIER),
             _CONTRACT_SHA256,
+            _VERIFIER_SHA256,
         ],
         check=True,
         capture_output=True,

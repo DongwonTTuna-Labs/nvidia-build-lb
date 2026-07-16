@@ -130,6 +130,15 @@ def _login(page: Page, server: RunningFakeServer) -> None:
     expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
 
 
+def _expect_refresh_recovery_ready(page: Page, state: str) -> None:
+    expect(page.locator("#global-error")).to_be_visible()
+    expect(page.locator("#global-error")).to_be_focused()
+    expect(page.locator("#global-error-state")).to_have_text(state)
+    expect(page.locator("#retry-dashboard")).to_be_visible()
+    expect(page.locator("#retry-dashboard")).to_be_enabled()
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+
+
 def test_first_capacity_assessment_has_an_operational_reason_and_one_refresh(
     decision_browser: tuple[RunningFakeServer, BrowserContext, Page],
 ) -> None:
@@ -1145,10 +1154,13 @@ def test_unbound_probe_and_pause_evidence_reject_later_fresh_versions(
 
     server.state.fail_next("/admin/api/v1/dashboard")
     page.locator(f"#key-{FIRST_KEY_ID}-probe").click()
-    expect(page.locator("#global-error-state")).to_have_text("Snapshot refresh not confirmed")
+    _expect_refresh_recovery_ready(page, "Snapshot refresh not confirmed")
 
     def drift_probe_version(route: Route) -> None:
         response = route.fetch()
+        if response.status != 200:
+            message = f"expected dashboard 200, got {response.status}"
+            raise AssertionError(message)
         payload = AdminDashboardRead.model_validate_json(response.text())
         items = tuple(
             item.model_copy(update={"updated_at": datetime(2026, 1, 2, tzinfo=UTC)})
@@ -1162,9 +1174,10 @@ def test_unbound_probe_and_pause_evidence_reject_later_fresh_versions(
             body=_replace_dashboard_upstreams(payload, upstreams).model_dump_json(),
         )
 
-    _ = page.route("**/admin/api/v1/dashboard", drift_probe_version)
+    _ = page.route("**/admin/api/v1/dashboard", drift_probe_version, times=1)
     page.locator("#retry-dashboard").click()
     expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+    expect(page.locator("#global-error")).to_be_hidden()
     expect(page.locator("#decision-title")).not_to_have_text("Enable Key aaaaaaaa")
     page.unroute("**/admin/api/v1/dashboard", drift_probe_version)
 
@@ -1173,13 +1186,18 @@ def test_unbound_probe_and_pause_evidence_reject_later_fresh_versions(
     toggle = page.locator(f"#key-{FIRST_KEY_ID}-toggle")
     toggle.click()
     expect(toggle).to_have_text("Disable")
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
     server.state.fail_next("/admin/api/v1/dashboard")
     toggle.click()
     page.locator("#confirm-action").click()
-    expect(page.locator("#global-error-state")).to_have_text("Snapshot refresh not confirmed")
+    _expect_refresh_recovery_ready(page, "Snapshot refresh not confirmed")
+    expect(page.locator("#global-confirmed-result")).to_contain_text("was disabled")
 
     def drift_paused_version(route: Route) -> None:
         response = route.fetch()
+        if response.status != 200:
+            message = f"expected dashboard 200, got {response.status}"
+            raise AssertionError(message)
         payload = AdminDashboardRead.model_validate_json(response.text())
         items = tuple(
             item.model_copy(
@@ -1200,8 +1218,10 @@ def test_unbound_probe_and_pause_evidence_reject_later_fresh_versions(
             body=_replace_dashboard_upstreams(payload, upstreams).model_dump_json(),
         )
 
-    _ = page.route("**/admin/api/v1/dashboard", drift_paused_version)
+    _ = page.route("**/admin/api/v1/dashboard", drift_paused_version, times=1)
     page.locator("#retry-dashboard").click()
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+    expect(page.locator("#global-error")).to_be_hidden()
     expect(page.locator("#decision-title")).to_have_text("Probe Key aaaaaaaa")
 
 

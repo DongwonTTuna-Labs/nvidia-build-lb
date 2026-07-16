@@ -1298,6 +1298,7 @@ def test_rollback_document_signal_withdraws_and_preserves_signal_status(
     environment = os.environ.copy()
     environment.update(
         {
+            "LC_ALL": "C",
             "NBLB_ROLLBACK_CHILD_READY": str(child_ready),
             "NBLB_ROLLBACK_LOG": str(command_log),
             "NBLB_ROLLBACK_READY": str(ready),
@@ -1335,8 +1336,16 @@ def test_rollback_document_signal_withdraws_and_preserves_signal_status(
     assert rollback_process.returncode == expected_status, stderr
     assert stdout == ""
     if foreground_child:
+        signal_diagnostic = {
+            signal.SIGHUP: "Hangup",
+            signal.SIGINT: "Interrupt",
+            signal.SIGTERM: "Terminated",
+        }[interruption]
+        diagnostic_pattern = (
+            rf"(?:{re.escape(signal_diagnostic)}(?:[ \t]+scripts/foreground-child\.sh)?\n)?"
+        )
         assert "rollback_candidate_withdraw_failed" not in stderr
-        assert "foreground-child.sh" in stderr or stderr == ""
+        assert re.fullmatch(diagnostic_pattern, stderr) is not None, repr(stderr)
     else:
         assert stderr == ""
     assert command_log.read_text(encoding="utf-8") == "stop app\n"

@@ -83,6 +83,10 @@ loops.
 - Authentication expiry preserves a non-secret description of the interrupted
   target and action. Reauthentication asks the operator to verify current state
   before retrying; it never claims the ambiguous action failed or succeeded.
+- While authentication is pending, the submitted bearer field is immutable and
+  cannot accept a replacement value that would be silently discarded when the
+  response remounts the login surface. A new attempt begins only after the prior
+  request reaches a terminal response.
 - A lost add response is reconciled only by the submitted key's exact SHA-256
   fingerprint, never by assuming that one newly visible row is the same request.
   A lost probe, enable, disable, delete, or revoke response is reconciled against
@@ -120,6 +124,13 @@ loops.
   mutations, Copy, and Dismiss all preserve focus inside the active task and
   restore it deterministically after completion. Submitted dialog fields remain
   immutable while their request is pending.
+- A settling response keeps any locally known non-secret target and attempted
+  action in L1 as an unconfirmed operation. Separately, it states that the
+  service reports some administration change is settling and cannot identify
+  whether it is the same change. It preserves the local outcome as unknown,
+  locks every mutation, and offers Refresh as the only action; it never invents
+  correlation, collapses to an anonymous "previous request", or re-enables the
+  unresolved mutation.
 - A confirmed deliberate Disable or final-token Revoke is not immediately
   reversed by an Enable or Issue primary action. Enable is recommended only
   when this journey has current probe/replacement evidence; first-token Issue

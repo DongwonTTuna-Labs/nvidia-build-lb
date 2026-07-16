@@ -14,6 +14,7 @@ async function login(event) {
   const submit = byId("login-submit");
   byId("login-busy").hidden = false;
   byId("login-busy").focus();
+  field.disabled = true;
   submit.disabled = true;
   submit.setAttribute("aria-busy", "true");
   submit.textContent = "Authenticating…";

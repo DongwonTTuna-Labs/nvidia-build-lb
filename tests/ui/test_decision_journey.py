@@ -113,6 +113,22 @@ def enable_first_key(page: Page) -> None:
     _enable_first_key(page)
 
 
+def _refresh_dashboard_from(page: Page, control_id: str) -> None:
+    with page.expect_response(lambda response: response.url.endswith("/dashboard")) as refresh:
+        page.locator(control_id).click()
+    assert refresh.value.status == 200
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+
+
+def _open_admin_with_paused_clock(page: Page, admin_bearer: str) -> None:
+    page.clock.install()
+    _ = page.goto(f"{UI_ORIGIN}/admin", wait_until="domcontentloaded")
+    page.clock.pause_at(float(evaluate_string(page, "() => String(Date.now())")))
+    page.locator("#admin-bearer").fill(admin_bearer)
+    page.keyboard.press("Enter")
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+
+
 def _start_reviewed_row_action(page: Page, control_id: str) -> None:
     page.locator("#recommended-action").click()
     control = page.locator(f"#{control_id}")
@@ -807,24 +823,24 @@ def test_snapshot_expiry_keeps_focus_in_modal_and_uses_a_connected_cancel_fallba
     page = context.new_page()
     page.set_default_timeout(5_000)
     try:
-        _ = page.goto(f"{UI_ORIGIN}/admin", wait_until="domcontentloaded")
-        page.locator("#admin-bearer").fill(server.state.admin_bearer)
-        page.keyboard.press("Enter")
+        _open_admin_with_paused_clock(page, server.state.admin_bearer)
         _install_decision_scenario(page, "short-cooldown", server.state)
-        page.locator("#refresh-dashboard").click()
+        _refresh_dashboard_from(page, "#refresh-dashboard")
 
         evidence = page.locator(f"#key-{_FIRST_KEY_ID}-evidence")
         evidence.click()
         expect(evidence).to_be_focused()
+        page.clock.run_for(800)
         expect(page.locator("#decision-state")).to_contain_text("Stale")
         expect(evidence).to_be_focused()
         expect(evidence.locator("xpath=parent::details")).to_have_attribute("open", "")
-        page.locator("#recommended-action").click()
+        _refresh_dashboard_from(page, "#recommended-action")
 
         page.locator("#add-upstream").click()
         page.locator("#upstream-key").fill("synthetic-modal-expiry-focus")
         _observe_live_nodes(page, ("upstream-dialog-stale", "live-region"))
         page.locator("#submit-upstream").focus()
+        page.clock.run_for(800)
         expect(page.locator("#upstream-dialog-stale")).to_be_focused()
         expect(page.locator("#upstream-dialog")).to_be_visible()
         assert '"id":"upstream-dialog-stale"' in _live_changes(page)
@@ -832,11 +848,12 @@ def test_snapshot_expiry_keeps_focus_in_modal_and_uses_a_connected_cancel_fallba
         page.locator("[data-close='upstream-dialog']").click()
         expect(page.locator("#dashboard-title")).to_be_focused()
 
-        page.locator("#recommended-action").click()
+        _refresh_dashboard_from(page, "#recommended-action")
         first_toggle = page.locator(f"#key-{_FIRST_KEY_ID}-toggle")
         expect(first_toggle).to_have_text("Disable")
         first_toggle.click()
         page.locator("#confirm-action").focus()
+        page.clock.run_for(800)
         expect(page.locator("#confirm-dialog-stale")).to_be_focused()
         expect(page.locator("#confirm-dialog")).to_be_visible()
         page.locator("[data-close='confirm-dialog']").click()
@@ -1013,7 +1030,12 @@ def _logout_and_reauthenticate_orphan_recovery(page: Page, state: FakeAdminState
     page.locator("#admin-bearer").fill("synthetic-wrong-admin-bearer")
     expect(page.locator("#login-interrupted")).to_be_visible()
     page.keyboard.press("Enter")
-    expect(page.locator("#login-interrupted")).to_be_visible()
+    expect(page.locator("#login-error")).to_be_visible()
+    expect(page.locator("#login-error-message")).to_have_text(
+        "Authentication expired or failed. Enter the current admin bearer."
+    )
+    expect(page.locator("#admin-bearer")).to_have_attribute("aria-invalid", "true")
+    expect(page.locator("#login-submit")).to_be_enabled()
 
     def abort_dashboard(route: Route) -> None:
         route.abort()
@@ -1397,10 +1419,9 @@ def test_runtime_not_ready_overrides_eligible_rows_and_locks_mutations() -> None
         _ = page.goto(f"{UI_ORIGIN}/admin", wait_until="domcontentloaded")
         page.locator("#admin-bearer").fill(server.state.admin_bearer)
         page.keyboard.press("Enter")
-        page.locator(f"#key-{_FIRST_KEY_ID}-probe").click()
-        page.locator(f"#key-{_FIRST_KEY_ID}-toggle").click()
+        _enable_first_key(page)
         _ = page.route("**/admin/api/v1/dashboard", runtime_not_ready)
-        page.locator("#refresh-dashboard").click()
+        _refresh_dashboard_from(page, "#refresh-dashboard")
         expect(page.locator("#gateway-status")).to_have_text(
             "Not ready · Local runtime unavailable"
         )
@@ -1669,15 +1690,16 @@ def test_snapshot_expires_at_known_cooldown_transition_and_moves_focus_to_refres
     page = context.new_page()
     page.set_default_timeout(5_000)
     try:
-        _ = page.goto(f"{UI_ORIGIN}/admin", wait_until="domcontentloaded")
-        page.locator("#admin-bearer").fill(server.state.admin_bearer)
-        page.keyboard.press("Enter")
+        _open_admin_with_paused_clock(page, server.state.admin_bearer)
         page.locator(f"#key-{_FIRST_KEY_ID}-probe").click()
+        expect(page.locator("#decision-title")).to_have_text("Enable Key aaaaaaaa")
+        expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
         _install_decision_scenario(page, "short-cooldown", server.state)
-        page.locator("#refresh-dashboard").click()
+        _refresh_dashboard_from(page, "#refresh-dashboard")
         expect(page.locator("#decision-title")).to_have_text("Wait for Key bbbbbbbb cooldown")
         page.locator("#add-upstream").focus()
         expect(page.locator("#add-upstream")).to_be_focused()
+        page.clock.run_for(800)
         expect(page.locator("#decision-state")).to_contain_text("Stale")
         expect(page.locator("#recommended-action")).to_have_text("Refresh current state")
         expect(page.locator("#recommended-action")).to_be_focused()

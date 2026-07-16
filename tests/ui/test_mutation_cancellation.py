@@ -61,6 +61,16 @@ def _login(page: Page, state: FakeAdminState) -> None:
         page.locator("#admin-bearer").fill(state.admin_bearer)
         page.keyboard.press("Enter")
         page.locator("#dashboard-title").wait_for(state="visible")
+        expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+
+
+def _expect_dashboard_recovery_ready(page: Page, state: str) -> None:
+    expect(page.locator("#global-error")).to_be_visible()
+    expect(page.locator("#global-error")).to_be_focused()
+    expect(page.locator("#global-error-state")).to_have_text(state)
+    expect(page.locator("#retry-dashboard")).to_be_visible()
+    expect(page.locator("#retry-dashboard")).to_be_enabled()
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
 
 
 def _refresh_fixture(page: Page, state: FakeAdminState, case: MutationCase | None = None) -> None:
@@ -426,7 +436,7 @@ def test_settling_dashboard_keeps_unknown_and_only_refresh(
     probe_path = f"**/admin/api/v1/upstream-keys/{_DISABLED_ID}/probe"
     _ = page.route(probe_path, lambda route: route.abort(), times=1)
     page.locator(f"#key-{_DISABLED_ID}-probe").click()
-    expect(page.locator("#global-error-state")).to_have_text("Action not confirmed")
+    _expect_dashboard_recovery_ready(page, "Action not confirmed")
 
     _ = page.route(
         "**/admin/api/v1/dashboard",
@@ -438,16 +448,54 @@ def test_settling_dashboard_keeps_unknown_and_only_refresh(
         ),
         times=1,
     )
-    page.locator("#retry-dashboard").click()
-    expect(page.locator("#global-error-state")).to_have_text("Action still settling")
-    expect(page.locator("#global-error-message")).to_contain_text("Do not repeat it")
-    expect(page.locator("#retry-dashboard")).to_be_visible()
+    with page.expect_response(lambda response: response.url.endswith("/dashboard")) as settling:
+        page.locator("#retry-dashboard").click()
+    assert settling.value.status == 503
+    _expect_dashboard_recovery_ready(page, "Administration change settling")
+    expect(page.locator("#global-error-message")).to_contain_text(
+        "Probing Key aaaaaaaa remains unconfirmed"
+    )
+    expect(page.locator("#global-error-message")).to_contain_text(
+        "an administration change is still settling, but cannot identify whether it is the same change"
+    )
+    expect(page.locator("#global-error-message")).to_contain_text(
+        "Do not repeat the unconfirmed action"
+    )
     expect(page.locator("#recommended-action")).to_be_hidden()
     assert page.locator("[data-mutation]:enabled").count() == 0
 
-    page.locator("#retry-dashboard").click()
+    with page.expect_response(lambda response: response.url.endswith("/dashboard")) as refreshed:
+        page.locator("#retry-dashboard").click()
+    assert refreshed.value.status == 200
     expect(page.locator("#global-error")).to_be_hidden()
     expect(page.locator("#last-result")).to_contain_text("Fresh state for Key aaaaaaaa")
+
+
+def test_external_settling_names_unavailable_target_and_keeps_only_refresh(
+    mutation_browser: tuple[RunningFakeServer, BrowserContext, Page],
+) -> None:
+    _, _, page = mutation_browser
+    _ = page.route(
+        "**/admin/api/v1/dashboard",
+        lambda route: _fulfill_problem(
+            route,
+            503,
+            "admin_mutation_settling",
+            "another mutation is still settling",
+        ),
+        times=1,
+    )
+
+    with page.expect_response(lambda response: response.url.endswith("/dashboard")) as settling:
+        page.locator("#refresh-dashboard").click()
+    assert settling.value.status == 503
+    _expect_dashboard_recovery_ready(page, "Administration change settling")
+    expect(page.locator("#global-error-message")).to_contain_text(
+        "an administration change is still settling. Its target is not available in this tab"
+    )
+    expect(page.locator("#global-error-message")).to_contain_text("Do not start another change")
+    expect(page.locator("#recommended-action")).to_be_hidden()
+    assert page.locator("[data-mutation]:enabled").count() == 0
 
 
 def test_mutation_401_and_capacity_rejection_are_known_no_success(
@@ -575,9 +623,34 @@ def test_login_refresh_and_probe_keep_visible_focus_while_requests_are_pending()
         held: list[tuple[Route, APIResponse]] = []
         _ = page.route("**/admin/api/v1/dashboard", partial(_hold_committed_response, held))
         page.locator("#admin-bearer").fill(server.state.admin_bearer)
+        execute_script(
+            page,
+            """() => {
+const field = document.getElementById('admin-bearer');
+const busy = document.getElementById('login-busy');
+const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'disabled');
+if (!descriptor?.get || !descriptor?.set) throw new Error('disabled descriptor unavailable');
+globalThis.__loginTransitionOrder = [];
+Object.defineProperty(field, 'disabled', {
+  configurable: true,
+  get() { return descriptor.get.call(this); },
+  set(value) {
+    if (value) globalThis.__loginTransitionOrder.push('disabled');
+    descriptor.set.call(this, value);
+  },
+});
+busy.addEventListener('focus', () => globalThis.__loginTransitionOrder.push('focus'), {once: true});
+}""",
+        )
         with page.expect_request(lambda request: request.url.endswith("/dashboard")):
             page.locator("#login-submit").click()
         expect(page.locator("#login-busy")).to_be_focused()
+        expect(page.locator("#admin-bearer")).to_be_disabled()
+        expect(page.locator("#login-submit")).to_be_disabled()
+        assert (
+            evaluate_string(page, "() => JSON.stringify(globalThis.__loginTransitionOrder)")
+            == '["focus","disabled"]'
+        )
         route, response = _pop_held_response(page, held)
         route.fulfill(response=response)
         page.unroute("**/admin/api/v1/dashboard")
@@ -654,13 +727,13 @@ def test_lost_probe_is_not_promoted_when_recovery_refresh_also_fails() -> None:
         _login(page, server.state)
         _ = page.route(f"**{path}", _commit_then_abort)
         page.locator(f"#key-{_DISABLED_ID}-probe").click()
-        expect(page.locator("#global-error-state")).to_have_text("Action not confirmed")
+        _expect_dashboard_recovery_ready(page, "Action not confirmed")
         expect(page.locator(f"#result-{_DISABLED_ID}")).to_contain_text("Success was not assumed")
         page.unroute(f"**{path}", _commit_then_abort)
 
-        _ = page.route("**/admin/api/v1/dashboard", lambda route: route.abort())
+        _ = page.route("**/admin/api/v1/dashboard", lambda route: route.abort(), times=1)
         page.locator("#retry-dashboard").click()
-        expect(page.locator("#global-error-state")).to_have_text("Action not confirmed")
+        _expect_dashboard_recovery_ready(page, "Action not confirmed")
         expect(page.locator("#global-confirmed-result")).to_be_hidden()
     finally:
         try:
