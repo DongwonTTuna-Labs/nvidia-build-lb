@@ -196,6 +196,7 @@ update_app_digest() {
 
 export_runtime_config() {
     local restore_isolated=${NBLB_RESTORE_ISOLATED:-false}
+    local port=${NBLB_PORT:-}
     export NBLB_APP_REGISTRY_DIGEST=${RUNTIME_VALUES[NBLB_APP_REGISTRY_DIGEST]}
     export NBLB_POSTGRES_REGISTRY_DIGEST=${RUNTIME_VALUES[NBLB_POSTGRES_REGISTRY_DIGEST]}
     export NBLB_ADMIN_EVENT_MAX_ROWS=${RUNTIME_VALUES[NBLB_ADMIN_EVENT_MAX_ROWS]}
@@ -207,8 +208,15 @@ export_runtime_config() {
                 /*) export NBLB_SECRET_DIR ;;
                 *) fail restore_secret_dir_invalid ;;
             esac
+            if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$port" -gt 65535 ]; then
+                fail restore_port_invalid
+            fi
+            export NBLB_PORT=$port
             ;;
-        false) export NBLB_SECRET_DIR=${RUNTIME_VALUES[NBLB_SECRET_DIR]} ;;
+        false)
+            export NBLB_SECRET_DIR=${RUNTIME_VALUES[NBLB_SECRET_DIR]}
+            export NBLB_PORT=2456
+            ;;
         *) fail restore_isolation_flag_invalid ;;
     esac
 }

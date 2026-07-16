@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
+from nvidia_build_lb.compose_values import parse_canonical_decimal
 from nvidia_build_lb.errors import ConfigurationError, ConfigurationErrorCode
 from nvidia_build_lb.routing_limits import MAX_PUBLIC_ATTEMPTS
 
@@ -19,8 +20,8 @@ _ADMIN_TOKEN_PREFIX: Final = b"nblb_admin_"
 _ADMIN_TOKEN_HEX_BYTES: Final = 64
 _ADMIN_TOKEN_BYTES: Final = len(_ADMIN_TOKEN_PREFIX) + _ADMIN_TOKEN_HEX_BYTES
 _DATABASE_PASSWORD_MAX_BYTES: Final = 1024
-_MAX_DECIMAL_SETTING_DIGITS: Final = 10
 
+type PublicPort = Annotated[int, Field(ge=1, le=65_535, strict=True)]
 type AdminReadDeadlineSeconds = Annotated[int, Field(ge=1, le=5, strict=True)]
 type AdminMutationDeadlineSeconds = Annotated[int, Field(ge=5, le=125, strict=True)]
 type AdminEventRetentionDays = Annotated[int, Field(ge=1, le=365, strict=True)]
@@ -65,6 +66,7 @@ class SettingsSource(BaseSettings):
     admin_token_file: Path = Path("/run/nvidia-build-lb/secrets/admin_token")
     stage: str = DeploymentStage.PRODUCTION.value
     log_level: str = LogLevel.INFO.value
+    public_port: PublicPort = 2456
     admin_read_deadline_seconds: AdminReadDeadlineSeconds = 5
     admin_mutation_deadline_seconds: AdminMutationDeadlineSeconds = 125
     admin_event_retention_days: AdminEventRetentionDays = 30
@@ -78,20 +80,13 @@ class SettingsSource(BaseSettings):
         "admin_event_max_rows",
         "admin_attempt_max_rows",
         "admin_ledger_prune_batch_size",
+        "public_port",
         mode="before",
     )
     @classmethod
     def _parse_compose_integer(cls, value: object) -> object:
         """Parse canonical decimal strings emitted by Compose."""
-        if (
-            isinstance(value, str)
-            and len(value) <= _MAX_DECIMAL_SETTING_DIGITS
-            and not value.startswith("0")
-            and value.isascii()
-            and value.isdecimal()
-        ):
-            return int(value)
-        return value
+        return parse_canonical_decimal(value)
 
 
 class SettingsMetadata(BaseModel):
@@ -103,6 +98,7 @@ class SettingsMetadata(BaseModel):
     model: str
     stage: DeploymentStage
     log_level: LogLevel
+    public_port: PublicPort
     secret_files_loaded: bool
     admin_read_deadline_seconds: AdminReadDeadlineSeconds
     admin_mutation_deadline_seconds: AdminMutationDeadlineSeconds
@@ -124,6 +120,7 @@ class Settings(BaseModel):
     admin_token: SecretStr
     stage: DeploymentStage
     log_level: LogLevel
+    public_port: PublicPort
     admin_read_deadline_seconds: AdminReadDeadlineSeconds
     admin_mutation_deadline_seconds: AdminMutationDeadlineSeconds
     admin_event_retention_days: AdminEventRetentionDays
@@ -140,6 +137,7 @@ class Settings(BaseModel):
             model=NVIDIA_MODEL,
             stage=self.stage,
             log_level=self.log_level,
+            public_port=self.public_port,
             secret_files_loaded=True,
             admin_read_deadline_seconds=self.admin_read_deadline_seconds,
             admin_mutation_deadline_seconds=self.admin_mutation_deadline_seconds,
@@ -205,6 +203,7 @@ def load_settings(source: SettingsSource | None = None) -> Settings:
         admin_token=SecretStr(admin_token_bytes.decode("ascii")),
         stage=stage,
         log_level=log_level,
+        public_port=boundary.public_port,
         admin_read_deadline_seconds=boundary.admin_read_deadline_seconds,
         admin_mutation_deadline_seconds=boundary.admin_mutation_deadline_seconds,
         admin_event_retention_days=boundary.admin_event_retention_days,

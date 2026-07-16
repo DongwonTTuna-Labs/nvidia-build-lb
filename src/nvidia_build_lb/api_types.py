@@ -11,7 +11,7 @@ from nvidia_build_lb.active_routed_requests import ActiveRoutedRequestRegistry
 from nvidia_build_lb.admin_credentials import CredentialServices
 from nvidia_build_lb.credential_protocols import CredentialRepositorySurface
 from nvidia_build_lb.logging import ServiceLogger
-from nvidia_build_lb.routing import RoutedResult
+from nvidia_build_lb.routing import RoutedResult, RoutedStream
 from nvidia_build_lb.streaming import ChatStreamResponder
 
 
@@ -53,6 +53,10 @@ class PublicChatRouter(Protocol):
         """Return one fully classified routed result."""
         ...
 
+    async def cancel_unhanded_stream(self, routed: RoutedStream) -> None:
+        """Cancel and retire a live stream that no responder accepted."""
+        ...
+
 
 class ChatResponderFactory(Protocol):
     """Create request-scoped terminal arbitration state."""
@@ -84,6 +88,7 @@ class ApplicationServices:
     responders: ChatResponderFactory
     readiness: ReadinessProbe
     logger: ServiceLogger
+    public_port: int = 2456
     active_requests: ActiveRoutedRequestRegistry = field(
         default_factory=ActiveRoutedRequestRegistry
     )

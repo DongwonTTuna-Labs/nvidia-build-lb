@@ -220,6 +220,7 @@ async def build_production_resources(
                 RepositoryReadinessProbe(gated, settings.admin_read_deadline_seconds),
             ),
             logger=logger,
+            public_port=settings.public_port,
             active_requests=active_requests,
         )
         application = create_app(services)

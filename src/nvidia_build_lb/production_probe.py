@@ -1,5 +1,6 @@
 """Production explicit-probe execution over the durable routing coordinator."""
 
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
@@ -54,7 +55,17 @@ class RoutingProbeExecutor:
         if isinstance(routed, RoutedStream):
             responders = self.responders
             if responders is None:
+                with suppress(BaseException):
+                    await self.router.cancel_unhanded_stream(routed)
                 raise RuntimeError
+            try:
+                responder = responders.create(
+                    StreamLogContext(routed.lease.key_id, routed.attempt_count)
+                )
+            except BaseException:
+                with suppress(BaseException):
+                    await self.router.cancel_unhanded_stream(routed)
+                raise
 
             async def receive() -> dict[str, object]:
                 await anyio.sleep_forever()
@@ -63,9 +74,6 @@ class RoutingProbeExecutor:
             async def send(message: dict[str, object]) -> None:
                 del message
 
-            responder = responders.create(
-                StreamLogContext(routed.lease.key_id, routed.attempt_count)
-            )
             persisted = await responder.run_stream_status(
                 routed=routed,
                 receive=receive,

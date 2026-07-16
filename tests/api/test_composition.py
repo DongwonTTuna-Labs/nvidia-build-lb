@@ -84,6 +84,27 @@ def test_health_and_static_admin_are_composed(api_client: ContractClient) -> Non
     assert admin.status_code == 200
 
 
+def test_configured_published_port_is_the_exact_host_and_origin_boundary(
+    api_harness: ApiHarness,
+) -> None:
+    api_harness.readiness.set_ready(True)
+    services = replace(api_harness.services, public_port=32_458)
+
+    with TestClient(
+        create_app(services),
+        base_url="http://127.0.0.1:32458",
+    ) as client:
+        accepted = client.get(
+            "/health",
+            headers={"Origin": "http://127.0.0.1:32458"},
+        )
+        stale = client.get("/health", headers={"Host": "127.0.0.1:2456"})
+
+    assert accepted.status_code == 200
+    assert stale.status_code == 403
+    assert stale.json()["error"]["code"] == "host_forbidden"
+
+
 def test_operator_readiness_is_one_authenticated_closed_read(
     api_client: ContractClient,
 ) -> None:

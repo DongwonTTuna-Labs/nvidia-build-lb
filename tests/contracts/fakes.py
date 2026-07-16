@@ -63,6 +63,7 @@ from nvidia_build_lb.routing import (
     RoutedFailure,
     RoutedJson,
     RoutedResult,
+    RoutedStream,
 )
 from nvidia_build_lb.routing_models import RoutedAttemptObservation
 from nvidia_build_lb.scheduler_state import TerminalOutcome
@@ -318,6 +319,10 @@ class FakeReadiness:
 
 
 class FakeRouter:
+    async def cancel_unhanded_stream(self, routed: RoutedStream) -> None:
+        """Retire a synthetic stream if a composition test abandons it."""
+        await routed.terminal.stream.aclose()
+
     async def execute(
         self,
         *,

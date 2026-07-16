@@ -256,7 +256,8 @@ printf '%s\n' "$RESTORE_RECEIPT" | jq -e \
   '.status == "PASS" and .restored_state_matches == true' >/dev/null
 scripts/ops/production-compose.sh -p "$RESTORE_PROJECT" up -d migrate app
 RESTORE_APP="$(scripts/ops/production-compose.sh -p "$RESTORE_PROJECT" ps -q app)"
-# The alternate connection port still uses the canonical service Host header.
+# The isolated app uses the same selected alternate port for its connection
+# and Host header.
 RESTORE_RUNTIME_READY=0
 RESTORE_RUNTIME_ATTEMPT=0
 while [ "$RESTORE_RUNTIME_ATTEMPT" -lt 30 ]; do
@@ -285,8 +286,9 @@ receipt-validation, migration, app-start, or health failure. The original
 failure status remains authoritative; a simultaneous cleanup failure is also
 reported on stderr. Success is published only after the exact receipt,
 migration, authenticated runtime probe, and explicit zero-resource cleanup all
-pass. The host probe connects to the isolated port but sends the canonical
-service `Host`. Current images must return the exact bounded
+pass. The host probe uses one configured loopback authority. Its selected
+connection port and `Host` port are identical. Current images must return the
+exact bounded
 `operator-readiness` DTO; only that route's `404` can use the exact stable
 legacy-overview fallback, whose degraded path also requires one unchanged
 container ID and `StartedAt` generation. The probe

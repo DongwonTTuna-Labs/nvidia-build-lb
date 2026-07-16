@@ -1,5 +1,6 @@
 """Static candidate image, secret prestart, compose, and QA recipe contract."""
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -95,9 +96,11 @@ def test_qa_compose_is_labelled_bounded_and_does_not_publish_production_port() -
     compose = _text("compose.qa.yml")
     proxy = _text("scripts/qa/loopback_proxy.py")
     healthcheck = _text("docker/healthcheck.sh")
+    verify = _text("scripts/qa/verify-local.sh")
 
     assert compose.count("${NBLB_QA_TASK_LABEL:-todo6a-candidate}") == 8
     assert "127.0.0.1:${NBLB_QA_PORT:-32456}:2456" in compose
+    assert "NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_QA_PUBLIC_PORT:-2456}" in compose
     assert "127.0.0.1:2456:2456" not in compose
     assert "cap_drop:" in compose
     assert "- ALL" in compose
@@ -120,10 +123,35 @@ def test_qa_compose_is_labelled_bounded_and_does_not_publish_production_port() -
     assert "CapBnd:" in healthcheck
     assert "NoNewPrivs:" in healthcheck
     assert "valid = valid && NF == 1" in healthcheck
+    assert "NVIDIA_BUILD_LB_PUBLIC_PORT" in healthcheck
+    assert "urllib.request.Request(" in healthcheck
+    assert "'http://127.0.0.1:2456/health'" in healthcheck
+    assert "headers={'Host': f'127.0.0.1:{port}'}" in healthcheck
+    assert "port.isascii()" in healthcheck
+    assert "port.isdecimal()" in healthcheck
+    assert "not port.startswith('0')" in healthcheck
+    assert 'NBLB_QA_PUBLIC_PORT="$PRIMARY_PORT"' in verify
+    assert 'NBLB_QA_PUBLIC_PORT="$RESTORE_PORT"' in verify
+    assert 'header "Host: 127.0.0.1:$port"' in verify
+    assert 'printf \'header = "Host: 127.0.0.1:%s"\\n\' "$port"' in verify
+    assert '"$CLIENT_DIR/persistence-restore.curl" "$RESTORE_PORT"' in verify
+    assert '"$CLIENT_DIR/admin-next-restore.curl" "$RESTORE_PORT"' in verify
+    assert "Host: 127.0.0.1:2456" not in verify
+
+
+def test_production_keeps_internal_bind_separate_from_public_authority() -> None:
+    production = _text("src/nvidia_build_lb/production.py")
+    compose = _text("compose.yml")
+
+    assert "port=2456" in production
+    assert "port=settings.public_port" not in production
+    assert "127.0.0.1:${NBLB_PORT:-2456}:2456" in compose
+    assert "NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_PORT:-2456}" in compose
 
 
 def test_build_candidate_recipe_owns_evidence_and_cleanup() -> None:
     script = _text("scripts/qa/build-candidate.sh")
+    stage_evidence = _text("scripts/qa/admin-stage-evidence.sh")
 
     assert "manual-qa.json" in script
     assert "adversarial.json" in script
@@ -152,11 +180,146 @@ def test_build_candidate_recipe_owns_evidence_and_cleanup() -> None:
     assert 'docker image rm "$POSTGRES_TAG"' not in script
     assert "curl sha256sum ss uv" in script
     assert "NBLB_QA_PORT" in script
+    assert "export NBLB_QA_PUBLIC_PORT=$QA_PORT" in script
+    assert 'header "Host: 127.0.0.1:$QA_PORT"' in script
+    assert 'printf \'header = "Host: 127.0.0.1:%s"\\n\' "$QA_PORT"' in script
+    assert "Host: 127.0.0.1:2456" not in script
     assert '--argjson qa_port "$QA_PORT"' in script
     assert "qa_port:$qa_port" in script
     assert "compose up --detach --wait" not in script
     assert "wait_bootstrap_degraded" in script
     assert "NBLB_QA_TASK_LABEL" not in script
+    assert 'source "$ROOT/scripts/qa/admin-stage-evidence.sh"' in script
+    assert script.count('write_admin_stage_evidence "$EVIDENCE_DIR"') == 3
+    assert script.count('assert_admin_stage_evidence "$EVIDENCE_DIR"') == 3
+    assert "safe_error_code=unavailable" in stage_evidence
+    assert 'test("^[a-z_]+$")' in stage_evidence
+    assert "safe_error_code=none" in stage_evidence
+    assert "admin-stage-${stage}.json" in stage_evidence
+    assert "response_file" in stage_evidence
+    assert "response_body" not in stage_evidence
+
+
+def test_admin_stage_evidence_persists_only_bounded_safe_results(tmp_path: Path) -> None:
+    bash = shutil.which("bash")
+    assert bash is not None
+    helper = _ROOT / "scripts/qa/admin-stage-evidence.sh"
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    response = tmp_path / "response.json"
+
+    def record(stage: str, expected: str, observed: str, valid: str) -> None:
+        completed = subprocess.run(  # noqa: S603 - resolved shell and fixed helper.
+            [
+                bash,
+                "-c",
+                'source "$1"; write_admin_stage_evidence "$2" "$3" "$4" "$5" "$6" "$7"',
+                "admin-stage-evidence-test",
+                str(helper),
+                str(evidence),
+                stage,
+                expected,
+                observed,
+                valid,
+                str(response),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout == ""
+
+    _ = response.write_text("{}", encoding="utf-8")
+    record("create", "201", "201", "true")
+    success = (evidence / "admin-stage-create.json").read_text(encoding="utf-8")
+    assert (
+        success
+        == json.dumps(
+            {
+                "schema_version": 1,
+                "stage": "create",
+                "expected_http": 201,
+                "observed_http": 201,
+                "contract_valid": True,
+                "safe_error_code": "none",
+                "status": "PASS",
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+    _ = response.write_text(
+        json.dumps(
+            {
+                "error": {
+                    "code": "resource_conflict",
+                    "message": "sensitive detail",
+                    "request_id": "request",
+                }
+            },
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    record("probe", "200", "409", "false")
+    failed = (evidence / "admin-stage-probe.json").read_text(encoding="utf-8")
+    assert (
+        failed
+        == json.dumps(
+            {
+                "schema_version": 1,
+                "stage": "probe",
+                "expected_http": 200,
+                "observed_http": 409,
+                "contract_valid": False,
+                "safe_error_code": "resource_conflict",
+                "status": "FAIL",
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    assert "sensitive detail" not in failed
+    assert "request" not in failed
+
+    _ = response.write_text('{"error":{"code":"NOT_SAFE"}}', encoding="utf-8")
+    record("enable", "204", "000", "false")
+    unavailable = (evidence / "admin-stage-enable.json").read_text(encoding="utf-8")
+    assert (
+        unavailable
+        == json.dumps(
+            {
+                "schema_version": 1,
+                "stage": "enable",
+                "expected_http": 204,
+                "observed_http": None,
+                "contract_valid": False,
+                "safe_error_code": "unavailable",
+                "status": "FAIL",
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def test_build_candidate_probes_before_enable_and_persists_stage_contracts() -> None:
+    script = _text("scripts/qa/build-candidate.sh")
+
+    create = script.index('"http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys")')
+    probe = script.index('"http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys/$key_id/probe")')
+    enable = script.index('"http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys/$key_id/enable")')
+    assert create < probe < enable < script.index("wait_healthy app")
+    assert '.id == $key_id and .enabled == false and .probe_status == "valid"' in script
+    assert 'write_admin_stage_evidence "$EVIDENCE_DIR" create 201' in script
+    assert 'write_admin_stage_evidence "$EVIDENCE_DIR" probe 200' in script
+    assert 'write_admin_stage_evidence "$EVIDENCE_DIR" enable 204' in script
+    assert "admin_upstream_create_contract:true" in script
+    assert "admin_upstream_probe_contract:true" in script
+    assert "admin_upstream_enable_contract:true" in script
+    assert "admin_stage_evidence_persisted:true" in script
 
 
 def test_build_candidate_recipe_owns_deterministic_runtime_gate() -> None:
@@ -206,7 +369,6 @@ def test_build_candidate_recipe_owns_deterministic_runtime_gate() -> None:
     assert script.index("wait_bootstrap_degraded", script.index("COMPOSE_STARTED")) < script.index(
         "upstream.json"
     )
-    assert script.index("/enable") < script.index("wait_healthy app")
     assert "run_postgres_missing_db_secret" in script
     assert "prestart_failed:source_missing" in script
     assert "missing_app_database_secret_exit" in script

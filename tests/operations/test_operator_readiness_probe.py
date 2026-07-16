@@ -37,11 +37,11 @@ from tests.ui.fake_admin_state import FakeAdminState
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts/operator_readiness_probe.py"
 _ISOLATED_PYTHON = Path("/usr/bin/python3")
 _TOKEN = "nblb_admin_" + ("a" * 64)
-_CANONICAL_HOST = "127.0.0.1:2456"
 _OVERSIZED_BODY_BYTES = 2 * 1024 * 1024 + 1
 
 
 class _LegacyOverviewHandler(BaseHTTPRequestHandler):
+    expected_host: ClassVar[str] = ""
     readiness_payload: ClassVar[bytes | None] = None
     overview_payload: ClassVar[bytes] = b""
     observed_paths: ClassVar[list[str]] = []
@@ -60,7 +60,7 @@ class _LegacyOverviewHandler(BaseHTTPRequestHandler):
         type(self).observed_hosts.append(self.headers.get("Host"))
         if self.headers.get("Authorization") != "Bearer " + _TOKEN:
             self._respond(401, b"{}")
-        elif self.headers.get("Host") != _CANONICAL_HOST:
+        elif self.headers.get("Host") != type(self).expected_host:
             self._respond(403, b"{}")
         elif self.path == "/admin/api/v1/operator-readiness":
             readiness = type(self).readiness_payload
@@ -80,8 +80,10 @@ class _LegacyOverviewHandler(BaseHTTPRequestHandler):
 
 
 class _SlowBodyHandler(BaseHTTPRequestHandler):
+    expected_host: ClassVar[str] = ""
+
     def do_GET(self) -> None:
-        if self.headers.get("Host") != _CANONICAL_HOST:
+        if self.headers.get("Host") != type(self).expected_host:
             self.send_error(403)
             return
         payload = b"slow"
@@ -457,9 +459,17 @@ def test_cli_separates_invalid_arguments_from_token_or_runtime_failure(tmp_path:
         (("runtime", "not-a-port", missing_token), 64),
         (("runtime", "0", missing_token), 64),
         (("runtime", "65536", missing_token), 64),
+        (("runtime", "02456", missing_token), 64),
+        (("runtime", "+2456", missing_token), 64),
+        (("runtime", " 2456", missing_token), 64),
+        (("runtime", "2456 ", missing_token), 64),
+        (("runtime", "2_456", missing_token), 64),
+        (("runtime", "\uff12\uff14\uff15\uff16", missing_token), 64),
         (("runtime", "2456", missing_token, "not-a-container"), 64),
         (("ledger-capacity", "2456", missing_token, "a" * 64), 64),
+        (("runtime", "1", missing_token), 1),
         (("runtime", "2456", missing_token), 1),
+        (("runtime", "65535", missing_token), 1),
     )
 
     for arguments, expected in cases:
@@ -478,7 +488,7 @@ def _run_host_probe(
     tmp_path: Path,
     *,
     readiness_payload: bytes | None = None,
-) -> subprocess.CompletedProcess[str]:
+) -> tuple[subprocess.CompletedProcess[str], str]:
     _LegacyOverviewHandler.readiness_payload = readiness_payload
     _LegacyOverviewHandler.overview_payload = (
         _dashboard().overview.model_dump_json().encode("utf-8")
@@ -491,6 +501,8 @@ def _run_host_probe(
     token_file.chmod(0o600)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _LegacyOverviewHandler)
     assert server.server_port != 2456
+    expected_host = f"127.0.0.1:{server.server_port}"
+    _LegacyOverviewHandler.expected_host = expected_host
     thread = Thread(target=server.serve_forever, daemon=False)
     thread.start()
     try:
@@ -511,14 +523,14 @@ def _run_host_probe(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-    return completed
+    return completed, expected_host
 
 
 def test_host_probe_executes_stable_legacy_fallback_without_target_module(
     tmp_path: Path,
 ) -> None:
     assert _ISOLATED_PYTHON.is_file()
-    completed = _run_host_probe(tmp_path)
+    completed, expected_host = _run_host_probe(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == ""
@@ -527,19 +539,19 @@ def test_host_probe_executes_stable_legacy_fallback_without_target_module(
         "/admin/api/v1/operator-readiness",
         "/admin/api/v1/overview",
     ]
-    assert _LegacyOverviewHandler.observed_hosts == [_CANONICAL_HOST] * 2
+    assert _LegacyOverviewHandler.observed_hosts == [expected_host] * 2
 
 
 def test_host_probe_uses_only_bounded_current_endpoint(
     tmp_path: Path,
 ) -> None:
-    completed = _run_host_probe(tmp_path, readiness_payload=_readiness())
+    completed, expected_host = _run_host_probe(tmp_path, readiness_payload=_readiness())
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout == ""
     assert completed.stderr == ""
     assert _LegacyOverviewHandler.observed_paths == ["/admin/api/v1/operator-readiness"]
-    assert _LegacyOverviewHandler.observed_hosts == [_CANONICAL_HOST]
+    assert _LegacyOverviewHandler.observed_hosts == [expected_host]
 
 
 @pytest.mark.parametrize(("repeated_status", "expected"), [(200, True), (503, False)])
@@ -662,6 +674,7 @@ def test_container_generation_uses_only_filtered_bounded_docker_inspect(
 
 def test_host_request_has_absolute_deadline_against_slow_body() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _SlowBodyHandler)
+    _SlowBodyHandler.expected_host = f"127.0.0.1:{server.server_port}"
     thread = Thread(target=server.serve_forever, daemon=False)
     thread.start()
     started = monotonic()

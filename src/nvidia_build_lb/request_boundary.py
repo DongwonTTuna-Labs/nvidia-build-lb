@@ -10,13 +10,12 @@ from fastapi import Request, Response
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-_ACCEPTED_HOST: Final = "127.0.0.1:2456"
-_ACCEPTED_ORIGIN: Final = "http://127.0.0.1:2456"
 _CSP: Final = (
     "default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; "
     "frame-ancestors 'none'; img-src 'self'; object-src 'none'; script-src 'self'; "
     "style-src 'self'"
 )
+_MAX_PORT: Final = 65_535
 SECURITY_HEADERS: Final[Mapping[str, str]] = MappingProxyType(
     {
         "Cache-Control": "no-store",
@@ -73,10 +72,16 @@ class RequestBoundaryMiddleware:
     """Terminate Host and Origin failures before auth or route dispatch."""
 
     _app: ASGIApp
+    _accepted_host: str
+    _accepted_origin: str
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, *, accepted_port: int = 2456) -> None:
         """Bind the request boundary around the inner application."""
+        if type(accepted_port) is not int or not 1 <= accepted_port <= _MAX_PORT:
+            raise ValueError
         self._app = app
+        self._accepted_host = f"127.0.0.1:{accepted_port}"
+        self._accepted_origin = f"http://{self._accepted_host}"
 
     async def __call__(
         self,
@@ -90,12 +95,12 @@ class RequestBoundaryMiddleware:
             return
         request = Request(scope, receive=receive)
         path = request.url.path
-        if not _single_exact(request.headers.getlist("host"), _ACCEPTED_HOST):
+        if not _single_exact(request.headers.getlist("host"), self._accepted_host):
             response = _forbidden(path, "host_forbidden", "request host is forbidden")
             await response(scope, receive, send)
             return
         origins = request.headers.getlist("origin")
-        if origins and not _single_exact(origins, _ACCEPTED_ORIGIN):
+        if origins and not _single_exact(origins, self._accepted_origin):
             response = _forbidden(path, "origin_forbidden", "request origin is forbidden")
             await response(scope, receive, send)
             return

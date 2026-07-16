@@ -27,13 +27,13 @@ _ADMIN_PREFIX = "nblb_admin_"
 _ADMIN_HEX_LENGTH = 64
 _TOKEN_MODE = 0o600
 _MAX_PORT = 65_535
+_MAX_PORT_TEXT_LENGTH = 5
 _MAX_COUNTER = 9_223_372_036_854_775_807
 _MAX_LABEL_SCALARS = 128
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _REQUEST_DEADLINE_SECONDS = 2.0
 _LEGACY_STABILITY_SECONDS = 30.0
-_CANONICAL_HOST = "127.0.0.1:2456"
 _DOCKER_EXECUTABLE = "/usr/bin/docker"
 _GENERATION_DEADLINE_SECONDS = 2.0
 _GENERATION_FIELD_COUNT = 2
@@ -47,7 +47,7 @@ _TIMESTAMP_TIME = r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,6})?Z\Z"
 _TIMESTAMP = re.compile(f"{_TIMESTAMP_DATE}{_TIMESTAMP_TIME}")
 _CONTAINER_ID = re.compile(r"[0-9a-f]{64}\Z")
 _CONTAINER_STARTED_AT = re.compile(
-    f"{_TIMESTAMP_DATE}" r"T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?Z\Z"
+    rf"{_TIMESTAMP_DATE}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{{1,9}})?Z\Z"
 )
 
 _OPERATOR_READINESS_KEYS = frozenset(
@@ -801,7 +801,9 @@ def legacy_runtime_confirmed(
     overview = _json_object(payload)
     if overview is None or overview["ready"] is True:
         return overview is not None
-    generation_before = None if container_id is None else container_generation(container_id)
+    if container_id is None:
+        return False
+    generation_before = container_generation(container_id)
     if generation_before is None:
         return False
     sleep(_LEGACY_STABILITY_SECONDS)
@@ -840,7 +842,7 @@ def _deadline_expired(_signal_number: int, _frame: object | None) -> None:
 
 
 def operator_http_request(port: int, token: str, path: str) -> tuple[int, bytes]:
-    """Read one bounded canonical-host operator response without logging it."""
+    """Read one bounded configured-loopback response without logging it."""
     previous_handler = signal.signal(signal.SIGALRM, _deadline_expired)
     started = monotonic()
     previous_timer = signal.setitimer(signal.ITIMER_REAL, _REQUEST_DEADLINE_SECONDS)
@@ -855,7 +857,7 @@ def operator_http_request(port: int, token: str, path: str) -> tuple[int, bytes]
             path,
             headers={
                 "Authorization": "Bearer " + token,
-                "Host": _CANONICAL_HOST,
+                "Host": f"127.0.0.1:{port}",
             },
         )
         response = connection.getresponse()
@@ -890,16 +892,28 @@ def operator_http_request(port: int, token: str, path: str) -> tuple[int, bytes]
             )
 
 
+def _parse_port(value: str) -> int | None:
+    if (
+        not 1 <= len(value) <= _MAX_PORT_TEXT_LENGTH
+        or not value.isascii()
+        or not value.isdecimal()
+        or value.startswith("0")
+    ):
+        return None
+    port = int(value)
+    return port if port <= _MAX_PORT else None
+
+
 def main() -> int:
     """Run one local probe without emitting bearer or response data."""
     if len(sys.argv) not in _ARGUMENT_COUNTS:
         return _INPUT_ERROR
     try:
         mode = OperatorProbeMode(sys.argv[1])
-        port = int(sys.argv[2])
     except ValueError:
         return _INPUT_ERROR
-    if port < 1 or port > _MAX_PORT:
+    port = _parse_port(sys.argv[2])
+    if port is None:
         return _INPUT_ERROR
     container_id = sys.argv[4] if len(sys.argv) == _RUNTIME_WITH_GENERATION_ARGUMENT_COUNT else None
     if container_id is not None and (

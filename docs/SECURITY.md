@@ -2,8 +2,8 @@
 
 ## Trust boundaries
 
-- The admin UI and API are host-loopback only. Exact Host and Origin checks run
-  before credential parsing; CORS is not enabled.
+- The admin UI and API are host-loopback only. Exact Host and Origin checks use
+  the same validated published port before credential parsing; CORS is not enabled.
 - Downstream clients receive scoped digest-only credentials. `models:read` and
   `chat:write` are independently enforced before request counters or upstream
   I/O.

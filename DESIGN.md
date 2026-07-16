@@ -267,9 +267,13 @@ as durable success. A post-recreation image, capacity, CAS, signal, or commit
 failure withdraws the app, and the same operation can reenter that stopped
 same-image state. Permanent evidence blockers never enter this path. Backup,
 restore, and rollback use the same target-image-independent host checker in
-runtime-only mode. Each request uses the canonical service `Host` independently
-of the host connection port, a two-second absolute deadline, and a 2 MiB body
-cap. Current images expose an authenticated, fixed four-field
+runtime-only mode. Each request uses the exact configured loopback authority as
+its `Host`: ordinary production is fixed to `127.0.0.1:2456`, while an isolated
+restore uses its separately validated alternate port. The container healthcheck
+connects to the internal app port but sends that same configured authority, so
+Docker health and the external operator probe cannot disagree. Requests retain
+a two-second absolute deadline and a 2 MiB body cap. Current images expose an
+authenticated, fixed four-field
 `GET /admin/api/v1/operator-readiness` DTO containing only `runtime_state`,
 `readiness_cause`, `ledger_status`, and `capacity_blocker`. Its repeatable-read
 query reads the ledger singleton, the three admission counts, and one eligible-

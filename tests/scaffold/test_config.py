@@ -44,6 +44,7 @@ def test_settings_return_only_safe_metadata_when_secret_files_are_valid(
     assert metadata.model == NVIDIA_MODEL
     assert metadata.stage is DeploymentStage.PRODUCTION
     assert metadata.log_level is LogLevel.INFO
+    assert metadata.public_port == 2456
     assert metadata.secret_files_loaded is True
     serialized = metadata.model_dump_json()
     assert "nblb_admin_" not in serialized
@@ -57,6 +58,7 @@ def test_settings_source_accepts_compose_decimal_environment_values(
         "ADMIN_EVENT_MAX_ROWS": 200_000,
         "ADMIN_ATTEMPT_MAX_ROWS": 80_000,
         "ADMIN_LEDGER_PRUNE_BATCH_SIZE": 2_000,
+        "PUBLIC_PORT": 32_458,
     }
     for name, value in values.items():
         monkeypatch.setenv(f"NVIDIA_BUILD_LB_{name}", str(value))
@@ -66,6 +68,17 @@ def test_settings_source_accepts_compose_decimal_environment_values(
     assert source.admin_event_max_rows == values["ADMIN_EVENT_MAX_ROWS"]
     assert source.admin_attempt_max_rows == values["ADMIN_ATTEMPT_MAX_ROWS"]
     assert source.admin_ledger_prune_batch_size == values["ADMIN_LEDGER_PRUNE_BATCH_SIZE"]
+    assert source.public_port == values["PUBLIC_PORT"]
+
+
+@pytest.mark.parametrize("value", ["1", "65535"])
+def test_settings_source_accepts_public_port_range_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("NVIDIA_BUILD_LB_PUBLIC_PORT", value)
+
+    assert SettingsSource().public_port == int(value)
 
 
 @pytest.mark.parametrize(
@@ -77,6 +90,14 @@ def test_settings_source_accepts_compose_decimal_environment_values(
         ("ADMIN_EVENT_MAX_ROWS", "+1000"),
         ("ADMIN_EVENT_MAX_ROWS", " 1000"),
         ("ADMIN_EVENT_MAX_ROWS", "\uff11\uff10\uff10\uff10"),
+        ("PUBLIC_PORT", "02456"),
+        ("PUBLIC_PORT", "+2456"),
+        ("PUBLIC_PORT", "0"),
+        ("PUBLIC_PORT", "65536"),
+        ("PUBLIC_PORT", " 2456"),
+        ("PUBLIC_PORT", "2456 "),
+        ("PUBLIC_PORT", "2_456"),
+        ("PUBLIC_PORT", "\uff12\uff14\uff15\uff16"),
     ],
 )
 def test_settings_source_rejects_noncanonical_compose_integers(

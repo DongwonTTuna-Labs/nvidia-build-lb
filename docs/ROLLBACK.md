@@ -80,8 +80,9 @@ ROLLBACK_APP_MUST_WITHDRAW=0
 trap - EXIT HUP INT TERM
 ```
 
-The authenticated runtime probe sends the canonical service `Host` even when a
-different host port is used. A current image must return the exact bounded
+The authenticated runtime probe uses one configured loopback authority. Its
+selected connection port and `Host` port are identical. A current image must
+return the exact bounded
 `operator-readiness` DTO. Only an `operator-readiness` `404` permits the exact
 legacy-overview path; a legacy ready result passes immediately, while a
 degraded/no-key result must remain exact on the same container ID and

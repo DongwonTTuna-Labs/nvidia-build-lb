@@ -1,15 +1,25 @@
 """Production maintenance join and engine-disposal ownership contracts."""
 
+from typing import NoReturn
 from uuid import UUID
 
 import anyio
 import pytest
 from pydantic import SecretBytes, SecretStr
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 import nvidia_build_lb.service_epoch as service_epoch_module
 from nvidia_build_lb import production_graph
+from nvidia_build_lb.active_routed_requests import ActiveRoutedRequestRegistry
+from nvidia_build_lb.admin_ledger import AdminLedger, AdminLedgerPolicy
+from nvidia_build_lb.api_types import ApplicationServices
 from nvidia_build_lb.config import DeploymentStage, LogLevel, Settings
+from nvidia_build_lb.credential_types import Clock
 from nvidia_build_lb.main import create_app
 from nvidia_build_lb.production_graph import ProductionResources
 from nvidia_build_lb.runtime_readiness import RuntimeReadinessGate
@@ -31,6 +41,7 @@ def _settings() -> Settings:
         admin_token=SecretStr(f"nblb_admin_{'a' * 64}"),
         stage=DeploymentStage.PRODUCTION,
         log_level=LogLevel.INFO,
+        public_port=2456,
         admin_read_deadline_seconds=5,
         admin_mutation_deadline_seconds=125,
         admin_event_retention_days=30,
@@ -167,7 +178,21 @@ async def test_graph_assembly_failure_retires_every_started_resource_in_order(  
     async def start_maintenance(*_args: object) -> tuple[object, object]:
         return _MaintenanceScope(), _MaintenanceJoined()
 
-    def fail_app(_services: object) -> None:
+    captured_ledgers: list[AdminLedger] = []
+
+    def capture_ledger(
+        sessions: async_sessionmaker[AsyncSession],
+        clock: Clock,
+        policy: AdminLedgerPolicy,
+        active_requests: ActiveRoutedRequestRegistry,
+    ) -> AdminLedger:
+        ledger = AdminLedger(sessions, clock, policy, active_requests)
+        captured_ledgers.append(ledger)
+        return ledger
+
+    def fail_app(services: ApplicationServices) -> NoReturn:
+        assert len(captured_ledgers) == 1
+        assert services.active_requests is captured_ledgers[0].active_requests
         raise RuntimeError(_ASSEMBLY_FAILURE)
 
     def create_test_engine(_url: SecretStr) -> _Engine:
@@ -188,6 +213,7 @@ async def test_graph_assembly_failure_retires_every_started_resource_in_order(  
     monkeypatch.setattr(production_graph, "ensure_vault_key_binding", bound)
     monkeypatch.setattr(production_graph, "SanitizedAsyncClient", _ClientFactory)
     monkeypatch.setattr(production_graph, "NvidiaHostedAdapter", create_test_adapter)
+    monkeypatch.setattr(production_graph, "AdminLedger", capture_ledger)
     monkeypatch.setattr(
         service_epoch_module,
         "ServiceEpochCoordinator",

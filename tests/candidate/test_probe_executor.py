@@ -1,7 +1,7 @@
 """Production admin probe maps only durable routed outcomes."""
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import override
 from uuid import UUID
@@ -47,6 +47,9 @@ class _Upstream:
 @dataclass(frozen=True, slots=True)
 class _FailureRouter:
     status_code: int
+
+    async def cancel_unhanded_stream(self, routed: RoutedStream) -> None:
+        await routed.terminal.stream.aclose()
 
     async def execute(
         self,
@@ -100,8 +103,14 @@ def _stream_terminal() -> StreamTerminal:
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _StreamRouter:
+    cancelled: list[RoutedStream] = field(default_factory=list)
+
+    async def cancel_unhanded_stream(self, routed: RoutedStream) -> None:
+        self.cancelled.append(routed)
+        await routed.terminal.stream.aclose()
+
     async def execute(
         self,
         *,
@@ -150,6 +159,19 @@ class _Responders:
     def create(self, stream_log: StreamLogContext | None = None) -> ChatStreamResponder:
         assert stream_log == StreamLogContext(_KEY_ID, 1)
         return _StatusResponder(self.status)
+
+
+class _ResponderConstructionError(Exception):
+    """Synthetic probe responder-construction failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class _FailingResponders:
+    error: _ResponderConstructionError
+
+    def create(self, stream_log: StreamLogContext | None = None) -> ChatStreamResponder:
+        del stream_log
+        raise self.error
 
 
 async def test_probe_success_is_projected_as_valid() -> None:
@@ -208,3 +230,18 @@ async def test_streamed_probe_uses_durable_terminal_status(
 
     assert result.probe_status is expected
     assert upstream.observed == [expected]
+
+
+async def test_streamed_probe_cancels_when_responder_construction_fails() -> None:
+    router = _StreamRouter()
+    error = _ResponderConstructionError()
+
+    with pytest.raises(_ResponderConstructionError) as captured:
+        _ = await RoutingProbeExecutor(
+            router,
+            _Upstream([]),
+            _FailingResponders(error),
+        ).probe(_KEY_ID, "stream-probe-construction-failure")
+
+    assert captured.value is error
+    assert len(router.cancelled) == 1

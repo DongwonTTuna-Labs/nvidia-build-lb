@@ -103,7 +103,7 @@ class RoutingCoordinator:
                 await checkpoint_if_cancelled()
             except anyio.get_cancelled_exc_class():
                 if isinstance(handled, RoutedStream):
-                    await self._cancel_stream_before_handoff(handled, started_monotonic)
+                    await self.cancel_unhanded_stream(handled)
                 raise
             if not isinstance(handled, FailureTerminal):
                 return observations.completed(handled, lease, attempt_count)
@@ -206,14 +206,10 @@ class RoutingCoordinator:
         fail_stop_after_terminal(self.dependencies, committed)
         return committed
 
-    async def _cancel_stream_before_handoff(
-        self,
-        routed: RoutedStream,
-        started_monotonic: float,
-    ) -> None:
+    async def cancel_unhanded_stream(self, routed: RoutedStream) -> None:
         """Persist cancellation and retire a stream that was never handed off."""
         try:
-            await self._finalize_cancelled(routed.lease, started_monotonic)
+            await self._finalize_cancelled(routed.lease, routed.started_monotonic)
         finally:
             with suppress(BaseException):
                 await routed.terminal.stream.aclose()

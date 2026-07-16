@@ -5,6 +5,9 @@ umask 077
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 
+# shellcheck source=scripts/qa/admin-stage-evidence.sh
+source "$ROOT/scripts/qa/admin-stage-evidence.sh"
+
 EVIDENCE_DIR=${EVIDENCE_DIR:-.omo/evidence/task-6a-nvidia-build-lb}
 QA_PORT=${NBLB_QA_PORT:-32456}
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -138,6 +141,7 @@ CLIENT_DIR=$(mktemp -d /tmp/nblb-todo6a-client.XXXXXX)
 export NBLB_QA_RUN_ID=$RUN_ID
 export NBLB_QA_SECRET_DIR=$SECRET_DIR
 export NBLB_QA_PORT=$QA_PORT
+export NBLB_QA_PUBLIC_PORT=$QA_PORT
 export NBLB_POSTGRES_IMAGE=$POSTGRES_TAG
 
 source_manifest() {
@@ -222,7 +226,7 @@ wait_process_owner() {
 wait_bootstrap_degraded() {
     for _ in $(seq 1 60); do
         status=$(curl --silent \
-            --header 'Host: 127.0.0.1:2456' \
+            --header "Host: 127.0.0.1:$QA_PORT" \
             --output "$CLIENT_DIR/bootstrap-health.json" \
             --write-out '%{http_code}' \
             "http://127.0.0.1:$QA_PORT/health" 2>/dev/null || true)
@@ -238,7 +242,7 @@ wait_bootstrap_degraded() {
 
 safe_curl() {
     curl --silent --show-error --fail-with-body \
-        --header 'Host: 127.0.0.1:2456' \
+        --header "Host: 127.0.0.1:$QA_PORT" \
         "$@"
 }
 
@@ -471,22 +475,78 @@ docker run --rm --network none \
     -c 'cp /secrets/admin_token /client/admin_token && chown "$1:$2" /client/admin_token && chmod 0600 /client/admin_token' \
     sh "$(id -u)" "$(id -g)"
 {
-    printf '%s\n' 'header = "Host: 127.0.0.1:2456"'
+    printf 'header = "Host: 127.0.0.1:%s"\n' "$QA_PORT"
     printf '%s' 'header = "Authorization: Bearer '
     tr -d '\n' < "$CLIENT_DIR/admin_token"
     printf '%s\n' '"'
 } > "$CLIENT_DIR/admin.curl"
 
 printf '%s' '{"key":"nvapi-synthetic-candidate-key"}' > "$CLIENT_DIR/upstream.json"
-curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin.curl" \
+create_response=$CLIENT_DIR/upstream-response.json
+: > "$create_response"
+set +e
+create_http=$(curl --silent --show-error --config "$CLIENT_DIR/admin.curl" \
     --request POST --header 'Content-Type: application/json' \
     --data-binary "@$CLIENT_DIR/upstream.json" \
-    --output "$CLIENT_DIR/upstream-response.json" \
-    "http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys"
-key_id=$(jq -er '.id' "$CLIENT_DIR/upstream-response.json")
-curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin.curl" \
-    --request POST --output /dev/null \
-    "http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys/$key_id/enable"
+    --output "$create_response" --write-out '%{http_code}' \
+    "http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys")
+create_curl_status=$?
+set -e
+create_contract_valid=false
+if [ "$create_curl_status" -eq 0 ] && [ "$create_http" = 201 ] && jq -e '
+    (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))
+    and (.fingerprint | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+    and .enabled == false
+    and .routing_state == "disabled"
+    and .health_state == "unknown"
+' "$create_response" >/dev/null 2>&1; then
+    create_contract_valid=true
+fi
+write_admin_stage_evidence "$EVIDENCE_DIR" create 201 "$create_http" \
+    "$create_contract_valid" "$create_response"
+[ "$create_contract_valid" = true ] || exit 1
+key_id=$(jq -er '.id' "$create_response")
+printf '%s\n' 'qa_stage=key_created'
+
+probe_response=$CLIENT_DIR/upstream-probe-response.json
+: > "$probe_response"
+set +e
+probe_http=$(curl --silent --show-error --config "$CLIENT_DIR/admin.curl" \
+    --request POST --output "$probe_response" --write-out '%{http_code}' \
+    "http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys/$key_id/probe")
+probe_curl_status=$?
+set -e
+probe_contract_valid=false
+if [ "$probe_curl_status" -eq 0 ] && [ "$probe_http" = 200 ] && jq -e \
+    --arg key_id "$key_id" \
+    '.id == $key_id and .enabled == false and .probe_status == "valid" and (.observed_at | type == "string")' \
+    "$probe_response" >/dev/null 2>&1; then
+    probe_contract_valid=true
+fi
+write_admin_stage_evidence "$EVIDENCE_DIR" probe 200 "$probe_http" \
+    "$probe_contract_valid" "$probe_response"
+[ "$probe_contract_valid" = true ] || exit 1
+printf '%s\n' 'qa_stage=key_probed_valid'
+
+enable_response=$CLIENT_DIR/upstream-enable-response.bin
+: > "$enable_response"
+set +e
+enable_http=$(curl --silent --show-error --config "$CLIENT_DIR/admin.curl" \
+    --request POST --output "$enable_response" --write-out '%{http_code}' \
+    "http://127.0.0.1:$QA_PORT/admin/api/v1/upstream-keys/$key_id/enable")
+enable_curl_status=$?
+set -e
+enable_contract_valid=false
+if [ "$enable_curl_status" -eq 0 ] && [ "$enable_http" = 204 ] \
+    && [ ! -s "$enable_response" ]; then
+    enable_contract_valid=true
+fi
+write_admin_stage_evidence "$EVIDENCE_DIR" enable 204 "$enable_http" \
+    "$enable_contract_valid" "$enable_response"
+[ "$enable_contract_valid" = true ] || exit 1
+assert_admin_stage_evidence "$EVIDENCE_DIR" create 201
+assert_admin_stage_evidence "$EVIDENCE_DIR" probe 200
+assert_admin_stage_evidence "$EVIDENCE_DIR" enable 204
 printf '%s\n' 'qa_stage=key_enabled'
 wait_healthy app
 printf '%s\n' 'qa_stage=app_healthy'
@@ -509,7 +569,7 @@ curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin.curl" \
 jq -er '.token' "$CLIENT_DIR/downstream-response.json" > "$CLIENT_DIR/downstream-token"
 rm -f "$CLIENT_DIR/downstream-response.json"
 {
-    printf '%s\n' 'header = "Host: 127.0.0.1:2456"'
+    printf 'header = "Host: 127.0.0.1:%s"\n' "$QA_PORT"
     printf '%s' 'header = "Authorization: Bearer '
     tr -d '\n' < "$CLIENT_DIR/downstream-token"
     printf '%s\n' '"'
@@ -636,7 +696,7 @@ jq -n \
     --arg image_digest "$image_digest" \
     --arg postgres_image_digest "$postgres_image_digest" \
     --arg key_id "$key_id" \
-    '{schema_version:2,status:"PASS",source_tree_sha256:$source_sha256,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,checks:{candidate_build:true,postgres_candidate_build:true,compose_render:true,migration:true,app_healthy:true,database_healthy:true,fake_upstream_healthy:true,loopback_proxy_healthy:true,healthcheck_identity_self_verified:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,synthetic_internal_key_id:$key_id,app_uid:65532,database_uid:70,fake_upstream_uid:65532,loopback_proxy_uid:65532,capabilities_effective_cleared:true,capabilities_bounding_cleared:true,steady_state_no_new_privileges:true,supplementary_groups_cleared:true,runtime_secret_mode_0400:true,runtime_secret_content_exact:true,canonical_secret_mode_0600:true,tmpfs_runtime:true,app_internal_network_only:true,loopback_proxy_dual_homed:true,restart_persistence:true,tmpfs_repopulated:true,restart_runtime_secret_content_exact:true}}' \
+    '{schema_version:2,status:"PASS",source_tree_sha256:$source_sha256,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,checks:{candidate_build:true,postgres_candidate_build:true,compose_render:true,migration:true,admin_upstream_create_contract:true,admin_upstream_probe_contract:true,admin_upstream_enable_contract:true,admin_stage_evidence_persisted:true,app_healthy:true,database_healthy:true,fake_upstream_healthy:true,loopback_proxy_healthy:true,healthcheck_identity_self_verified:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,synthetic_internal_key_id:$key_id,app_uid:65532,database_uid:70,fake_upstream_uid:65532,loopback_proxy_uid:65532,capabilities_effective_cleared:true,capabilities_bounding_cleared:true,steady_state_no_new_privileges:true,supplementary_groups_cleared:true,runtime_secret_mode_0400:true,runtime_secret_content_exact:true,canonical_secret_mode_0600:true,tmpfs_runtime:true,app_internal_network_only:true,loopback_proxy_dual_homed:true,restart_persistence:true,tmpfs_repopulated:true,restart_runtime_secret_content_exact:true}}' \
     > "$EVIDENCE_DIR/manual-qa.json"
 jq -n \
     --argjson missing_admin "$missing_admin_status" \

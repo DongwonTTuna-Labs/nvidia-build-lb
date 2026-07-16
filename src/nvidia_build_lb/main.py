@@ -58,7 +58,10 @@ def create_app(services: ApplicationServices | None = None) -> SafeServerErrorFa
             authenticators=services.credentials.authenticators,
         )
     application.add_middleware(RequestIdMiddleware)
-    application.add_middleware(RequestBoundaryMiddleware)
+    application.add_middleware(
+        RequestBoundaryMiddleware,
+        accepted_port=services.public_port if services is not None else 2456,
+    )
     return application
 
 

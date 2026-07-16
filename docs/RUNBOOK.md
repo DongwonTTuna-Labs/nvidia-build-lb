@@ -31,7 +31,7 @@ export NBLB_RUNTIME_CONFIG_FILE=/etc/nvidia-build-lb/runtime.env
 sudo install -d -o root -g root -m 0755 /etc/nvidia-build-lb
 sudo test ! -e /etc/nvidia-build-lb/runtime.env.lock
 sudo install -o root -g root -m 0644 /dev/null /etc/nvidia-build-lb/runtime.env.lock
-sudo env APP_DIGEST="$APP_REGISTRY_DIGEST" POSTGRES_DIGEST="$POSTGRES_REGISTRY_DIGEST" sh -c '
+sudo env APP_DIGEST="$NBLB_APP_REGISTRY_DIGEST" POSTGRES_DIGEST="$NBLB_POSTGRES_REGISTRY_DIGEST" sh -c '
   set -eu
   tmp=$(mktemp /etc/nvidia-build-lb/.runtime.env.XXXXXX)
   trap '\''rm -f -- "$tmp"'\'' EXIT HUP INT TERM

@@ -31,6 +31,7 @@ from nvidia_build_lb.polling import FailureTerminal
 from nvidia_build_lb.routing import (
     RoutedFailure,
     RoutedResult,
+    RoutedStream,
     RoutingCoordinator,
     RoutingCoordinatorDependencies,
 )
@@ -76,6 +77,10 @@ class ScenarioRouter:
     def fail_with(self, signal: SourceSignal, retry_after_seconds: int | None = None) -> None:
         """Make the next routed call return one closed safe outcome."""
         self._failure = (signal, retry_after_seconds)
+
+    async def cancel_unhanded_stream(self, routed: RoutedStream) -> None:
+        """Delegate abandoned stream retirement to the wrapped router."""
+        await self._normal.cancel_unhanded_stream(routed)
 
     async def execute(
         self,

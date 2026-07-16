@@ -15,6 +15,9 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    outputs:
+      app_registry_digest: ${{ steps.publish.outputs.app_registry_digest }}
+      postgres_registry_digest: ${{ steps.publish.outputs.postgres_registry_digest }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -59,7 +62,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Tag and publish only the scanned local image IDs
+      - name: Tag, publish, and bind deployable registry digests
+        id: publish
         shell: bash
         env:
           APP_DIGEST: ${{ steps.candidate.outputs.app }}
@@ -74,3 +78,26 @@ jobs:
           docker tag "$POSTGRES_DIGEST" "$postgres_ref"
           docker push "$app_ref"
           docker push "$postgres_ref"
+          receipt_dir=$(mktemp -d "${RUNNER_TEMP}/registry-receipts.XXXXXX")
+          cleanup_receipts() {
+            rm -f -- "$receipt_dir/app.json" "$receipt_dir/postgres.json"
+            rmdir -- "$receipt_dir"
+          }
+          trap cleanup_receipts EXIT
+          docker buildx imagetools inspect "$app_ref" --raw > "$receipt_dir/app.json"
+          docker buildx imagetools inspect "$postgres_ref" --raw \
+            > "$receipt_dir/postgres.json"
+          app_registry_digest=$(uv run python -m scripts.qa.registry_manifest_digest \
+            --manifest "$receipt_dir/app.json" --expected-image-id "$APP_DIGEST")
+          postgres_registry_digest=$(uv run python -m scripts.qa.registry_manifest_digest \
+            --manifest "$receipt_dir/postgres.json" --expected-image-id "$POSTGRES_DIGEST")
+          printf '%s\n' \
+            "app_registry_digest=$app_registry_digest" \
+            "postgres_registry_digest=$postgres_registry_digest" >> "$GITHUB_OUTPUT"
+          {
+            printf '%s\n' '### Immutable deployment digests' '```text'
+            printf '%s\n' \
+              "NBLB_APP_REGISTRY_DIGEST=$app_registry_digest" \
+              "NBLB_POSTGRES_REGISTRY_DIGEST=$postgres_registry_digest"
+            printf '%s\n' '```'
+          } >> "$GITHUB_STEP_SUMMARY"

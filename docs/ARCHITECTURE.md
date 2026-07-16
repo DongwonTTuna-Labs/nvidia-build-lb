@@ -595,11 +595,12 @@ For every framework-parseable non-`OPTIONS` request, checks run in this order:
 Host -> Origin -> auth/authorization or explicit unauthenticated no-op -> route
 ```
 
-The sole accepted authority is exactly `127.0.0.1:2456`. Missing, duplicate,
+Normal production accepts exactly `127.0.0.1:2456`; an explicit isolated
+restore accepts its validated alternate loopback port. Missing, duplicate,
 comma-joined, or different Host is `403 host_forbidden` before credentials are
-parsed. If Origin is present, it must be exactly
-`http://127.0.0.1:2456`. `null`, duplicate/comma-joined, HTTPS, or any other
-origin is `403 origin_forbidden`. Origin-less CLI calls and top-level browser
+parsed. If Origin is present, it must use that same exact HTTP authority.
+`null`, duplicate/comma-joined, HTTPS, or any other origin is
+`403 origin_forbidden`. Origin-less CLI calls and top-level browser
 navigation remain allowed after Host validation.
 
 Every `OPTIONS` request terminates at:

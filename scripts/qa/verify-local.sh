@@ -5,6 +5,9 @@ umask 077
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 
+# shellcheck source=scripts/qa/admin-stage-evidence.sh
+source "$ROOT/scripts/qa/admin-stage-evidence.sh"
+
 EVIDENCE_DIR=${EVIDENCE_DIR:-.omo/evidence/task-7-nvidia-build-lb}
 IMAGE_DIGEST=${IMAGE_DIGEST:-}
 POSTGRES_IMAGE_DIGEST=${POSTGRES_IMAGE_DIGEST:-}
@@ -36,6 +39,7 @@ primary_compose() {
     NBLB_QA_RUN_ID="$RUN_ID" \
     NBLB_QA_SECRET_DIR="$PRIMARY_SECRET_DIR" \
     NBLB_QA_PORT="$PRIMARY_PORT" \
+    NBLB_QA_PUBLIC_PORT="$PRIMARY_PORT" \
     NBLB_POSTGRES_IMAGE="$POSTGRES_IMAGE_DIGEST" \
     NBLB_CANDIDATE_IMAGE="$IMAGE_DIGEST" \
     NBLB_BACKUP_SOURCE=true \
@@ -47,6 +51,7 @@ restore_compose() {
     NBLB_QA_RUN_ID="$RUN_ID" \
     NBLB_QA_SECRET_DIR="$RESTORE_SECRET_DIR" \
     NBLB_QA_PORT="$RESTORE_PORT" \
+    NBLB_QA_PUBLIC_PORT="$RESTORE_PORT" \
     NBLB_POSTGRES_IMAGE="$POSTGRES_IMAGE_DIGEST" \
     NBLB_CANDIDATE_IMAGE="$IMAGE_DIGEST" \
     NBLB_BACKUP_SOURCE=false \
@@ -199,7 +204,7 @@ wait_http() {
     local output=$3
     local observed
     for _ in $(seq 1 90); do
-        observed=$(curl --silent --header 'Host: 127.0.0.1:2456' \
+        observed=$(curl --silent --header "Host: 127.0.0.1:$port" \
             --output "$output" --write-out '%{http_code}' \
             "http://127.0.0.1:$port/health" 2>/dev/null || true)
         [ "$observed" = "$expected" ] && return 0
@@ -221,8 +226,9 @@ copy_secret_to_client() {
 write_curl_config() {
     local secret_file=$1
     local output=$2
+    local port=$3
     {
-        printf '%s\n' 'header = "Host: 127.0.0.1:2456"'
+        printf 'header = "Host: 127.0.0.1:%s"\n' "$port"
         printf '%s' 'header = "Authorization: Bearer '
         tr -d '\n' < "$secret_file"
         printf '%s\n' '"'
@@ -430,18 +436,73 @@ primary_db=$(primary_compose ps -q db)
 [ -n "$primary_app" ] && [ -n "$primary_db" ] || fail primary_container_missing
 
 copy_secret_to_client "$PRIMARY_SECRET_DIR/admin_token" admin-token-original
-write_curl_config "$CLIENT_DIR/admin-token-original" "$CLIENT_DIR/admin-original.curl"
+write_curl_config \
+    "$CLIENT_DIR/admin-token-original" "$CLIENT_DIR/admin-original.curl" "$PRIMARY_PORT"
 printf '%s' '{"key":"nvapi-synthetic-todo7-key"}' > "$CLIENT_DIR/upstream.json"
-curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin-original.curl" \
+create_response=$CLIENT_DIR/upstream-response.json
+: > "$create_response"
+set +e
+create_http=$(curl --silent --show-error --config "$CLIENT_DIR/admin-original.curl" \
     --request POST --header 'Content-Type: application/json' \
     --data-binary "@$CLIENT_DIR/upstream.json" \
-    --output "$CLIENT_DIR/upstream-response.json" \
-    "http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys"
-key_id=$(jq -er '.id' "$CLIENT_DIR/upstream-response.json")
-key_fingerprint=$(jq -er '.fingerprint' "$CLIENT_DIR/upstream-response.json")
-curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin-original.curl" \
-    --request POST --output /dev/null \
-    "http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys/$key_id/enable"
+    --output "$create_response" --write-out '%{http_code}' \
+    "http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys")
+create_curl_status=$?
+set -e
+create_contract_valid=false
+if [ "$create_curl_status" -eq 0 ] && [ "$create_http" = 201 ] && jq -e '
+    (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))
+    and (.fingerprint | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+    and .enabled == false
+    and .routing_state == "disabled"
+    and .health_state == "unknown"
+' "$create_response" >/dev/null 2>&1; then
+    create_contract_valid=true
+fi
+write_admin_stage_evidence "$EVIDENCE_DIR" create 201 "$create_http" \
+    "$create_contract_valid" "$create_response"
+[ "$create_contract_valid" = true ] || fail admin_upstream_create_contract_failed
+key_id=$(jq -er '.id' "$create_response")
+key_fingerprint=$(jq -er '.fingerprint' "$create_response")
+
+probe_response=$CLIENT_DIR/upstream-probe-response.json
+: > "$probe_response"
+set +e
+probe_http=$(curl --silent --show-error --config "$CLIENT_DIR/admin-original.curl" \
+    --request POST --output "$probe_response" --write-out '%{http_code}' \
+    "http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys/$key_id/probe")
+probe_curl_status=$?
+set -e
+probe_contract_valid=false
+if [ "$probe_curl_status" -eq 0 ] && [ "$probe_http" = 200 ] && jq -e \
+    --arg key_id "$key_id" \
+    '.id == $key_id and .enabled == false and .probe_status == "valid" and (.observed_at | type == "string")' \
+    "$probe_response" >/dev/null 2>&1; then
+    probe_contract_valid=true
+fi
+write_admin_stage_evidence "$EVIDENCE_DIR" probe 200 "$probe_http" \
+    "$probe_contract_valid" "$probe_response"
+[ "$probe_contract_valid" = true ] || fail admin_upstream_probe_contract_failed
+
+enable_response=$CLIENT_DIR/upstream-enable-response.bin
+: > "$enable_response"
+set +e
+enable_http=$(curl --silent --show-error --config "$CLIENT_DIR/admin-original.curl" \
+    --request POST --output "$enable_response" --write-out '%{http_code}' \
+    "http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys/$key_id/enable")
+enable_curl_status=$?
+set -e
+enable_contract_valid=false
+if [ "$enable_curl_status" -eq 0 ] && [ "$enable_http" = 204 ] \
+    && [ ! -s "$enable_response" ]; then
+    enable_contract_valid=true
+fi
+write_admin_stage_evidence "$EVIDENCE_DIR" enable 204 "$enable_http" \
+    "$enable_contract_valid" "$enable_response"
+[ "$enable_contract_valid" = true ] || fail admin_upstream_enable_contract_failed
+assert_admin_stage_evidence "$EVIDENCE_DIR" create 201
+assert_admin_stage_evidence "$EVIDENCE_DIR" probe 200
+assert_admin_stage_evidence "$EVIDENCE_DIR" enable 204
 wait_healthy primary app
 
 printf '%s' '{"label":"todo7-revoked","scopes":["models:read"]}' \
@@ -454,7 +515,7 @@ curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin-original
 revoked_token_id=$(jq -er '.id' "$CLIENT_DIR/revoked-token-response.json")
 jq -er '.token' "$CLIENT_DIR/revoked-token-response.json" > "$CLIENT_DIR/revoked-token"
 rm -f "$CLIENT_DIR/revoked-token-response.json"
-write_curl_config "$CLIENT_DIR/revoked-token" "$CLIENT_DIR/revoked.curl"
+write_curl_config "$CLIENT_DIR/revoked-token" "$CLIENT_DIR/revoked.curl" "$PRIMARY_PORT"
 curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin-original.curl" \
     --request DELETE --output /dev/null \
     "http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/downstream-tokens/$revoked_token_id"
@@ -472,7 +533,8 @@ persistence_token_id=$(jq -er '.id' "$CLIENT_DIR/persistence-token-response.json
 jq -er '.token' "$CLIENT_DIR/persistence-token-response.json" \
     > "$CLIENT_DIR/persistence-token"
 rm -f "$CLIENT_DIR/persistence-token-response.json"
-write_curl_config "$CLIENT_DIR/persistence-token" "$CLIENT_DIR/persistence.curl"
+write_curl_config \
+    "$CLIENT_DIR/persistence-token" "$CLIENT_DIR/persistence.curl" "$PRIMARY_PORT"
 
 curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/persistence.curl" \
     --output "$CLIENT_DIR/models.json" "http://127.0.0.1:$PRIMARY_PORT/v1/models"
@@ -503,7 +565,7 @@ primary_compose stop db >/dev/null &
 db_stop_pid=$!
 for _ in $(seq 1 45); do
     stopped_db_status=$(curl --silent --connect-timeout 1 --max-time 1 \
-        --header 'Host: 127.0.0.1:2456' \
+        --header "Host: 127.0.0.1:$PRIMARY_PORT" \
         --output "$CLIENT_DIR/stopped-db-health-probe.json" --write-out '%{http_code}' \
         "http://127.0.0.1:$PRIMARY_PORT/health" 2>/dev/null || true)
     if [ "$stopped_db_status" = 503 ] && jq -e \
@@ -555,7 +617,8 @@ root_helper \
     "$IMAGE_DIGEST" -c 'cp /source/admin_token /secrets/.admin_token.next; chmod 0600 /secrets/.admin_token.next; chown 0:0 /secrets/.admin_token.next; mv /secrets/.admin_token.next /secrets/admin_token; sync -f /secrets/admin_token; sync -f /secrets'
 primary_compose up --detach --force-recreate --no-deps app
 wait_healthy primary app
-write_curl_config "$CLIENT_DIR/admin-token-next" "$CLIENT_DIR/admin-next.curl"
+write_curl_config \
+    "$CLIENT_DIR/admin-token-next" "$CLIENT_DIR/admin-next.curl" "$PRIMARY_PORT"
 old_admin_status=$(api_status "$CLIENT_DIR/admin-original.curl" "$PRIMARY_PORT" \
     /admin/api/v1/overview)
 new_admin_status=$(api_status "$CLIENT_DIR/admin-next.curl" "$PRIMARY_PORT" \
@@ -615,15 +678,19 @@ wait_healthy restore fake-nvidia
 restore_compose run --rm --no-deps migrate >/dev/null
 restore_compose up --detach app loopback
 wait_healthy restore app
-[ "$(api_status "$CLIENT_DIR/persistence.curl" "$RESTORE_PORT" /v1/models)" = 200 ] \
+write_curl_config \
+    "$CLIENT_DIR/persistence-token" "$CLIENT_DIR/persistence-restore.curl" "$RESTORE_PORT"
+write_curl_config \
+    "$CLIENT_DIR/admin-token-next" "$CLIENT_DIR/admin-next-restore.curl" "$RESTORE_PORT"
+[ "$(api_status "$CLIENT_DIR/persistence-restore.curl" "$RESTORE_PORT" /v1/models)" = 200 ] \
     || fail restored_token_auth_failed
-curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/persistence.curl" \
+curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/persistence-restore.curl" \
     --header 'Content-Type: application/json' --data-binary "@$CLIENT_DIR/chat.json" \
     --output "$CLIENT_DIR/restored-chat-response.json" \
     "http://127.0.0.1:$RESTORE_PORT/v1/chat/completions"
 jq -e '.choices[0].message.content == "candidate fake upstream ok"' \
     "$CLIENT_DIR/restored-chat-response.json" >/dev/null
-curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin-next.curl" \
+curl --silent --show-error --fail-with-body --config "$CLIENT_DIR/admin-next-restore.curl" \
     --output "$CLIENT_DIR/restored-upstreams.json" \
     "http://127.0.0.1:$RESTORE_PORT/admin/api/v1/upstream-keys"
 jq -e --arg key_id "$key_id" --arg fingerprint "$key_fingerprint" \
@@ -671,7 +738,7 @@ jq -n \
     --arg source_manifest_sha256 "$source_manifest_sha256" \
     --arg key_fingerprint "$key_fingerprint" --arg token_id "$persistence_token_id" \
     --arg pair_id "$pair_id" \
-    '{schema_version:3,run_id:$run_id,status:$status,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,source_tree_sha256:$source_sha256,source_manifest_sha256:$source_manifest_sha256,checks:{static_analysis:true,full_test_suite:true,production_compose_render:true,concurrent_migration_serialization:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,restart_persistence:true,admin_rotation:true,separate_backup:true,isolated_restore:true,restored_chat:true,existing_codex_lb_preserved:true,exact_database_failure_503:true,database_failure_grace_exit:true,old_app_replaced_after_exit:true,source_manifest_final_byte_exact:true,app_postgres_pair_preserved:true},safe_identity:{upstream_key_id:$key_id,upstream_fingerprint:$key_fingerprint,persistence_downstream_token_id:$token_id,backup_pair_id:$pair_id}}' \
+    '{schema_version:3,run_id:$run_id,status:$status,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,source_tree_sha256:$source_sha256,source_manifest_sha256:$source_manifest_sha256,checks:{static_analysis:true,full_test_suite:true,production_compose_render:true,concurrent_migration_serialization:true,admin_upstream_create_contract:true,admin_upstream_probe_contract:true,admin_upstream_enable_contract:true,admin_stage_evidence_persisted:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,restart_persistence:true,admin_rotation:true,separate_backup:true,isolated_restore:true,restored_chat:true,existing_codex_lb_preserved:true,exact_database_failure_503:true,database_failure_grace_exit:true,old_app_replaced_after_exit:true,source_manifest_final_byte_exact:true,app_postgres_pair_preserved:true},safe_identity:{upstream_key_id:$key_id,upstream_fingerprint:$key_fingerprint,persistence_downstream_token_id:$token_id,backup_pair_id:$pair_id}}' \
     > "$EVIDENCE_DIR/manual-qa.json"
 jq -n \
     --arg run_id "$RUN_ID" --arg status PASS \

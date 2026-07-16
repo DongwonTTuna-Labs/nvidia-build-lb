@@ -1097,6 +1097,30 @@ def test_local_verifier_and_release_scanner_own_evidence_and_cleanup() -> None:
     assert "uses:" in scan
 
 
+def test_local_verifier_probes_before_enable_and_persists_stage_contracts() -> None:
+    verify = _text("scripts/qa/verify-local.sh")
+    stage_evidence = _text("scripts/qa/admin-stage-evidence.sh")
+
+    assert 'source "$ROOT/scripts/qa/admin-stage-evidence.sh"' in verify
+    assert verify.count('write_admin_stage_evidence "$EVIDENCE_DIR"') == 3
+    assert verify.count('assert_admin_stage_evidence "$EVIDENCE_DIR"') == 3
+    create = verify.index('"http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys")')
+    probe = verify.index(
+        '"http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys/$key_id/probe")'
+    )
+    enable = verify.index(
+        '"http://127.0.0.1:$PRIMARY_PORT/admin/api/v1/upstream-keys/$key_id/enable")'
+    )
+    assert create < probe < enable < verify.index("wait_healthy primary app")
+    assert '.id == $key_id and .enabled == false and .probe_status == "valid"' in verify
+    assert "admin_upstream_create_contract:true" in verify
+    assert "admin_upstream_probe_contract:true" in verify
+    assert "admin_upstream_enable_contract:true" in verify
+    assert "admin_stage_evidence_persisted:true" in verify
+    assert 'test("^[a-z_]+$")' in stage_evidence
+    assert "admin-stage-${stage}.json" in stage_evidence
+
+
 def test_local_verifier_observes_database_grace_and_old_app_exit() -> None:
     verify = _text("scripts/qa/verify-local.sh")
 
@@ -1143,6 +1167,7 @@ def test_production_compose_keeps_the_release_boundary_closed() -> None:
     assert "NBLB_APP_IMAGE" not in compose
     assert "NBLB_POSTGRES_IMAGE" not in compose
     assert "127.0.0.1:${NBLB_PORT:-2456}:2456" in compose
+    assert "NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_PORT:-2456}" in compose
     assert "NBLB_BIND_ADDRESS" not in compose
     assert "nvidia-build-lb.restore-isolated: ${NBLB_RESTORE_ISOLATED:-false}" in compose
     assert "nvidia-build-lb.backup-source: ${NBLB_BACKUP_SOURCE:-true}" in compose
@@ -1203,7 +1228,12 @@ def test_operator_probe_docs_name_evidence_and_withdraw_failed_rollback() -> Non
     assert "Only that route's `404`" in backup
     assert "same container ID and `StartedAt` generation" in backup
     assert "operational evidence is unconfirmed" in backup
-    assert "canonical service `Host`" in rollback
+    assert "connection port and `Host` port are identical" in backup
+    assert "connection port and `Host` port are identical" in rollback
+    assert 'APP_DIGEST="$NBLB_APP_REGISTRY_DIGEST"' in runbook
+    assert 'POSTGRES_DIGEST="$NBLB_POSTGRES_REGISTRY_DIGEST"' in runbook
+    assert 'APP_DIGEST="$APP_REGISTRY_DIGEST"' not in runbook
+    assert 'POSTGRES_DIGEST="$POSTGRES_REGISTRY_DIGEST"' not in runbook
     assert "ledger-capacity` mode used by forward recovery has no legacy" in rollback
     assert "two-second absolute deadline" in design
     assert "second exact sample 30 seconds" in design
@@ -1468,7 +1498,7 @@ printf '%s\n' \
     ]
 
 
-def test_production_compose_gates_secret_override_to_isolated_restore(
+def test_production_compose_gates_secret_override_to_isolated_restore(  # noqa: PLR0915
     tmp_path: Path,
 ) -> None:
     wrapper = _ROOT / "scripts/ops/production-compose.sh"
@@ -1476,7 +1506,7 @@ def test_production_compose_gates_secret_override_to_isolated_restore(
     fake_bin.mkdir()
     fake_docker = fake_bin / "docker"
     _ = fake_docker.write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$NBLB_SECRET_DIR\"\n",
+        '#!/bin/sh\nprintf \'%s|%s\\n\' "$NBLB_SECRET_DIR" "$NBLB_PORT"\n',
         encoding="utf-8",
     )
     fake_docker.chmod(0o755)
@@ -1502,6 +1532,7 @@ def test_production_compose_gates_secret_override_to_isolated_restore(
             "NBLB_RUNTIME_CONFIG_FILE": str(runtime_config),
             "NBLB_RESTORE_ISOLATED": "false",
             "NBLB_SECRET_DIR": str(ambient_directory),
+            "NBLB_PORT": "30001",
         }
     )
 
@@ -1514,11 +1545,22 @@ def test_production_compose_gates_secret_override_to_isolated_restore(
             env=environment,
         )
 
-    ordinary = run_wrapper()
-    assert ordinary.returncode == 0, ordinary.stderr
-    assert ordinary.stdout == f"{canonical_directory}\n"
+    for ambient_port in (
+        "30001",
+        "invalid",
+        "0",
+        "65536",
+        "+2456",
+        " 2456",
+        "\uff12\uff14\uff15\uff16",
+    ):
+        environment["NBLB_PORT"] = ambient_port
+        ordinary = run_wrapper()
+        assert ordinary.returncode == 0, ordinary.stderr
+        assert ordinary.stdout == f"{canonical_directory}|2456\n"
 
     environment["NBLB_RESTORE_ISOLATED"] = "true"
+    environment["NBLB_PORT"] = "32458"
     _ = environment.pop("NBLB_SECRET_DIR")
     missing = run_wrapper()
     assert missing.returncode != 0
@@ -1531,9 +1573,35 @@ def test_production_compose_gates_secret_override_to_isolated_restore(
     assert relative.stderr == "restore_secret_dir_invalid\n"
 
     environment["NBLB_SECRET_DIR"] = str(restore_directory)
+    _ = environment.pop("NBLB_PORT")
+    missing_port = run_wrapper()
+    assert missing_port.returncode != 0
+    assert missing_port.stderr == "restore_port_invalid\n"
+
+    for invalid_port in (
+        "0",
+        "65536",
+        "02458",
+        "+2456",
+        " 2456",
+        "2_456",
+        "\uff12\uff14\uff15\uff16",
+    ):
+        environment["NBLB_PORT"] = invalid_port
+        noncanonical_port = run_wrapper()
+        assert noncanonical_port.returncode != 0
+        assert noncanonical_port.stderr == "restore_port_invalid\n"
+
+    for boundary_port in ("1", "65535"):
+        environment["NBLB_PORT"] = boundary_port
+        boundary = run_wrapper()
+        assert boundary.returncode == 0, boundary.stderr
+        assert boundary.stdout == f"{restore_directory}|{boundary_port}\n"
+
+    environment["NBLB_PORT"] = "32458"
     isolated = run_wrapper()
     assert isolated.returncode == 0, isolated.stderr
-    assert isolated.stdout == f"{restore_directory}\n"
+    assert isolated.stdout == f"{restore_directory}|32458\n"
 
     environment["NBLB_RESTORE_ISOLATED"] = "invalid"
     invalid = run_wrapper()
@@ -1977,6 +2045,33 @@ def test_workflows_use_only_full_sha_actions_and_minimum_job_permissions() -> No
     assert "uv run playwright install --with-deps chromium" in publish
     assert 'docker tag "$APP_DIGEST"' in publish
     assert 'docker tag "$POSTGRES_DIGEST"' in publish
+    publish_lines = publish.splitlines()
+    app_receipt_start = publish_lines.index(
+        '          docker buildx imagetools inspect "$app_ref" --raw > "$receipt_dir/app.json"'
+    )
+    registry_digest_module = "scripts.qa.registry_manifest_digest"
+    postgres_manifest_argument = '--manifest "$receipt_dir/postgres.json"'
+    postgres_image_id_argument = '--expected-image-id "$POSTGRES_DIGEST")'
+    assert publish_lines[app_receipt_start : app_receipt_start + 7] == [
+        '          docker buildx imagetools inspect "$app_ref" --raw > "$receipt_dir/app.json"',
+        '          docker buildx imagetools inspect "$postgres_ref" --raw \\',
+        '            > "$receipt_dir/postgres.json"',
+        "          app_registry_digest=$(uv run python -m scripts.qa.registry_manifest_digest \\",
+        '            --manifest "$receipt_dir/app.json" --expected-image-id "$APP_DIGEST")',
+        f"          postgres_registry_digest=$(uv run python -m {registry_digest_module} \\",
+        f"            {postgres_manifest_argument} {postgres_image_id_argument}",
+    ]
+    assert "app_registry_digest: ${{ steps.publish.outputs.app_registry_digest }}" in publish
+    assert (
+        "postgres_registry_digest: ${{ steps.publish.outputs.postgres_registry_digest }}"
+    ) in publish
+    assert (
+        '"app_registry_digest=$app_registry_digest" \\\n'
+        '            "postgres_registry_digest=$postgres_registry_digest"'
+    ) in publish
+    assert "NBLB_APP_REGISTRY_DIGEST=$app_registry_digest" in publish
+    assert "NBLB_POSTGRES_REGISTRY_DIGEST=$postgres_registry_digest" in publish
+    assert '>> "$GITHUB_STEP_SUMMARY"' in publish
 
 
 def test_product_pattern_scan_allows_only_named_synthetic_examples(tmp_path: Path) -> None:

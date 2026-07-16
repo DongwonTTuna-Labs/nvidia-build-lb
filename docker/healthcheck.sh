@@ -46,8 +46,34 @@ awk -v expected_uid="$expected_uid" -v expected_gid="$expected_gid" '
 
 case "$probe" in
     app)
+        public_port=${NVIDIA_BUILD_LB_PUBLIC_PORT:-2456}
         exec /app/.venv/bin/python -c \
-            "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:2456/health',timeout=1); raise SystemExit(0 if r.status==200 and json.load(r)=={'status':'ok','ready':True} else 1)"
+            "
+import json
+import sys
+import urllib.request
+
+port = sys.argv[1]
+canonical = (
+    port.isascii()
+    and port.isdecimal()
+    and not port.startswith('0')
+    and 1 <= int(port) <= 65535
+)
+if not canonical:
+    raise SystemExit(1)
+request = urllib.request.Request(
+    'http://127.0.0.1:2456/health',
+    headers={'Host': f'127.0.0.1:{port}'},
+)
+with urllib.request.urlopen(request, timeout=1) as response:
+    healthy = response.status == 200 and json.load(response) == {
+        'status': 'ok',
+        'ready': True,
+    }
+raise SystemExit(0 if healthy else 1)
+" \
+            "$public_port"
         ;;
     postgres)
         exec pg_isready -q -U nvidia_build_lb -d nvidia_build_lb

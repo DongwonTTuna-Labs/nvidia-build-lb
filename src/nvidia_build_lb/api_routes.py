@@ -1,10 +1,12 @@
 """Public health, model-list, and OpenAI-compatible chat routes."""
 
+from contextlib import suppress
+
 import orjson
 from fastapi import FastAPI, Request, Response
 
 from nvidia_build_lb.api_errors import model_not_found, routed_failure
-from nvidia_build_lb.api_response import RoutedChatResponse
+from nvidia_build_lb.api_response import ActiveRoutedResponse, RoutedChatResponse
 from nvidia_build_lb.api_types import ApplicationServices, StreamLogContext
 from nvidia_build_lb.config import NVIDIA_MODEL, LogLevel
 from nvidia_build_lb.logging import LogEventName, RequestId, SafeLogEvent
@@ -17,6 +19,51 @@ from nvidia_build_lb.routing import (
 from nvidia_build_lb.routing_models import RoutedAttemptObservation
 from nvidia_build_lb.scheduler_state import TerminalOutcome
 from nvidia_build_lb.schemas import ChatCompletionsRequest, ModelListResponse
+
+
+async def build_public_chat_response(
+    request: Request,
+    payload: ChatCompletionsRequest,
+    services: ApplicationServices,
+) -> Response:
+    """Route one validated chat request and transfer active-request ownership."""
+    request_id = request_id_from(request)
+    if payload.model != NVIDIA_MODEL:
+        return model_not_found(request_id)
+    body = orjson.dumps(payload.model_dump(mode="json", exclude_unset=True))
+    services.active_requests.register(request_id)
+    routed: RoutedJson | RoutedStream | RoutedFailure | None = None
+    try:
+        routed = await services.routing.execute(
+            request_id=request_id,
+            body=body,
+            requested_stream=payload.stream,
+        )
+        _log_completed_attempts(services, request_id, routed)
+        if isinstance(routed, RoutedFailure):
+            response = routed_failure(routed.terminal, request_id)
+        else:
+            stream_log = (
+                StreamLogContext(routed.lease.key_id, routed.attempt_count)
+                if isinstance(routed, RoutedStream)
+                else None
+            )
+            response = RoutedChatResponse(
+                routed,
+                services.responders.create(stream_log),
+                requested_stream=payload.stream,
+            )
+        return ActiveRoutedResponse(
+            response,
+            services.active_requests,
+            request_id,
+        )
+    except BaseException:
+        if isinstance(routed, RoutedStream):
+            with suppress(BaseException):
+                await services.routing.cancel_unhanded_stream(routed)
+        services.active_requests.release(request_id)
+        raise
 
 
 def register_public_routes(app: FastAPI, services: ApplicationServices) -> None:
@@ -40,29 +87,7 @@ def register_public_routes(app: FastAPI, services: ApplicationServices) -> None:
 
     @app.post("/v1/chat/completions", response_class=Response)
     async def _chat(request: Request, payload: ChatCompletionsRequest) -> Response:
-        request_id = request_id_from(request)
-        if payload.model != NVIDIA_MODEL:
-            return model_not_found(request_id)
-        body = orjson.dumps(payload.model_dump(mode="json", exclude_unset=True))
-        with services.active_requests.track(request_id):
-            routed = await services.routing.execute(
-                request_id=request_id,
-                body=body,
-                requested_stream=payload.stream,
-            )
-            _log_completed_attempts(services, request_id, routed)
-            if isinstance(routed, RoutedFailure):
-                return routed_failure(routed.terminal, request_id)
-            stream_log = (
-                StreamLogContext(routed.lease.key_id, routed.attempt_count)
-                if isinstance(routed, RoutedStream)
-                else None
-            )
-            return RoutedChatResponse(
-                routed,
-                services.responders.create(stream_log),
-                requested_stream=payload.stream,
-            )
+        return await build_public_chat_response(request, payload, services)
 
     _ = (_health, _models, _chat)
 
