@@ -211,6 +211,19 @@ def test_admin_script_accepts_only_exact_success_and_error_dtos() -> None:
     assert accepted == [True] * len(cases)
 
 
+def test_admin_script_accepts_safe_internal_error_envelope() -> None:
+    # Given: the exact safe 500 envelope emitted by the server boundary.
+    internal_detail: dict[str, JsonValue] = {
+        **_ERROR_DETAIL,
+        "code": "internal_server_error",
+        "message": "internal server error",
+    }
+    internal_error: dict[str, JsonValue] = {"error": internal_detail}
+
+    # When/Then: the UI preserves the canonical code and request evidence.
+    assert _accepted((("error", internal_error),)) == [True]
+
+
 def test_admin_script_rejects_missing_extra_and_wrong_type_fields() -> None:
     # Given: missing, extra, and wrong-type variants at every closed DTO layer.
     cases: list[tuple[str, JsonValue]] = []

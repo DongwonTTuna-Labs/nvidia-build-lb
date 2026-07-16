@@ -353,12 +353,13 @@ async def test_live_sse_persists_success_before_done_terminal_send() -> None:
             events.append("terminal_send")
         sent.append(message)
 
-    await ChatStreamResponder(supervisor).run_stream(
+    status = await ChatStreamResponder(supervisor).run_stream_status(
         routed=routed,
         receive=_receive_forever,
         send=send,
     )
 
+    assert status is LastStatusClass.SUCCESS
     assert events == ["terminal_persist", "terminal_send"]
     assert [message["type"] for message in sent] == [
         "http.response.start",
@@ -892,12 +893,13 @@ async def test_live_sse_transport_failure_has_typed_persistence_and_safe_wire() 
     async def send(message: dict[str, object]) -> None:
         sent.append(message)
 
-    await ChatStreamResponder(supervisor).run_stream(
+    status = await ChatStreamResponder(supervisor).run_stream_status(
         routed=RoutedStream(_stream_terminal(response), _lease(), 1, 1.0),
         receive=_receive_forever,
         send=send,
     )
 
+    assert status is LastStatusClass.TIMEOUT
     assert response.close_count == 1
     assert len(attempts.commands) == 1
     assert attempts.commands[0].status_class is LastStatusClass.TIMEOUT
@@ -1077,12 +1079,13 @@ async def test_live_sse_protocol_failure_emits_one_request_correlated_error_even
     async def send(message: dict[str, object]) -> None:
         sent.append(message)
 
-    await ChatStreamResponder(supervisor).run_stream(
+    status = await ChatStreamResponder(supervisor).run_stream_status(
         routed=RoutedStream(_stream_terminal(response), _lease(), 1, 1.0),
         receive=_receive_forever,
         send=send,
     )
 
+    assert status is LastStatusClass.UPSTREAM_PROTOCOL_ERROR
     assert response.close_count == 1
     assert len(attempts.commands) == 1
     assert attempts.commands[0].status_class is LastStatusClass.UPSTREAM_PROTOCOL_ERROR

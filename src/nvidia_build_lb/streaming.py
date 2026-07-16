@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 
 import anyio
 
+from nvidia_build_lb.admin.schemas import LastStatusClass
 from nvidia_build_lb.asgi_response import (
     AsgiReceive,
     AsgiSend,
@@ -17,9 +18,8 @@ from nvidia_build_lb.routing import RoutedJson, RoutedStream
 from nvidia_build_lb.sse import SSEFrame
 from nvidia_build_lb.stream_cancellation import record_ancestor_cancellation
 from nvidia_build_lb.stream_close import close_stream_after_body
-from nvidia_build_lb.stream_failures import transport_failure_proposal
+from nvidia_build_lb.stream_failures import complete_network_failure, transport_failure_proposal
 from nvidia_build_lb.stream_reads import finish_disconnect, next_frame_or_disconnect
-from nvidia_build_lb.stream_retirement_fail_stop import complete_before_stream_fail_stop
 from nvidia_build_lb.streaming_control import (
     DownstreamDisconnectedError,
     DownstreamSendError,
@@ -62,7 +62,7 @@ class ChatStreamResponder:
         if isinstance(routed, RoutedJson):
             await self.run_json(routed=routed, send=send, requested_stream=requested_stream)
             return
-        await self.run_stream(routed=routed, receive=receive, send=send)
+        _ = await self.run_stream(routed=routed, receive=receive, send=send)
 
     async def run_json(
         self,
@@ -82,6 +82,16 @@ class ChatStreamResponder:
         send: AsgiSend,
     ) -> None:
         """Forward ordinary frames and arbitrate exactly one terminal frame."""
+        _ = await self.run_stream_status(routed=routed, receive=receive, send=send)
+
+    async def run_stream_status(
+        self,
+        *,
+        routed: RoutedStream,
+        receive: AsgiReceive,
+        send: AsgiSend,
+    ) -> LastStatusClass:
+        """Forward frames and return the safe status after durable terminal commit."""
         supervisor = self._supervisor
         if supervisor is None:
             raise RuntimeError
@@ -103,6 +113,7 @@ class ChatStreamResponder:
         if body_error is not None:
             _ = routed.terminal.stream.trigger_pending_fail_stop()
             raise body_error from None
+        return await supervisor.persisted_status_class()
 
     async def _run_stream_body(self, context: StreamContext) -> None:
         state = StreamState()
@@ -169,7 +180,7 @@ class ChatStreamResponder:
             proposal = None
         except Exception:  # noqa: BLE001 - provider text is never inspected.
             proposal = None
-        await self._network_failure(context, state, proposal)
+        await complete_network_failure(context, state, proposal)
         return None
 
     async def _handle_frame(
@@ -215,31 +226,3 @@ class ChatStreamResponder:
             await send_after_terminal(context, sse_response_start())
             state.response_started = True
         await send_after_terminal(context, sse_response_body(frame.raw, more_body=False))
-
-    async def _network_failure(
-        self,
-        context: StreamContext,
-        state: StreamState,
-        proposal: TerminalProposal | None = None,
-    ) -> None:
-        proposal = proposal or TerminalProposal.for_kind(
-            TerminalKind.NETWORK_TERMINAL_FAILURE,
-            sequence=state.sequence,
-            request_id=context.routed.lease.identity.request_id,
-        )
-        generation = state.generation
-        decision = await complete_before_stream_fail_stop(
-            lambda: coordinate_and_release(context, proposal, generation=generation),
-            context.routed.terminal.stream,
-        )
-        terminal = decision.terminal
-        state.terminal_released = terminal is not None
-        if terminal is None or terminal.winner.kind is not TerminalKind.NETWORK_TERMINAL_FAILURE:
-            return
-        if not state.response_started:
-            await send_after_terminal(context, sse_response_start())
-            state.response_started = True
-        payload = terminal.winner.payload
-        if payload is None:
-            raise RuntimeError
-        await send_after_terminal(context, sse_response_body(payload, more_body=False))

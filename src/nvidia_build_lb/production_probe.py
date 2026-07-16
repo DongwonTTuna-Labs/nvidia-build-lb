@@ -66,9 +66,19 @@ class RoutingProbeExecutor:
             responder = responders.create(
                 StreamLogContext(routed.lease.key_id, routed.attempt_count)
             )
-            await responder.run_stream(routed=routed, receive=receive, send=send)
+            persisted = await responder.run_stream_status(
+                routed=routed,
+                receive=receive,
+                send=send,
+            )
+            return self._probe_status(persisted)
+        return self._probe_status(routed.terminal.outcome.persisted_status)
+
+    @staticmethod
+    def _probe_status(persisted: LastStatusClass | None) -> ProbeStatus:
+        """Reduce one durably committed safe status to the closed probe projection."""
+        if persisted is LastStatusClass.SUCCESS:
             return ProbeStatus.VALID
-        persisted = routed.terminal.outcome.persisted_status
         if persisted is LastStatusClass.INVALID_CREDENTIAL:
             return ProbeStatus.INVALID_CREDENTIAL
         if persisted is LastStatusClass.RATE_LIMITED:

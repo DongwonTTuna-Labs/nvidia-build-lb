@@ -5,6 +5,7 @@ from typing import Protocol
 
 import anyio
 
+from nvidia_build_lb.admin.schemas import LastStatusClass
 from nvidia_build_lb.attempt_types import AttemptFinalizeCommand, AttemptLease, TerminalCommitted
 from nvidia_build_lb.credential_types import Clock
 from nvidia_build_lb.terminal_arbiter import (
@@ -63,6 +64,7 @@ class ChatSupervisor:
     _generation_proposals: dict[int, list[TerminalProposal]]
     _release_decisions: dict[int, FrameReleaseDecision]
     _acceptance_sequence: int
+    _persisted_status_class: LastStatusClass | None
     _lock: anyio.Lock
 
     def __init__(self, dependencies: ChatSupervisorDependencies) -> None:
@@ -72,6 +74,7 @@ class ChatSupervisor:
         self._generation_proposals = {}
         self._release_decisions = {}
         self._acceptance_sequence = 0
+        self._persisted_status_class = None
         self._lock = anyio.Lock()
 
     async def coordinate(
@@ -138,6 +141,13 @@ class ChatSupervisor:
         async with self._lock:
             return bool(self._generation_proposals.get(generation))
 
+    async def persisted_status_class(self) -> LastStatusClass:
+        """Return the safe terminal status only after its durable commit completed."""
+        async with self._lock:
+            if self._persisted_status_class is None:
+                raise RuntimeError
+            return self._persisted_status_class
+
     async def finalize(
         self,
         *,
@@ -173,14 +183,14 @@ class ChatSupervisor:
             0,
             int((self._dependencies.monotonic_clock.monotonic() - started_monotonic) * 1000),
         )
-        _ = await self._dependencies.attempts.finalize_attempt(
-            AttemptFinalizeCommand(
-                identity=lease.identity,
-                outcome=winner.outcome,
-                status_class=winner.status_class,
-                latency_ms=latency_ms,
-                cooldown_until=winner.cooldown_until,
-                cooldown_kind=winner.cooldown_kind,
-                terminal_committed_at=self._dependencies.clock.now(),
-            )
+        command = AttemptFinalizeCommand(
+            identity=lease.identity,
+            outcome=winner.outcome,
+            status_class=winner.status_class,
+            latency_ms=latency_ms,
+            cooldown_until=winner.cooldown_until,
+            cooldown_kind=winner.cooldown_kind,
+            terminal_committed_at=self._dependencies.clock.now(),
         )
+        _ = await self._dependencies.attempts.finalize_attempt(command)
+        self._persisted_status_class = command.status_class

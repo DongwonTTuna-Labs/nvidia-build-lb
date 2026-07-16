@@ -23,10 +23,12 @@ from nvidia_build_lb.admin.schemas import (
     LastStatusClass,
     LedgerStatus,
     OverviewStatus,
+    ProbeStatus,
     ReadinessCause,
     RuntimeState,
     UpstreamKeyCreateRequest,
     UpstreamKeyListResponse,
+    UpstreamProbeResponse,
 )
 
 from .browser_checks import axe_counts, evaluate_string, execute_script
@@ -531,6 +533,81 @@ def test_confirmed_probe_survives_followup_refresh_401(
     expect(page.locator("#last-result")).to_contain_text("Probe confirmed Key aaaaaaaa is valid")
     expect(page.locator("#operation-status-line")).to_be_hidden()
     expect(page.locator("#decision-title")).to_have_text("Enable Key aaaaaaaa")
+
+
+def test_failed_probe_uses_response_enabled_state_over_cached_item(
+    decision_browser: tuple[RunningFakeServer, BrowserContext, Page],
+) -> None:
+    server, _, page = decision_browser
+    _login(page, server)
+    probe_path = f"**/admin/api/v1/upstream-keys/{FIRST_KEY_ID}/probe"
+
+    def unavailable_probe(route: Route) -> None:
+        target = UUID(FIRST_KEY_ID)
+        _ = server.state.change_upstream(target, "probe")
+        _ = server.state.change_upstream(target, "enable")
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=UpstreamProbeResponse(
+                id=UUID(FIRST_KEY_ID),
+                enabled=True,
+                probe_status=ProbeStatus.UPSTREAM_UNAVAILABLE,
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ).model_dump_json(),
+        )
+
+    _ = page.route(probe_path, unavailable_probe, times=1)
+    page.locator(f"#key-{FIRST_KEY_ID}-probe").click()
+
+    result = page.locator("#last-result")
+    expect(result).to_contain_text("Probe confirmed Key aaaaaaaa is upstream unavailable")
+    expect(result).to_contain_text(
+        "It remains enabled, but this result does not confirm that it can receive new requests."
+    )
+    expect(result).not_to_contain_text("remains excluded")
+    row = page.locator(f"#key-{FIRST_KEY_ID}-probe").locator("xpath=ancestor::tr")
+    expect(row).to_contain_text("Eligible")
+
+
+def test_failed_probe_keeps_enabled_distinct_from_routing_eligibility(
+    decision_browser: tuple[RunningFakeServer, BrowserContext, Page],
+) -> None:
+    server, _, page = decision_browser
+    _login(page, server)
+    second_id = "00000000-0000-4000-8000-000000000002"
+    install_decision_scenario(page, "quarantined", server.state)
+    page.locator("#refresh-dashboard").click()
+    expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+    probe_control = page.locator(f"#key-{second_id}-probe")
+    row = probe_control.locator("xpath=ancestor::tr")
+    expect(probe_control).to_be_enabled()
+    expect(row).to_contain_text("Quarantined")
+    probe_path = f"**/admin/api/v1/upstream-keys/{second_id}/probe"
+
+    def unavailable_probe(route: Route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=UpstreamProbeResponse(
+                id=UUID(second_id),
+                enabled=True,
+                probe_status=ProbeStatus.UPSTREAM_UNAVAILABLE,
+                observed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ).model_dump_json(),
+        )
+
+    _ = page.route(probe_path, unavailable_probe, times=1)
+    probe_control.click()
+
+    result = page.locator("#last-result")
+    expect(result).to_contain_text("Probe confirmed Key bbbbbbbb is upstream unavailable")
+    expect(result).to_contain_text(
+        "It remains enabled, but this result does not confirm that it can receive new requests."
+    )
+    expect(result).not_to_contain_text("remains disabled")
+    expect(result).not_to_contain_text("remains excluded")
+    expect(row).to_contain_text("Quarantined")
 
 
 def test_digest_failure_restores_field_focus_and_hides_busy_status(

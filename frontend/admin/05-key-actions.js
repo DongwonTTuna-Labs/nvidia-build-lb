@@ -96,7 +96,9 @@ async function runKeyAction(item, action, button) {
         ? probe.enabled
           ? `Probe confirmed ${handle} is valid and remains enabled. It can receive new requests.`
           : `Probe confirmed ${handle} is valid. Enable is now available.`
-        : `Probe confirmed ${handle} is ${humanize(probe.probe_status).toLowerCase()}. It remains excluded.`;
+        : probe.enabled
+          ? `Probe confirmed ${handle} is ${humanize(probe.probe_status).toLowerCase()}. It remains enabled, but this result does not confirm that it can receive new requests.`
+          : `Probe confirmed ${handle} is ${humanize(probe.probe_status).toLowerCase()}. It remains disabled and cannot receive new requests.`;
       setLocatedResult(item.id, message);
     } else {
       enableReadyKeyEvidence.delete(item.id); deliberatelyPausedKeyIds.delete(item.id);
