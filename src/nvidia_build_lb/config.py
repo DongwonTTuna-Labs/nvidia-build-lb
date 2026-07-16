@@ -77,15 +77,20 @@ class SettingsSource(BaseSettings):
     admin_attempt_reconciliation_grace_seconds: AdminAttemptReconciliationGraceSeconds = 300
 
     @field_validator(
+        "admin_read_deadline_seconds",
+        "admin_mutation_deadline_seconds",
+        "admin_event_retention_days",
         "admin_event_max_rows",
         "admin_attempt_max_rows",
         "admin_ledger_prune_batch_size",
+        "admin_ledger_maintenance_interval_seconds",
+        "admin_attempt_reconciliation_grace_seconds",
         "public_port",
         mode="before",
     )
     @classmethod
-    def _parse_compose_integer(cls, value: object) -> object:
-        """Parse canonical decimal strings emitted by Compose."""
+    def _parse_environment_integer(cls, value: object) -> object:
+        """Parse canonical decimal strings at the settings-source boundary."""
         return parse_canonical_decimal(value)
 
 

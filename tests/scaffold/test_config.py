@@ -13,6 +13,19 @@ from nvidia_build_lb.config import (
 )
 from nvidia_build_lb.errors import ConfigurationError, ConfigurationErrorCode
 
+_INTEGER_SETTINGS = (
+    ("admin_read_deadline_seconds", 3),
+    ("admin_mutation_deadline_seconds", 60),
+    ("admin_event_retention_days", 7),
+    ("admin_event_max_rows", 200_000),
+    ("admin_attempt_max_rows", 80_000),
+    ("admin_ledger_prune_batch_size", 2_000),
+    ("admin_ledger_maintenance_interval_seconds", 60),
+    ("admin_attempt_reconciliation_grace_seconds", 600),
+    ("public_port", 32_458),
+)
+_INTEGER_SETTING_FIELDS = tuple(name for name, _value in _INTEGER_SETTINGS)
+
 
 def _valid_source(tmp_path: Path) -> SettingsSource:
     vault_path = tmp_path / "vault.key"
@@ -54,21 +67,27 @@ def test_settings_return_only_safe_metadata_when_secret_files_are_valid(
 def test_settings_source_accepts_compose_decimal_environment_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    values = {
-        "ADMIN_EVENT_MAX_ROWS": 200_000,
-        "ADMIN_ATTEMPT_MAX_ROWS": 80_000,
-        "ADMIN_LEDGER_PRUNE_BATCH_SIZE": 2_000,
-        "PUBLIC_PORT": 32_458,
-    }
-    for name, value in values.items():
-        monkeypatch.setenv(f"NVIDIA_BUILD_LB_{name}", str(value))
+    for name, value in _INTEGER_SETTINGS:
+        monkeypatch.setenv(f"NVIDIA_BUILD_LB_{name.upper()}", str(value))
 
     source = SettingsSource()
 
-    assert source.admin_event_max_rows == values["ADMIN_EVENT_MAX_ROWS"]
-    assert source.admin_attempt_max_rows == values["ADMIN_ATTEMPT_MAX_ROWS"]
-    assert source.admin_ledger_prune_batch_size == values["ADMIN_LEDGER_PRUNE_BATCH_SIZE"]
-    assert source.public_port == values["PUBLIC_PORT"]
+    for name, expected in _INTEGER_SETTINGS:
+        assert getattr(source, name) == expected
+
+
+@pytest.mark.parametrize(("name", "value"), _INTEGER_SETTINGS)
+def test_settings_source_accepts_direct_strict_integers(name: str, value: int) -> None:
+    source = SettingsSource.model_validate({name: value})
+
+    assert getattr(source, name) == value
+
+
+@pytest.mark.parametrize("name", _INTEGER_SETTING_FIELDS)
+@pytest.mark.parametrize("value", [True, False], ids=("true", "false"))
+def test_settings_source_rejects_direct_booleans(name: str, value: bool) -> None:
+    with pytest.raises(ValidationError):
+        _ = SettingsSource.model_validate({name: value})
 
 
 @pytest.mark.parametrize("value", ["1", "65535"])
@@ -87,6 +106,11 @@ def test_settings_source_accepts_public_port_range_boundaries(
         ("ADMIN_EVENT_MAX_ROWS", "01000"),
         ("ADMIN_ATTEMPT_MAX_ROWS", "0100"),
         ("ADMIN_LEDGER_PRUNE_BATCH_SIZE", "06"),
+        ("ADMIN_READ_DEADLINE_SECONDS", "03"),
+        ("ADMIN_MUTATION_DEADLINE_SECONDS", "+60"),
+        ("ADMIN_EVENT_RETENTION_DAYS", " 7"),
+        ("ADMIN_LEDGER_MAINTENANCE_INTERVAL_SECONDS", "60 "),
+        ("ADMIN_ATTEMPT_RECONCILIATION_GRACE_SECONDS", "6_00"),
         ("ADMIN_EVENT_MAX_ROWS", "+1000"),
         ("ADMIN_EVENT_MAX_ROWS", " 1000"),
         ("ADMIN_EVENT_MAX_ROWS", "\uff11\uff10\uff10\uff10"),
