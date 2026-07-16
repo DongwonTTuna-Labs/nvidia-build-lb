@@ -240,6 +240,8 @@ if ARGS[0] == "inspect":
 
 if ARGS[0] == "exec":
     if "pg_restore" in ARGS:
+        if "--single-transaction" not in ARGS or "--exit-on-error" not in ARGS:
+            fail("synthetic_restore_not_atomic")
         payload = sys.stdin.buffer.read()
         observed = hashlib.sha256(payload).hexdigest()
         if observed != os.environ["NBLB_FAKE_DATABASE_SHA256"]:
@@ -628,6 +630,18 @@ def test_backup_and_restore_scripts_fail_closed_on_custody_or_target_drift() -> 
     assert "encode(token_digest,'hex')" in state
 
 
+def test_restore_replays_the_archive_in_one_transaction() -> None:
+    restore = _text("scripts/ops/restore.sh")
+    start = restore.index("pg_restore --username nvidia_build_lb")
+    end = restore.index("|| fail database_restore_failed", start)
+    invocation = restore[start:end]
+
+    assert invocation.count("--single-transaction") == 1
+    assert invocation.count("--exit-on-error") == 1
+    assert invocation.index("--single-transaction") < invocation.index("--exit-on-error")
+    assert "--jobs" not in invocation
+
+
 def test_database_state_requires_exact_0005_columns_constraints_and_indexes() -> None:
     state = _text("scripts/ops/database-state.sh")
 
@@ -702,6 +716,10 @@ def test_operator_backup_and_restore_examples_preserve_failure_status() -> None:
     assert restore.rindex("cleanup_restore_attempt") < restore.rindex(
         '''printf '%s\\n' "$RESTORE_RECEIPT"'''
     )
+    assert "one PostgreSQL transaction" in restore
+    assert "same verified backup pair only in a fresh isolated" in restore
+    assert "never reuse the failed target or clean its database in place" in restore
+    assert "leaves the empty isolated target retryable" not in restore
 
 
 def test_backup_copies_then_verifies_the_copied_key_against_database_state() -> None:

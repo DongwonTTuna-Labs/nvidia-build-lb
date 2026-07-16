@@ -224,7 +224,7 @@ docker run --rm --network none --read-only --cap-drop ALL \
     "$HELPER_IMAGE" /stage/database.dump \
     | docker exec --interactive --user 70 "$DB_CONTAINER" \
         pg_restore --username nvidia_build_lb --dbname nvidia_build_lb \
-        --exit-on-error --no-owner --no-privileges \
+        --single-transaction --exit-on-error --no-owner --no-privileges \
     || fail database_restore_failed
 
 STATE_DIR=$(mktemp -d /tmp/nblb-restore-state.XXXXXX)

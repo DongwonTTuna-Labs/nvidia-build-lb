@@ -318,8 +318,12 @@ network-disabled one-shot key installer receives only `DAC_OVERRIDE` and copies
 the staged key into a root-owned mode-0600 file; it has no database or network
 access. Restore verifies that installed file against both the staged manifest
 and the verifier captured from the restored database before emitting PASS. A
-failed restore removes any installed vault key and the entire staging tuple;
+restore replays the archive in one PostgreSQL transaction, so an archive error
+rolls back every database change. A failed restore removes any installed vault
+key and the entire staging tuple;
 an attempt-owned marker prevents cleanup from deleting a key that predated the
-restore attempt. Discard the isolated database volume after any failure.
+restore attempt. Discard the failed attempt's isolated database volume after
+any failure. Retry the same verified backup pair only in a fresh isolated
+attempt; never reuse the failed target or clean its database in place.
 `down --volumes` is permitted only for the unique explicitly isolated drill
 project created by this procedure, never for the live project.
