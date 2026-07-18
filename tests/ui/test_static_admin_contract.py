@@ -85,11 +85,11 @@ def test_admin_shell_has_exact_external_assets_and_semantic_identity() -> None:
     paths = {path for path, _ in parsed.elements}
     root_attributes = next(attrs for path, attrs in parsed.elements if path == ("html",))
 
-    # Then: only the two exact same-origin assets execute and affiliation is disclaimed.
+    # Then: only the exact same-origin stylesheet and script execute.
     assert root_attributes == {"lang": "en"}
     assert _NOTICE in document
     assert links == [
-        {"href": "/admin", "rel": "icon"},
+        {"href": "/assets/favicon.svg", "rel": "icon", "type": "image/svg+xml"},
         {"href": "/assets/admin.css", "rel": "stylesheet"},
     ]
     assert scripts == [{"defer": "defer", "src": "/assets/admin.js", "type": "module"}]
@@ -101,9 +101,43 @@ def test_admin_shell_has_exact_external_assets_and_semantic_identity() -> None:
     assert all(tag not in document.lower() for tag in ("<img", "<svg", "<iframe"))
 
 
+def test_admin_login_is_server_rendered_and_fails_closed_until_module_init() -> None:
+    document, parsed = _admin_document()
+    script = load_web_resource(WebResource("admin-script"))
+    login_form = next(
+        attrs
+        for path, attrs in parsed.elements
+        if path[-1] == "form" and attrs.get("id") == "login-form"
+    )
+    bearer = next(
+        attrs
+        for path, attrs in parsed.elements
+        if path[-1] == "input" and attrs.get("id") == "admin-bearer"
+    )
+    submit = next(
+        attrs
+        for path, attrs in parsed.elements
+        if path[-1] == "button" and attrs.get("id") == "login-submit"
+    )
+
+    assert login_form == {
+        "class": "login-form",
+        "id": "login-form",
+        "novalidate": "novalidate",
+    }
+    assert 'id="login-template"' not in document
+    assert bearer["disabled"] == "disabled"
+    assert "name" not in bearer
+    assert submit["disabled"] == "disabled"
+    assert 'const loginTemplate = byId("login-form").cloneNode(true);' in script
+    assert 'byId("login-slot").replaceChildren(loginTemplate.cloneNode(true));' in script
+    assert "field.disabled = false;" in script
+    assert "submit.disabled = false;" in script
+
+
 def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
     # Given: the static shell and its inert templates and dialogs.
-    _, parsed = _admin_document()
+    document, parsed = _admin_document()
 
     # When: sensitive inputs and action surfaces are located.
     password_inputs = [
@@ -117,6 +151,11 @@ def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
         for path, attrs in parsed.elements
         if path[-1] == "textarea" and attrs.get("id") == "one-time-token"
     )
+    credential_id = next(
+        attrs
+        for path, attrs in parsed.elements
+        if path[-1] == "input" and attrs.get("id") == "credential-id"
+    )
 
     # Then: entry is password-only and every owner journey has a native semantic surface.
     assert {attrs["id"] for attrs in password_inputs} == {
@@ -128,6 +167,10 @@ def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
     assert credential["rows"] == "3"
     assert "role" not in credential
     assert "aria-readonly" not in credential
+    assert credential_id["readonly"] == "readonly"
+    assert credential_id["aria-describedby"] == "credential-id-help"
+    assert "Store this Internal ID with the client record" in document
+    assert "Hermes token-ID prompt" not in document
     assert dialogs == {
         "upstream-dialog",
         "confirm-dialog",
@@ -143,6 +186,28 @@ def test_admin_shell_contains_native_secret_and_destructive_workflows() -> None:
     button_ids = {attrs.get("id") for path, attrs in parsed.elements if path[-1] == "button"}
     assert {"logout", "refresh-dashboard"} <= button_ids
     assert all(attrs.get("id") != "clipboard-recovery" for _, attrs in parsed.elements)
+
+
+def test_first_client_credential_requires_two_registered_eligible_keys() -> None:
+    script = load_web_resource(WebResource("admin-script"))
+
+    assert "snapshot.upstreams.length !== 2" in script
+    assert "snapshot.overview.upstream_keys.eligible !== 2" in script
+    assert "upstreams.length === 2 && overview.upstream_keys.eligible === 2" in script
+    assert "2 registered · ${overview.upstream_keys.eligible} eligible" not in script
+    assert (
+        "${overview.upstream_keys.total} registered · ${overview.upstream_keys.eligible} eligible"
+        in script
+    )
+    assert "items.length === 2 && !replacementContext" in script
+    assert 'createButton("Replace", `key-${item.id}-replace`' in script
+    assert "if (upstreams.length > 2 && !replacementContext)" in script
+    assert 'setControlPrerequisite("add-upstream", "add-upstream-reason", message)' in script
+    assert "else if (snapshot.upstreams.length > 2)" in script
+    assert 'setRecommendation("upstreams", "Review extra upstream keys")' in script
+    assert script.index("reconcileReplacementContext(snapshot.upstreams)") < script.index(
+        "renderUpstreams(snapshot.upstreams, reference)"
+    )
 
 
 def test_global_error_reads_action_before_result_and_then_evidence() -> None:

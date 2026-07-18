@@ -1,5 +1,5 @@
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from contextlib import ExitStack
 from hashlib import sha256
 from pathlib import Path
@@ -33,7 +33,10 @@ from .browser_prod_models import (
     ProductionNativeReceipt,
 )
 from .browser_prod_states import run_production_state_recovery
-from .browser_prod_upstream import run_production_upstream_journey
+from .browser_prod_upstream import (
+    complete_production_upstream_cleanup,
+    run_production_upstream_journey,
+)
 from .browser_runtime import browser_resource_snapshot
 from .browser_zoom import (
     NATIVE_PREFERENCES,
@@ -51,6 +54,7 @@ _UUID: Final = re.compile(
     r"(?<![0-9a-f])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9a-f])"
 )
 _TIMESTAMP: Final = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
+_FULL_SHA_FINGERPRINT: Final = re.compile(r"sha256:([0-9a-f]{64})")
 _SHA_FINGERPRINT: Final = re.compile(r"sha256:[0-9a-f]{16,64}(?:…|\.\.\.)?")
 _OPAQUE_HEX: Final = re.compile(r"(?<![0-9a-f])[0-9a-f]{16,64}(?![0-9a-f])")
 _EVENT_LATENCY: Final = re.compile(
@@ -58,16 +62,33 @@ _EVENT_LATENCY: Final = re.compile(
 )
 
 
-def _canonical_dom(document: str) -> str:
+def _fingerprint_prefixes(fingerprints: Collection[str]) -> tuple[str, ...]:
+    prefixes: set[str] = set()
+    for fingerprint in fingerprints:
+        match = _FULL_SHA_FINGERPRINT.fullmatch(fingerprint)
+        if match is None:
+            reason = "native DOM canonicalization received an invalid fingerprint sidecar"
+            raise AssertionError(reason)
+        prefixes.add(match.group(1)[:8])
+    return tuple(sorted(prefixes))
+
+
+def _canonical_dom(document: str, fingerprints: Collection[str] = ()) -> str:
     canonical = _UUID.sub("{uuid}", document)
     canonical = _TIMESTAMP.sub("{timestamp}", canonical)
     canonical = _SHA_FINGERPRINT.sub("sha256:{fingerprint}", canonical)
     canonical = _OPAQUE_HEX.sub("{opaque-hex}", canonical)
+    for prefix in _fingerprint_prefixes(fingerprints):
+        canonical = re.sub(
+            rf"\bKey {re.escape(prefix)}\b",
+            "Key {fingerprint}",
+            canonical,
+        )
     return _EVENT_LATENCY.sub(r"\1 · \2 · {latency}", canonical)
 
 
-def _stable_dom_hash(document: str) -> str:
-    return sha256(_canonical_dom(document).encode()).hexdigest()
+def _stable_dom_hash(document: str, fingerprints: Collection[str] = ()) -> str:
+    return sha256(_canonical_dom(document, fingerprints).encode()).hexdigest()
 
 
 def _desktop_placeholder() -> AdminDesktopObservation:
@@ -86,9 +107,14 @@ def _desktop_placeholder() -> AdminDesktopObservation:
     )
 
 
-def _stable(page: Page, label: str, axe_asset: Path) -> NativeStableProjection:
+def _stable(
+    page: Page,
+    label: str,
+    axe_asset: Path,
+    fingerprints: Collection[str] = (),
+) -> NativeStableProjection:
     before_document = page.content()
-    before = _stable_dom_hash(before_document)
+    before = _stable_dom_hash(before_document, fingerprints)
     assert_no_page_overflow(page)
     execute_script(page, "() => window.scrollTo(Number.MAX_SAFE_INTEGER, window.scrollY)")
     assert float(evaluate_string(page, "() => JSON.stringify(window.scrollX)")) == 0
@@ -99,7 +125,7 @@ def _stable(page: Page, label: str, axe_asset: Path) -> NativeStableProjection:
     assert counts.network_requests == 0
     focus_stops = keyboard_focus_count(page)
     after_document = page.content()
-    after = _stable_dom_hash(after_document)
+    after = _stable_dom_hash(after_document, fingerprints)
     assert before_document == after_document
     assert before == after
     return NativeStableProjection(
@@ -195,18 +221,25 @@ def _open_native_session(
 
 def _run_native_owner_journey(
     journey: ProductionJourney,
+    historical_fingerprints: Collection[str],
 ) -> tuple[NativeStableProjection, ...]:
     page = journey.session.page
     axe_asset = journey.qa.axe_asset
-    stable = [_stable(page, "dashboard", axe_asset)]
-    run_production_upstream_journey(journey)
-    stable.append(_stable(page, "upstream", axe_asset))
+    fingerprints = {
+        *historical_fingerprints,
+        *(str(item.fingerprint) for item in journey.qa.client.upstreams().items),
+    }
+    stable = [_stable(page, "dashboard", axe_asset, fingerprints)]
+    upstream_cleanup = run_production_upstream_journey(journey)
+    fingerprints.add(upstream_cleanup.fingerprint)
+    stable.append(_stable(page, "upstream", axe_asset, fingerprints))
     run_production_downstream_journey(journey)
-    stable.append(_stable(page, "downstream", axe_asset))
+    complete_production_upstream_cleanup(journey, upstream_cleanup)
+    stable.append(_stable(page, "downstream", axe_asset, fingerprints))
     run_production_state_recovery(journey)
-    stable.append(_stable(page, "state-recovery", axe_asset))
+    stable.append(_stable(page, "state-recovery", axe_asset, fingerprints))
     run_production_clipboard_failure(journey)
-    stable.append(_stable(page, "clipboard-recovery", axe_asset))
+    stable.append(_stable(page, "clipboard-recovery", axe_asset, fingerprints))
     assert clipboard_is_empty(page)
     return tuple(stable)
 
@@ -214,6 +247,7 @@ def _run_native_owner_journey(
 def run_production_native_phase(
     qa: ProductionQaContext,
     context_factory: _NativeContextFactory,
+    historical_fingerprints: Collection[str] = (),
 ) -> tuple[ProductionNativeReceipt, PageAudit]:
     baseline = browser_resource_snapshot()
     baseline_processes = {pid for pid, _ in baseline.processes}
@@ -253,7 +287,7 @@ def run_production_native_phase(
                     capture_prefix="native-",
                     native_zoom=True,
                 )
-                stable.extend(_run_native_owner_journey(journey))
+                stable.extend(_run_native_owner_journey(journey, historical_fingerprints))
             finally:
                 qa.network.detach(page)
                 audit.detach()
@@ -268,9 +302,9 @@ def run_production_native_phase(
         "native-showcase-focused-control",
         "native-admin-action-probe-503",
         "native-admin-action-enable-401",
-        "native-admin-upstream-post-cleanup",
         "native-admin-downstream-post-cleanup",
         "native-admin-cjk-xss-safe",
+        "native-admin-upstream-post-cleanup",
         "native-admin-stale-offline",
         "native-admin-empty-injected",
         "native-admin-clipboard-failure-post-cleanup",

@@ -27,8 +27,12 @@ function recommendExcludedKey(upstreams, overview, reference) {
   }
   if (trackedReplacement?.routing_state === "eligible") {
     const source = upstreams.find((item) => item.id === replacementContext.sourceId);
-    if (source?.last_status_class === "invalid_credential") {
-      recommendCredentialRecovery(source, overview, upstreams);
+    if (source) {
+      const action = source.enabled ? "disable" : "delete";
+      setText("decision-state", `Replacement ready · ${upstreams.length} registered keys`);
+      setText("decision-title", `${source.enabled ? "Disable" : "Delete"} replaced ${keyHandle(source)}`);
+      setText("decision-explanation", `${keyHandle(trackedReplacement)} is verified and enabled. ${source.enabled ? `Disable ${keyHandle(source)} now; after confirmation, delete it.` : `Delete ${keyHandle(source)} now`} to return to exactly two registered, eligible keys.`);
+      setRecommendation("review", `${source.enabled ? "Review disable for" : "Review delete for"} ${keyHandle(source)}`, source.id, action);
       return true;
     }
   }

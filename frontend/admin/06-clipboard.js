@@ -105,7 +105,8 @@ async function finishCredentialDismissal(recoveredClipboardFailure, clipboardUnt
   byId("one-time-token").value = "";
   setText("credential-title", "Store this credential now");
   setText("credential-target", "");
-  byId("copy-token").textContent = "Copy credential";
+  byId("credential-id").value = "";
+  byId("copy-token").textContent = "Copy one-time bearer";
   byId("credential-status").hidden = true;
   byId("credential-status").textContent = "";
   byId("clipboard-error").hidden = true;

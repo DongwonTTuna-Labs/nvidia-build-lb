@@ -1,0 +1,4685 @@
+{
+  "manifest_sha256": "80478bdcac8bde271f241fba8ac5a855dab37ead7a4caf01f0959a7a770b100c",
+  "manifest_sha256_basis": "RFC8785 JCS of this object with manifest_sha256 omitted",
+  "schema": "nblb",
+  "version": 1,
+  "foreign_key_defaults": {
+    "match": "SIMPLE",
+    "on_update": "NO ACTION",
+    "deferrable": false,
+    "initially_deferred": false,
+    "on_delete": "NO ACTION"
+  },
+  "tables": [
+    {
+      "name": "routing_configuration",
+      "columns": [
+        {
+          "name": "singleton",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "generation",
+          "type": "bigint",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "singleton"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_routing_configuration_singleton_1",
+          "predicate": "singleton=1"
+        },
+        {
+          "name": "ck_routing_configuration_generation_0",
+          "predicate": "generation>=0"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "singleton",
+        "generation"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#routing_configuration"
+    },
+    {
+      "name": "profile_routing_state",
+      "columns": [
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "generation",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "next_slot",
+          "type": "smallint",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "profile_id"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_profile_routing_state_generation_0",
+          "predicate": "generation>=0"
+        },
+        {
+          "name": "ck_profile_routing_state_next_slot_in_1_2",
+          "predicate": "next_slot in (1,2)"
+        },
+        {
+          "name": "ck_profile_routing_state_profile_enum",
+          "predicate": "profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "profile_id",
+        "generation",
+        "next_slot"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#profile_routing_state"
+    },
+    {
+      "name": "upstream_keys",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "label",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "lifecycle",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "slot_no",
+          "type": "smallint",
+          "nullable": true
+        },
+        {
+          "name": "staged_intent",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "target_slot_no",
+          "type": "smallint",
+          "nullable": true
+        },
+        {
+          "name": "enabled",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "ciphertext",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "nonce",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "tag",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "fingerprint",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "global_health_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "next_global_health_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "last_applied_global_health_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "global_last_failure_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "envelope_version",
+          "type": "smallint",
+          "nullable": true
+        },
+        {
+          "name": "key_generation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_upstream_keys_1",
+          "columns": [
+            "fingerprint"
+          ],
+          "deferrable": false
+        },
+        {
+          "name": "uq_upstream_keys_2",
+          "columns": [
+            "id",
+            "fingerprint"
+          ],
+          "deferrable": false
+        },
+        {
+          "name": "uq_upstream_keys_3",
+          "columns": [
+            "slot_no"
+          ],
+          "deferrable": true,
+          "initially_deferred": false
+        }
+      ],
+      "partial_indexes": [
+        {
+          "name": "upstream_keys_one_staged",
+          "expressions": ["true"],
+          "predicate": "lifecycle = 'staged'",
+          "unique": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "ck_upstream_keys_lifecycle_slot_cardinality",
+          "predicate": "lifecycle IN ('staged','assigned','retirement_pending','retired') AND ((lifecycle='assigned') = (slot_no IS NOT NULL)) AND (slot_no IS NULL OR slot_no IN (1,2))"
+        },
+        {
+          "name": "ck_upstream_keys_envelope_all_or_none",
+          "predicate": "(envelope_version IS NULL AND key_generation_id IS NULL AND ciphertext IS NULL AND nonce IS NULL AND tag IS NULL) OR (envelope_version=2 AND key_generation_id IS NOT NULL AND ciphertext IS NOT NULL AND nonce IS NOT NULL AND tag IS NOT NULL)"
+        },
+        {
+          "name": "ck_upstream_keys_enabled_implies_assigned",
+          "predicate": "enabled = false OR lifecycle='assigned'"
+        },
+        {
+          "name": "ck_upstream_keys_lifecycle_envelope_truth_table",
+          "predicate": "(lifecycle='staged' AND slot_no IS NULL AND staged_intent IN ('first','second','replacement') AND target_slot_no IN (1,2) AND enabled=false AND envelope_version IS NOT NULL AND key_generation_id IS NOT NULL AND ciphertext IS NOT NULL AND nonce IS NOT NULL AND tag IS NOT NULL) OR (lifecycle='assigned' AND slot_no IN (1,2) AND staged_intent IS NULL AND target_slot_no IS NULL AND envelope_version IS NOT NULL AND key_generation_id IS NOT NULL AND ciphertext IS NOT NULL AND nonce IS NOT NULL AND tag IS NOT NULL) OR (lifecycle='retirement_pending' AND slot_no IS NULL AND staged_intent IS NULL AND target_slot_no IS NULL AND enabled=false AND envelope_version IS NOT NULL AND key_generation_id IS NOT NULL AND ciphertext IS NOT NULL AND nonce IS NOT NULL AND tag IS NOT NULL) OR (lifecycle='retired' AND slot_no IS NULL AND staged_intent IS NULL AND target_slot_no IS NULL AND enabled=false AND envelope_version IS NULL AND key_generation_id IS NULL AND ciphertext IS NULL AND nonce IS NULL AND tag IS NULL)"
+        },
+        {
+          "name": "ck_upstream_keys_health_sequence_monotonic",
+          "predicate": "next_global_health_seq >= 0 AND last_applied_global_health_seq >= 0 AND last_applied_global_health_seq <= next_global_health_seq"
+        },
+        {
+          "name": "upstream_keys_nonce_length",
+          "predicate": "nonce IS NULL OR octet_length(nonce)=12"
+        },
+        {
+          "name": "upstream_keys_tag_length",
+          "predicate": "tag IS NULL OR octet_length(tag)=16"
+        },
+        {
+          "name": "ck_upstream_keys_fingerprint_length_32",
+          "predicate": "octet_length(fingerprint)=32"
+        },
+        {
+          "name": "ck_upstream_keys_ciphertext_length",
+          "predicate": "ciphertext IS NULL OR octet_length(ciphertext) BETWEEN 38 AND 198"
+        },
+        {
+          "name": "upstream_keys_created_updated_order",
+          "predicate": "updated_at >= created_at"
+        },
+        {
+          "name": "ck_upstream_keys_label_shape",
+          "predicate": "(lifecycle='retired' AND (label IS NULL OR (char_length(label) BETWEEN 1 AND 128 AND btrim(label)=label AND label !~ '[[:cntrl:]]'))) OR (lifecycle IN ('staged','assigned','retirement_pending') AND label IS NOT NULL AND char_length(label) BETWEEN 1 AND 128 AND btrim(label)=label AND label !~ '[[:cntrl:]]')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "upstream_keys_key_generation_fk",
+          "columns": ["key_generation_id"],
+          "references": "vault_key_generations(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_upstream_key_update",
+          "function": "nblb_guard_upstream_key_update",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "label",
+        "lifecycle",
+        "slot_no",
+        "staged_intent",
+        "target_slot_no",
+        "enabled",
+        "ciphertext",
+        "nonce",
+        "tag",
+        "fingerprint",
+        "global_health_state",
+        "next_global_health_seq",
+        "last_applied_global_health_seq",
+        "global_last_failure_at",
+        "envelope_version",
+        "key_generation_id",
+        "created_at",
+        "updated_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#upstream_keys"
+    },
+    {
+      "name": "key_profile_state",
+      "columns": [
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "current_proof_revision",
+          "type": "bigint",
+          "nullable": true
+        },
+        {
+          "name": "entitlement",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "protocol_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "rate_cooldown_until",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "transient_cooldown_until",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "rate_streak",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "transient_streak",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "next_health_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "last_applied_health_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "in_flight",
+          "type": "bigint",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "key_id",
+        "profile_id"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_key_profile_state_streaks_0",
+          "predicate": "rate_streak >= 0 AND transient_streak >= 0"
+        },
+        {
+          "name": "ck_key_profile_state_cooldown_pair",
+          "predicate": "(rate_cooldown_until IS NULL OR rate_streak > 0) AND (transient_cooldown_until IS NULL OR transient_streak > 0)"
+        },
+    {
+      "name": "ck_key_profile_state_in_flight_0",
+      "predicate": "next_health_seq >= 0 AND last_applied_health_seq >= 0 AND last_applied_health_seq <= next_health_seq AND in_flight >= 0"
+    },
+    {
+      "name": "ck_key_profile_state_entitlement_enum",
+      "predicate": "entitlement IN ('unknown','ok','not_entitled','credits_exhausted')"
+    },
+    {
+      "name": "ck_key_profile_state_protocol_enum",
+      "predicate": "protocol_state IN ('clear','protocol_quarantined')"
+    },
+    {
+      "name": "ck_key_profile_state_profile_enum",
+      "predicate": "profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')"
+    }
+      ],
+      "foreign_keys": [
+        {
+          "name": "key_profile_state_key_fk",
+          "columns": [
+            "key_id"
+          ],
+          "references": "upstream_keys(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "key_profile_state_current_proof_fk",
+          "columns": [
+            "key_id",
+            "profile_id",
+            "current_proof_revision"
+          ],
+          "references": "key_profile_proofs(key_id,profile_id,proof_revision)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "key_id",
+        "profile_id",
+        "current_proof_revision",
+        "entitlement",
+        "protocol_state",
+        "rate_cooldown_until",
+        "transient_cooldown_until",
+        "rate_streak",
+        "transient_streak",
+        "next_health_seq",
+        "last_applied_health_seq",
+        "in_flight"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#key_profile_state"
+    },
+    {
+      "name": "downstream_credentials",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "label",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "digest_version",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "digest",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "scopes",
+          "type": "text[]",
+          "nullable": false
+        },
+        {
+          "name": "active",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "revoked_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "request_count",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "last_used_at",
+          "type": "timestamptz",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_downstream_credentials_1",
+          "columns": [
+            "digest_version",
+            "digest"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_downstream_credentials_digest_length_32",
+          "predicate": "octet_length(digest)=32"
+        },
+        {
+          "name": "ck_downstream_credentials_active_revoked_pair",
+          "predicate": "(active AND revoked_at IS NULL) OR ((NOT active) AND revoked_at IS NOT NULL)"
+        },
+    {
+      "name": "ck_downstream_credentials_scope_enum",
+          "predicate": "nblb_is_canonical_scopes(scopes)"
+    },
+    {
+      "name": "ck_downstream_credentials_digest_version",
+      "predicate": "digest_version IN ('downstream_v2','legacy_sha256_v1') AND (digest_version='downstream_v2' OR active=false)"
+    },
+        {
+          "name": "ck_downstream_credentials_request_count_0",
+          "predicate": "request_count>=0"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [
+        {
+          "name": "nblb_guard_downstream_credential_update",
+          "function": "nblb_guard_downstream_credential_update",
+          "events": [
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "label",
+        "digest_version",
+        "digest",
+        "scopes",
+        "active",
+        "revoked_at",
+        "request_count",
+        "created_at",
+        "last_used_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#downstream_credentials"
+    },
+    {
+      "name": "admin_operations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "request_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "terminal_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "error_code",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "phase",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "progress",
+          "type": "jsonb",
+          "nullable": true
+        },
+        {
+          "name": "cancellable",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "terminal_event_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "evidence_event_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "resource_kind",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "resource_uuid",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "resource_literal",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "result_json",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "error_json",
+          "type": "bytea",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_admin_operations_closed_operation_state",
+          "predicate": "state IN ('queued','running','cancel_requested','succeeded','failed','cancelled','recovery_required') AND ((state IN ('queued','running','cancel_requested') AND terminal_at IS NULL AND terminal_event_id IS NULL AND evidence_event_id IS NULL AND result_json IS NULL AND error_json IS NULL) OR (state IN ('succeeded','failed','cancelled','recovery_required') AND terminal_at IS NOT NULL AND terminal_event_id IS NOT NULL AND evidence_event_id IS NOT NULL AND ((state='succeeded' AND result_json IS NOT NULL AND error_json IS NULL) OR (state<>'succeeded' AND result_json IS NULL AND error_json IS NOT NULL))))"
+        },
+        {
+          "name": "ck_admin_operations_request_hash_length_32",
+          "predicate": "octet_length(request_sha256)=32"
+        },
+        {
+          "name": "ck_admin_operations_terminal_timestamp_follows_state",
+          "predicate": "((state IN ('queued','running','cancel_requested')) = (terminal_at IS NULL)) AND updated_at >= created_at"
+        },
+        {
+          "name": "ck_admin_operations_kind_enum",
+          "predicate": "kind IN ('upstream_create','upstream_probe','upstream_assign','replacement_create','replacement_probe','replacement_commit','staged_delete','slot_disable','slot_enable','upstream_reset','downstream_issue','downstream_revoke','operation_cancel')"
+        },
+        {
+          "name": "ck_admin_operations_phase_enum",
+          "predicate": "phase IN ('accepted','planning','case_dispatched','case_cleanup','drain_requested','draining','committing','reopening','terminal')"
+        },
+        {
+          "name": "ck_admin_operations_resource_union",
+          "predicate": "(resource_kind IS NULL AND resource_uuid IS NULL AND resource_literal IS NULL) OR (resource_kind IN ('upstream_key','slot','downstream_credential','operation') AND ((resource_kind IN ('upstream_key','downstream_credential','operation') AND resource_uuid IS NOT NULL AND resource_literal IS NULL) OR (resource_kind='slot' AND resource_uuid IS NULL AND resource_literal IN ('1','2'))))"
+        },
+        {
+          "name": "ck_admin_operations_error_code_enum",
+          "predicate": "error_code IS NULL OR error_code IN ('invalid_admin_token','unsupported_media_type','request_too_large','invalid_json','stale_generation','resource_conflict','operation_id_conflict','invalid_state','upstream_unavailable','upstream_rejected','cancelled','recovery_required')"
+        },
+        {
+          "name": "ck_admin_operations_result_error_json_shape",
+          "predicate": "((state='succeeded' AND result_json IS NOT NULL AND nblb_is_admin_operation_result(result_json) AND error_json IS NULL AND error_code IS NULL) OR (state IN ('failed','cancelled','recovery_required') AND result_json IS NULL AND error_json IS NOT NULL AND nblb_is_admin_operation_error(error_json,error_code) AND error_code IS NOT NULL))"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "admin_operations_terminal_event_fk",
+          "columns": ["terminal_event_id"],
+          "references": "events(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": true,
+          "initially_deferred": true
+        },
+        {
+          "name": "admin_operations_evidence_event_fk",
+          "columns": ["evidence_event_id"],
+          "references": "events(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_admin_operation_update",
+          "function": "nblb_guard_admin_operation_update",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "kind",
+        "state",
+        "request_sha256",
+        "created_at",
+        "updated_at",
+        "terminal_at",
+        "error_code",
+        "phase",
+        "progress",
+        "cancellable",
+        "terminal_event_id",
+        "evidence_event_id",
+        "resource_kind",
+        "resource_uuid",
+        "resource_literal",
+        "result_json",
+        "error_json"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#admin_operations"
+    },
+    {
+      "name": "mutation_intents",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "request_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "terminal_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "method",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "path",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "input_class",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "expected_configuration_generation",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "prepared_request_format",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "prepared_request_body",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "prepared_request_sha256",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "terminal_outcome",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "terminal_operation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "terminal_error_code",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "fingerprint_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "request_fingerprint",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "prepared_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "acknowledged_at",
+          "type": "timestamptz",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [],
+      "partial_indexes": [
+        {
+          "name": "mutation_intents_one_open",
+          "expressions": ["true"],
+          "predicate": "acknowledged_at IS NULL",
+          "unique": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "ck_mutation_intents_closed_intent_state",
+          "predicate": "state IN ('prepared','executing','terminal') AND ((state IN ('prepared','executing') AND terminal_at IS NULL AND terminal_outcome IS NULL AND terminal_operation_id IS NULL AND terminal_error_code IS NULL) OR (state='terminal' AND terminal_at IS NOT NULL AND terminal_outcome IN ('succeeded','rejected_stable','abandoned') AND ((terminal_outcome='succeeded' AND terminal_operation_id IS NOT NULL AND terminal_error_code IS NULL) OR (terminal_outcome='rejected_stable' AND terminal_operation_id IS NULL AND terminal_error_code IS NOT NULL) OR (terminal_outcome='abandoned' AND terminal_operation_id IS NULL AND terminal_error_code IS NULL))))"
+        },
+        {
+          "name": "ck_mutation_intents_request_hash_length_32",
+          "predicate": "octet_length(request_sha256)=32"
+        },
+        {
+          "name": "ck_mutation_intents_resource_union",
+          "predicate": "resource_kind IN ('upstream_key','slot','downstream_credential','operation') AND resource_id IS NOT NULL"
+        },
+        {
+          "name": "mutation_intents_prepared_body_pair",
+          "predicate": "((prepared_request_body IS NULL AND prepared_request_sha256 IS NULL AND prepared_request_format IS NULL) OR (prepared_request_body IS NOT NULL AND prepared_request_sha256 IS NOT NULL AND octet_length(prepared_request_sha256)=32 AND prepared_request_format='canonical-json-v1'))"
+        },
+        {
+          "name": "ck_mutation_intents_kind_enum",
+          "predicate": "kind IN ('upstream_create','upstream_probe','upstream_assign','replacement_create','replacement_probe','replacement_commit','staged_delete','slot_disable','slot_enable','upstream_reset','downstream_issue','downstream_revoke','operation_cancel')"
+        },
+        {
+          "name": "ck_mutation_intents_input_class_enum",
+          "predicate": "input_class IN ('secret','nonsecret')"
+        },
+        {
+          "name": "ck_mutation_intents_fingerprint_state_enum",
+          "predicate": "fingerprint_state IN ('not_computed','stored') AND ((fingerprint_state='not_computed' AND request_fingerprint IS NULL) OR (fingerprint_state='stored' AND request_fingerprint IS NOT NULL AND octet_length(request_fingerprint)=32)) AND ((state='prepared' AND ((input_class='secret' AND fingerprint_state='not_computed') OR (input_class='nonsecret' AND fingerprint_state='stored'))) OR (state IN ('executing','terminal') AND fingerprint_state='stored') OR (input_class='secret' AND state='terminal' AND terminal_outcome='rejected_stable' AND terminal_error_code IN ('unsupported_media_type','request_too_large') AND fingerprint_state='not_computed'))"
+        },
+        {
+          "name": "ck_mutation_intents_prepared_format",
+          "predicate": "prepared_request_format IS NULL OR prepared_request_format='canonical-json-v1'"
+        },
+        {
+          "name": "ck_mutation_intents_secret_body_matrix",
+          "predicate": "(input_class='secret' AND kind IN ('upstream_create','replacement_create') AND prepared_request_body IS NULL AND prepared_request_sha256 IS NULL AND prepared_request_format IS NULL) OR (input_class='nonsecret' AND kind NOT IN ('upstream_create','replacement_create') AND prepared_request_body IS NOT NULL AND prepared_request_sha256 IS NOT NULL AND prepared_request_format='canonical-json-v1' AND fingerprint_state='stored' AND request_fingerprint=prepared_request_sha256)"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "mutation_intents_terminal_operation_fk",
+          "columns": ["terminal_operation_id"],
+          "references": "admin_operations(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_mutation_intent_update",
+          "function": "nblb_guard_mutation_intent_update",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "kind",
+        "state",
+        "resource_kind",
+        "resource_id",
+        "request_sha256",
+        "created_at",
+        "updated_at",
+        "terminal_at",
+        "method",
+        "path",
+        "input_class",
+        "expected_configuration_generation",
+        "prepared_request_format",
+        "prepared_request_body",
+        "prepared_request_sha256",
+        "terminal_outcome",
+        "terminal_operation_id",
+        "terminal_error_code",
+        "fingerprint_state",
+        "request_fingerprint",
+        "prepared_at",
+        "acknowledged_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#mutation_intents"
+    },
+    {
+      "name": "attentions",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "code",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_uuid",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "resource_literal",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "resource_key",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "operation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "blocking",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "first_seen_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "next_retry_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "evidence_event_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "resolved_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "resolved_event_id",
+          "type": "uuid",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [],
+      "partial_indexes": [
+        {
+          "name": "attentions_active_code_resource_idx",
+          "columns": ["code", "resource_key"],
+          "predicate": "resolved_at IS NULL",
+          "unique": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "ck_attentions_code_enum",
+          "predicate": "code IN ('asset_create_unknown','asset_cleanup_pending','operation_recovery_required','probe_failed','configuration_stale','backup_gate_missing','release_failed','hermes_failed','provider_contract_drift','public_route_degraded')"
+        },
+        {
+          "name": "ck_attentions_resource_union",
+          "predicate": "resource_kind IN ('upstream_key','downstream_credential','operation','asset','backup','release','hermes','public_route','slot','profile') AND ((resource_kind IN ('upstream_key','downstream_credential','operation','asset','backup','release','hermes') AND resource_uuid IS NOT NULL AND resource_literal IS NULL) OR (resource_kind='public_route' AND resource_uuid IS NULL AND resource_literal='nvidia-lb.dongwontuna.net') OR (resource_kind='slot' AND resource_uuid IS NULL AND resource_literal IN ('1','2')) OR (resource_kind='profile' AND resource_uuid IS NULL AND resource_literal IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')))"
+        },
+        {
+          "name": "ck_attentions_resource_key_canonical",
+          "predicate": "resource_key = canonical_resource_key(resource_kind,resource_uuid,resource_literal)"
+        },
+        {
+          "name": "ck_attentions_timestamp_ordering",
+          "predicate": "updated_at >= first_seen_at AND (next_retry_at IS NULL OR next_retry_at >= updated_at) AND ((resolved_at IS NULL AND resolved_event_id IS NULL) OR (resolved_at IS NOT NULL AND resolved_event_id IS NOT NULL AND resolved_at >= updated_at))"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "evidence_event_id"
+          ],
+          "references": "events(id)",
+          "on_delete": "RESTRICT",
+          "name": "attentions_events_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "columns": [
+            "resolved_event_id"
+          ],
+          "references": "events(id)",
+          "on_delete": "RESTRICT",
+          "name": "attentions_events_fk_2",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_attention_insert_update",
+          "function": "nblb_guard_attention_insert_update",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "code",
+        "resource_kind",
+        "resource_uuid",
+        "resource_literal",
+        "resource_key",
+        "operation_id",
+        "blocking",
+        "first_seen_at",
+        "updated_at",
+        "next_retry_at",
+        "evidence_event_id",
+        "resolved_at",
+        "resolved_event_id"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#attentions"
+    },
+    {
+      "name": "evidence",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "event_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "recorded_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "variant",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_uuid",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "resource_literal",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "operation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "canonical_json",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "payload_sha256",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_evidence_1",
+          "columns": [
+            "event_id"
+          ],
+          "deferrable": false
+        },
+        {
+          "name": "uq_evidence_2",
+          "columns": [
+            "id",
+            "event_id"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_evidence_payload_hash_length_32",
+          "predicate": "octet_length(payload_sha256)=32"
+        },
+        {
+          "name": "ck_evidence_canonical_jcs",
+          "predicate": "nblb_is_canonical_jcs(canonical_json) AND nblb_is_secret_free_jcs(canonical_json) AND payload_sha256 = public.digest(canonical_json,'sha256')"
+        },
+        {
+          "name": "ck_evidence_secret_free_union",
+          "predicate": "nblb_is_secret_free_jcs(canonical_json)"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "evidence_event_fk",
+          "columns": [
+            "event_id"
+          ],
+          "references": "events(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_evidence_insert",
+          "function": "nblb_guard_evidence_insert",
+          "events": [
+            "INSERT"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "nblb_guard_evidence_immutable",
+          "function": "nblb_guard_evidence_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "nblb_guard_event_evidence_pair",
+          "function": "nblb_guard_event_evidence_pair",
+          "events": [
+            "INSERT",
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "AFTER",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": true,
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "event_id",
+        "recorded_at",
+        "variant",
+        "resource_kind",
+        "resource_uuid",
+        "resource_literal",
+        "operation_id",
+        "canonical_json",
+        "payload_sha256"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#evidence"
+    },
+    {
+      "name": "request_terminals",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "request_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "admission_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "runtime_epoch_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "class",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "lifecycle_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "status_code",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "response_shape_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "terminal_receipt_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "budget_lease_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "delivery_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "handoff_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "completed_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "abandoned_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "admission_released_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "committed_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "event_id",
+          "type": "uuid",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_request_terminals_1",
+          "columns": [
+            "request_id"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_request_terminals_no_attempt_lifecycle",
+          "predicate": "lifecycle_state='admitted_no_attempt' AND class IN ('method','media','framing','schema','body_timeout','budget','cancelled') AND ((class='budget') = (budget_lease_id IS NULL))"
+        },
+        {
+          "name": "ck_request_terminals_hash_lengths_32",
+          "predicate": "octet_length(response_shape_sha256)=32 AND octet_length(terminal_receipt_sha256)=32"
+        },
+        {
+          "name": "ck_request_terminals_delivery_timestamps",
+          "predicate": "(delivery_state='not_applicable' AND handoff_at IS NULL AND completed_at IS NULL AND abandoned_at IS NULL) OR (delivery_state='body_complete' AND handoff_at IS NOT NULL AND completed_at IS NOT NULL AND abandoned_at IS NULL) OR (delivery_state='abandoned' AND completed_at IS NULL AND abandoned_at IS NOT NULL)"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "admission_id"
+          ],
+          "references": "intake_admissions(id)",
+          "on_delete": "RESTRICT",
+          "name": "request_terminals_intake_admissions_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "columns": [
+            "runtime_epoch_id"
+          ],
+          "references": "runtime_epochs(id)",
+          "on_delete": "RESTRICT",
+          "name": "request_terminals_runtime_epochs_fk_2",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "columns": [
+            "event_id"
+          ],
+          "references": "events(id)",
+          "on_delete": "RESTRICT",
+          "deferrable": true,
+          "name": "request_terminals_events_fk_3",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "initially_deferred": true
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_request_terminal_immutable",
+          "function": "nblb_guard_request_terminal_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "request_id",
+        "admission_id",
+        "runtime_epoch_id",
+        "class",
+        "lifecycle_state",
+        "status_code",
+        "response_shape_sha256",
+        "terminal_receipt_sha256",
+        "budget_lease_id",
+        "delivery_state",
+        "handoff_at",
+        "completed_at",
+        "abandoned_at",
+        "admission_released_at",
+        "committed_at",
+        "event_id"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#request_terminals"
+    },
+    {
+      "name": "legacy_migration_audit",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "transition_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "source_schema_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "source_cursor_projection",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "source_counter_projection",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "transformed_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "receipt_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "canonical_json",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_legacy_migration_audit_1",
+          "columns": [
+            "transition_id"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_legacy_migration_audit_hash_lengths_32",
+          "predicate": "octet_length(receipt_sha256)=32"
+        },
+        {
+          "name": "ck_legacy_migration_audit_canonical_jcs",
+          "predicate": "nblb_is_canonical_jcs(canonical_json) AND nblb_is_secret_free_jcs(canonical_json) AND receipt_sha256 = public.digest(canonical_json,'sha256')"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [
+        {
+          "name": "nblb_guard_legacy_migration_audit_immutable",
+          "function": "nblb_guard_legacy_migration_audit_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "transition_id",
+        "source_schema_sha256",
+        "source_cursor_projection",
+        "source_counter_projection",
+        "transformed_at",
+        "receipt_sha256",
+        "canonical_json"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#legacy_migration_audit"
+    },
+    {
+      "name": "intake_control",
+      "columns": [
+        {
+          "name": "singleton",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "mode",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "owner_kind",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "owner_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "prior_mode",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "phase",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "singleton"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_intake_control_singleton_1",
+          "predicate": "singleton=1"
+        },
+        {
+          "name": "ck_intake_control_epoch_0",
+          "predicate": "epoch>=0"
+        },
+        {
+          "name": "ck_intake_control_mode_owner_phase_matrix",
+          "predicate": "mode IN ('open','draining','closed') AND ((mode='open' AND owner_kind IS NULL AND owner_id IS NULL AND prior_mode IS NULL AND phase IS NULL) OR (mode IN ('draining','closed') AND owner_kind IN ('reset','release','restore') AND owner_id IS NOT NULL AND prior_mode IN ('open','closed') AND phase IN ('requested','quiescing','quiescent','commit_irreversible','reopen_requested')))"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [
+        {
+          "name": "nblb_guard_intake_control_update",
+          "function": "nblb_guard_intake_control_update",
+          "events": [
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "singleton",
+        "epoch",
+        "mode",
+        "owner_kind",
+        "owner_id",
+        "prior_mode",
+        "phase",
+        "updated_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#intake_control"
+    },
+    {
+      "name": "intake_admissions",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "epoch",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "class",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "operation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "started_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_intake_admissions_epoch_0",
+          "predicate": "epoch>=0"
+        },
+        {
+          "name": "ck_intake_admissions_class_enum",
+          "predicate": "class IN ('public','admin_mutation','probe_case','cleanup')"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [
+        {
+          "name": "nblb_guard_intake_admission_delete",
+          "function": "nblb_guard_intake_admission_delete",
+          "events": [
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "epoch",
+        "class",
+        "operation_id",
+        "started_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#intake_admissions"
+    },
+    {
+      "name": "runtime_epochs",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "boot_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "process_pid",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "process_start_ticks",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "started_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "ended_at",
+          "type": "timestamptz",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_runtime_epochs_1",
+          "columns": [
+            "boot_id",
+            "process_pid",
+            "process_start_ticks"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [
+        {
+          "name": "runtime_epochs_one_open",
+          "expressions": ["true"],
+          "predicate": "ended_at IS NULL",
+          "unique": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "ck_runtime_epochs_pid_start_ticks_0",
+          "predicate": "process_pid >= 0 AND process_start_ticks >= 0"
+        },
+        {
+          "name": "ck_runtime_epochs_ended_at_started_at",
+          "predicate": "ended_at>=started_at"
+        },
+        {
+          "name": "runtime_epochs_time",
+          "predicate": "ended_at IS NULL OR ended_at >= started_at"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [
+        {
+          "name": "nblb_guard_runtime_epoch_update",
+          "function": "nblb_guard_runtime_epoch_update",
+          "events": [
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "boot_id",
+        "process_pid",
+        "process_start_ticks",
+        "started_at",
+        "ended_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#runtime_epochs"
+    },
+    {
+      "name": "public_route_observations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "runtime_epoch_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "result",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "failure_class",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "latency_ms",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "observed_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_public_route_observations_result_failure_matrix",
+          "predicate": "result IN ('success','failure') AND ((result='success' AND failure_class IS NULL) OR (result='failure' AND failure_class IS NOT NULL))"
+        },
+        {
+          "name": "ck_public_route_observations_latency_ms_0",
+          "predicate": "latency_ms>=0"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "runtime_epoch_id"
+          ],
+          "references": "runtime_epochs(id)",
+          "on_delete": "RESTRICT",
+          "name": "public_route_observations_runtime_epochs_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_public_route_observation_insert",
+          "function": "nblb_guard_public_route_observation_insert",
+          "events": [
+            "INSERT"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "runtime_epoch_id",
+        "result",
+        "failure_class",
+        "latency_ms",
+        "observed_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#public_route_observations"
+    },
+    {
+      "name": "live_qa_fault_permits",
+      "columns": [
+        {
+          "name": "permit_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "run_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "fault",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "expires_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "consumed_attempt_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "command_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "expected_configuration_generation",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "consumed_at",
+          "type": "timestamptz",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "permit_id"
+      ],
+      "unique": [
+        {
+          "name": "uq_live_qa_fault_permits_1",
+          "columns": [
+            "run_id",
+            "key_id",
+            "profile_id",
+            "fault"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [
+        {
+          "name": "live_qa_fault_permits_one_armed",
+          "expressions": ["true"],
+          "predicate": "state='armed'",
+          "unique": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "ck_live_qa_fault_permits_fault_enum",
+          "predicate": "fault IN ('pre_dispatch_connect_failure','received_429')"
+        },
+        {
+          "name": "ck_live_qa_fault_permits_state_enum",
+          "predicate": "state IN ('armed','consumed','expired') AND ((state='armed' AND consumed_attempt_id IS NULL AND consumed_at IS NULL) OR (state='consumed' AND consumed_attempt_id IS NOT NULL AND consumed_at IS NOT NULL) OR (state='expired' AND consumed_attempt_id IS NULL AND consumed_at IS NULL))"
+        },
+        {
+          "name": "ck_live_qa_fault_permits_expires_at_created_time",
+          "predicate": "expires_at > created_at"
+        },
+        {
+          "name": "live_qa_fault_permits_command_hash",
+          "predicate": "octet_length(command_sha256)=32"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "key_id"
+          ],
+          "references": "upstream_keys(id)",
+          "on_delete": "RESTRICT",
+          "name": "live_qa_fault_permits_upstream_keys_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "columns": [
+            "consumed_attempt_id"
+          ],
+          "references": "upstream_attempts(id)",
+          "on_delete": "RESTRICT",
+          "name": "live_qa_fault_permits_upstream_attempts_fk_2",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_live_qa_fault_update",
+          "function": "nblb_guard_live_qa_fault_update",
+          "events": [
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "permit_id",
+        "run_id",
+        "key_id",
+        "profile_id",
+        "fault",
+        "state",
+        "expires_at",
+        "consumed_attempt_id",
+        "created_at",
+        "command_sha256",
+        "expected_configuration_generation",
+        "consumed_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#live_qa_fault_permits"
+    },
+    {
+      "name": "upstream_attempts",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "fingerprint",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "origin",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "runtime_epoch_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "logical_request_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "operation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "downstream_credential_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "slot_no",
+          "type": "smallint",
+          "nullable": true
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "transport_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "seal_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "terminal_outcome",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "delivery_state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "started_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "terminal_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "ordinal",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "configuration_generation",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "profile_generation",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "global_health_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "profile_health_seq",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "key_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "pair_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "magpie_key_map_digest",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "magpie_pair_map_digest",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "request_digest",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "upstream_request_maybe_sent",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "upstream_first_body_byte_observed",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "seal_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "seal_class",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "seal_projection_sha256",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "terminal_status_code",
+          "type": "integer",
+          "nullable": true
+        },
+        {
+          "name": "terminal_response_shape_sha256",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "terminal_predicate_bits",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "terminal_committed_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "health_sequence_applied",
+          "type": "boolean",
+          "nullable": true
+        },
+        {
+          "name": "handoff_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "completed_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "abandoned_at",
+          "type": "timestamptz",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_upstream_attempts_1",
+          "columns": [
+            "fingerprint"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_upstream_attempts_origin_nullability",
+          "predicate": "origin IN ('public','probe') AND ((origin='public' AND operation_id IS NULL AND downstream_credential_id IS NOT NULL AND slot_no IN (1,2) AND ordinal IN (1,2)) OR (origin='probe' AND operation_id IS NOT NULL AND downstream_credential_id IS NULL AND (slot_no IS NULL OR slot_no IN (1,2)) AND ordinal >= 0))"
+        },
+        {
+          "name": "ck_upstream_attempts_slot_enum",
+          "predicate": "slot_no IS NULL OR slot_no IN (1,2)"
+        },
+        {
+          "name": "ck_upstream_attempts_terminal_state_matrix",
+          "predicate": "(state='started' AND seal_state='unsealed' AND terminal_outcome IS NULL AND terminal_at IS NULL AND seal_id IS NULL AND seal_class IS NULL AND seal_projection_sha256 IS NULL AND terminal_status_code IS NULL AND terminal_response_shape_sha256 IS NULL AND terminal_predicate_bits IS NULL AND terminal_committed_at IS NULL AND health_sequence_applied IS NULL) OR (state='terminal' AND seal_state='sealed' AND terminal_outcome IS NOT NULL AND terminal_at IS NOT NULL AND seal_id IS NOT NULL AND seal_class=terminal_outcome AND seal_projection_sha256 IS NOT NULL AND terminal_committed_at IS NOT NULL AND health_sequence_applied IS NOT NULL)"
+        },
+        {
+          "name": "ck_upstream_attempts_delivery_matrix",
+          "predicate": "(delivery_state='not_handed_off' AND handoff_at IS NULL AND completed_at IS NULL AND abandoned_at IS NULL) OR (delivery_state='handed_off' AND handoff_at IS NOT NULL AND completed_at IS NULL AND abandoned_at IS NULL) OR (delivery_state='body_complete' AND handoff_at IS NOT NULL AND completed_at IS NOT NULL AND abandoned_at IS NULL) OR (delivery_state='abandoned' AND completed_at IS NULL AND abandoned_at IS NOT NULL)"
+        },
+        {
+          "name": "attempts_maybe_sent",
+          "predicate": "upstream_first_body_byte_observed = false OR upstream_request_maybe_sent = true"
+        },
+        {
+          "name": "attempts_digest_lengths",
+          "predicate": "octet_length(request_digest)=32"
+        },
+        {
+          "name": "ck_upstream_attempts_fingerprint_length_32",
+          "predicate": "octet_length(fingerprint)=32"
+        },
+        {
+          "name": "ck_upstream_attempts_profile_enum",
+          "predicate": "profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "runtime_epoch_id"
+          ],
+          "references": "runtime_epochs(id)",
+          "on_delete": "RESTRICT",
+          "name": "upstream_attempts_runtime_epochs_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "columns": [
+            "key_id"
+          ],
+          "references": "upstream_keys(id)",
+          "on_delete": "RESTRICT",
+          "name": "upstream_attempts_upstream_keys_fk_2",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_attempt_update",
+          "function": "nblb_guard_attempt_update",
+          "events": [
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "fingerprint",
+        "origin",
+        "runtime_epoch_id",
+        "logical_request_id",
+        "operation_id",
+        "downstream_credential_id",
+        "key_id",
+        "profile_id",
+        "slot_no",
+        "state",
+        "transport_state",
+        "seal_state",
+        "terminal_outcome",
+        "delivery_state",
+        "started_at",
+        "terminal_at",
+        "ordinal",
+        "configuration_generation",
+        "profile_generation",
+        "global_health_seq",
+        "profile_health_seq",
+        "key_proof_revision",
+        "pair_proof_revision",
+        "magpie_key_map_digest",
+        "magpie_pair_map_digest",
+        "request_digest",
+        "upstream_request_maybe_sent",
+        "upstream_first_body_byte_observed",
+        "seal_id",
+        "seal_class",
+        "seal_projection_sha256",
+        "terminal_status_code",
+        "terminal_response_shape_sha256",
+        "terminal_predicate_bits",
+        "terminal_committed_at",
+        "health_sequence_applied",
+        "handoff_at",
+        "completed_at",
+        "abandoned_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#upstream_attempts"
+    },
+    {
+      "name": "upstream_asset_intents",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "attempt_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "ordinal",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "mime",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "decoded_bytes",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "raw_sha256",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "fingerprint",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "upstream_asset_intents_attempt_ordinal_key",
+          "columns": [
+            "attempt_id",
+            "ordinal"
+          ],
+          "deferrable": false
+        },
+        {
+          "name": "upstream_asset_intents_id_key",
+          "columns": [
+            "id",
+            "key_id"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_upstream_asset_intents_raw_hash_length_32",
+          "predicate": "octet_length(raw_sha256)=32"
+        },
+        {
+          "name": "ck_upstream_asset_intents_state_enum",
+          "predicate": "state IN ('planned','create_dispatched','create_unknown','created_ephemeral','upload_dispatched','uploaded','cleanup_pending','deleted','revoked_cleanup_closed')"
+        },
+        {
+          "name": "asset_intents_ordinal",
+          "predicate": "ordinal >= 0 AND ordinal <= 9"
+        },
+        {
+          "name": "asset_intents_description",
+          "predicate": "description = concat('nblb/',attempt_id,'/',ordinal)"
+        },
+        {
+          "name": "asset_intents_fingerprint",
+          "predicate": "octet_length(fingerprint)=32"
+        },
+        {
+          "name": "asset_intents_decoded_bound",
+          "predicate": "decoded_bytes >= 0 AND decoded_bytes <= 16777216"
+        },
+        {
+          "name": "ck_upstream_asset_intents_profile_enum",
+          "predicate": "profile_id IN ('microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "asset_intents_attempt_fk",
+          "columns": [
+            "attempt_id"
+          ],
+          "references": "upstream_attempts(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "asset_intents_key_fk",
+          "columns": [
+            "key_id"
+          ],
+          "references": "upstream_keys(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_asset_intent_update",
+          "function": "nblb_guard_asset_intent_update",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "attempt_id",
+        "ordinal",
+        "key_id",
+        "profile_id",
+        "mime",
+        "decoded_bytes",
+        "raw_sha256",
+        "description",
+        "state",
+        "fingerprint",
+        "created_at",
+        "updated_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#upstream_asset_intents"
+    },
+    {
+      "name": "upstream_asset_objects",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "intent_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "provider_asset_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "provenance",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "fingerprint",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "upstream_asset_objects_key_provider_key",
+          "columns": [
+            "key_id",
+            "provider_asset_id"
+          ],
+          "deferrable": false
+        },
+        {
+          "name": "upstream_asset_objects_intent_provider_key",
+          "columns": [
+            "intent_id",
+            "provider_asset_id"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_upstream_asset_objects_provenance_enum",
+          "predicate": "provenance IN ('response','reconciliation')"
+        },
+        {
+          "name": "ck_upstream_asset_objects_state_enum",
+          "predicate": "state IN ('known','cleanup_pending','deleted')"
+        },
+        {
+          "name": "asset_objects_provider_uuid",
+          "predicate": "provider_asset_id IS NOT NULL"
+        },
+        {
+          "name": "asset_objects_fingerprint",
+          "predicate": "octet_length(fingerprint)=32"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "asset_objects_intent_key_fk",
+          "columns": [
+            "intent_id",
+            "key_id"
+          ],
+          "references": "upstream_asset_intents(id,key_id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_asset_object_update",
+          "function": "nblb_guard_asset_object_update",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "intent_id",
+        "provider_asset_id",
+        "provenance",
+        "state",
+        "created_at",
+        "key_id",
+        "fingerprint",
+        "updated_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#upstream_asset_objects"
+    },
+    {
+      "name": "events",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "occurred_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "severity",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_kind",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "resource_uuid",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "resource_literal",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "operation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "slot_no",
+          "type": "smallint",
+          "nullable": true
+        },
+        {
+          "name": "outcome",
+          "type": "text",
+          "nullable": true
+        },
+        {
+          "name": "evidence_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "canonical_json",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "payload_sha256",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_events_event_resource_union",
+          "predicate": "kind IN ('legacy_imported','legacy_token_revoked','upstream_staged','probe_terminal','assigned','replaced','upstream_reset','retired','slot_state_changed','downstream_issued','downstream_revoked','request_terminal','cooldown_changed','quarantine_changed','asset_attention','asset_quarantined','operation_recovery','attention_opened','attention_resolved','backup_terminal','restore_terminal','release_terminal','hermes_terminal') AND severity IN ('info','attention') AND resource_kind IN ('upstream_key','downstream_credential','operation','asset','backup','release','hermes','public_route','slot','profile') AND ((resource_kind IN ('upstream_key','downstream_credential','operation','asset','backup','release','hermes') AND resource_uuid IS NOT NULL AND resource_literal IS NULL) OR (resource_kind='public_route' AND resource_uuid IS NULL AND resource_literal='nvidia-lb.dongwontuna.net') OR (resource_kind='slot' AND resource_uuid IS NULL AND resource_literal IN ('1','2')) OR (resource_kind='profile' AND resource_uuid IS NULL AND resource_literal IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual'))) AND (profile_id IS NULL OR profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')) AND (slot_no IS NULL OR slot_no IN (1,2)) AND (outcome IS NULL OR outcome IN ('succeeded','failed','cancelled','recovery_required'))"
+        },
+        {
+          "name": "ck_events_payload_hash_length_32",
+          "predicate": "octet_length(payload_sha256)=32"
+        },
+        {
+          "name": "ck_events_canonical_jcs",
+          "predicate": "nblb_is_canonical_jcs(canonical_json) AND nblb_is_secret_free_jcs(canonical_json) AND payload_sha256 = public.digest(canonical_json,'sha256')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "events_evidence_pair_fk",
+          "columns": [
+            "evidence_id",
+            "id"
+          ],
+          "references": "evidence(id,event_id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_event_immutable",
+          "function": "nblb_guard_event_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "nblb_guard_event_insert",
+          "function": "nblb_guard_event_insert",
+          "events": [
+            "INSERT"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "nblb_guard_event_evidence_pair",
+          "function": "nblb_guard_event_evidence_pair",
+          "events": ["INSERT", "UPDATE", "DELETE"],
+          "timing": "AFTER",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": true,
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "occurred_at",
+        "kind",
+        "severity",
+        "resource_kind",
+        "resource_uuid",
+        "resource_literal",
+        "operation_id",
+        "profile_id",
+        "slot_no",
+        "outcome",
+        "evidence_id",
+        "canonical_json",
+        "payload_sha256"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#events"
+    },
+    {
+      "name": "vault_nonce_allocations",
+      "columns": [
+        {
+          "name": "key_generation_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "nonce",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "row_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "allocation_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "purpose",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "allocated_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "key_generation_id",
+        "nonce"
+      ],
+      "unique": [
+        {
+          "name": "uq_vault_nonce_allocations_1",
+          "columns": [
+            "allocation_id"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_vault_nonce_allocations_nonce_length_12",
+          "predicate": "octet_length(nonce)=12"
+        },
+        {
+          "name": "ck_vault_nonce_allocations_purpose_enum",
+          "predicate": "purpose IN ('create','restore','migration')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "vault_nonce_allocations_generation_fk",
+          "columns": [
+            "key_generation_id"
+          ],
+          "references": "vault_key_generations(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "vault_nonce_allocations_row_fk",
+          "columns": [
+            "row_id"
+          ],
+          "references": "upstream_keys(id)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_ledger_immutable",
+          "function": "nblb_guard_ledger_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_ledger_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "nblb_ledger_owner": [
+          "SELECT",
+          "INSERT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "key_generation_id",
+        "nonce",
+        "row_id",
+        "allocation_id",
+        "purpose",
+        "allocated_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#vault_nonce_allocations"
+    },
+    {
+      "name": "key_profile_proofs",
+      "columns": [
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "credential_fingerprint",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "profile_contract_digest",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "probe_suite_digest",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "voice_map_digest",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "completed_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "key_id",
+        "profile_id",
+        "proof_revision"
+      ],
+      "unique": [
+        {
+          "name": "uq_key_profile_proofs_1",
+          "columns": [
+            "key_id",
+            "profile_id",
+            "proof_revision",
+            "credential_fingerprint"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_key_profile_proofs_digest_lengths_32",
+          "predicate": "octet_length(credential_fingerprint)=32 AND octet_length(profile_contract_digest)=32 AND octet_length(probe_suite_digest)=32 AND (voice_map_digest IS NULL OR octet_length(voice_map_digest)=32)"
+        },
+        {
+          "name": "ck_key_profile_proofs_proof_revision_0",
+          "predicate": "proof_revision > 0"
+        },
+        {
+          "name": "ck_key_profile_proofs_profile_enum",
+          "predicate": "profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "key_profile_proofs_key_fingerprint_fk",
+          "columns": [
+            "key_id",
+            "credential_fingerprint"
+          ],
+          "references": "upstream_keys(id,fingerprint)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_key_profile_proof_immutable",
+          "function": "nblb_guard_key_profile_proof_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "key_id",
+        "profile_id",
+        "proof_revision",
+        "credential_fingerprint",
+        "profile_contract_digest",
+        "probe_suite_digest",
+        "voice_map_digest",
+        "completed_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#key_profile_proofs"
+    },
+    {
+      "name": "pair_proofs",
+      "columns": [
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "pair_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "slot1_key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "slot1_fingerprint",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "slot1_key_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "slot2_key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "slot2_fingerprint",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "slot2_key_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "profile_contract_digest",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "probe_suite_digest",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "completed_at",
+          "type": "timestamptz",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "profile_id",
+        "pair_proof_revision"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_pair_proofs_two_distinct_slots",
+          "predicate": "slot1_key_id <> slot2_key_id AND slot1_fingerprint <> slot2_fingerprint"
+        },
+        {
+          "name": "ck_pair_proofs_digest_lengths_32",
+          "predicate": "octet_length(slot1_fingerprint)=32 AND octet_length(slot2_fingerprint)=32 AND octet_length(profile_contract_digest)=32 AND octet_length(probe_suite_digest)=32"
+        },
+        {
+          "name": "ck_pair_proofs_revision_0",
+          "predicate": "pair_proof_revision > 0"
+        },
+        {
+          "name": "ck_pair_proofs_profile_enum",
+          "predicate": "profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "pair_proofs_slot1_proof_fk",
+          "columns": [
+            "slot1_key_id",
+            "profile_id",
+            "slot1_key_proof_revision",
+            "slot1_fingerprint"
+          ],
+          "references": "key_profile_proofs(key_id,profile_id,proof_revision,credential_fingerprint)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "pair_proofs_slot2_proof_fk",
+          "columns": [
+            "slot2_key_id",
+            "profile_id",
+            "slot2_key_proof_revision",
+            "slot2_fingerprint"
+          ],
+          "references": "key_profile_proofs(key_id,profile_id,proof_revision,credential_fingerprint)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_magpie_pair_sources_complete",
+          "function": "nblb_magpie_pair_sources_complete",
+          "events": [
+            "INSERT",
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "AFTER",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": true,
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "profile_id",
+        "pair_proof_revision",
+        "slot1_key_id",
+        "slot1_fingerprint",
+        "slot1_key_proof_revision",
+        "slot2_key_id",
+        "slot2_fingerprint",
+        "slot2_key_proof_revision",
+        "profile_contract_digest",
+        "probe_suite_digest",
+        "completed_at"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#pair_proofs"
+    },
+    {
+      "name": "magpie_key_voice_maps",
+      "columns": [
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "key_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "canonical_json",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "map_digest",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "key_id",
+        "profile_id",
+        "key_proof_revision"
+      ],
+      "unique": [
+        {
+          "name": "uq_magpie_key_voice_maps_1",
+          "columns": [
+            "key_id",
+            "profile_id",
+            "key_proof_revision",
+            "map_digest"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_magpie_key_voice_maps_profile_fixed",
+          "predicate": "profile_id='nvidia/magpie-tts-multilingual'"
+        },
+        {
+          "name": "ck_magpie_key_voice_maps_canonical_jcs",
+          "predicate": "nblb_is_canonical_jcs(canonical_json)"
+        },
+        {
+          "name": "ck_magpie_key_voice_maps_map_digest_length_32",
+          "predicate": "octet_length(map_digest)=32"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "key_id",
+            "profile_id",
+            "key_proof_revision"
+          ],
+          "references": "key_profile_proofs(key_id,profile_id,proof_revision)",
+          "on_delete": "RESTRICT",
+          "name": "magpie_key_voice_maps_key_profile_proofs_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_magpie_key_voice_map_immutable",
+          "function": "nblb_guard_magpie_key_voice_map_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "key_id",
+        "profile_id",
+        "key_proof_revision",
+        "canonical_json",
+        "map_digest"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#magpie_key_voice_maps"
+    },
+    {
+      "name": "magpie_key_voices",
+      "columns": [
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "key_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "voice",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "locale",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "key_id",
+        "profile_id",
+        "key_proof_revision",
+        "voice"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_magpie_key_voices_profile_fixed",
+          "predicate": "profile_id='nvidia/magpie-tts-multilingual'"
+        },
+        {
+          "name": "ck_magpie_key_voices_voice_locale_grammar",
+          "predicate": "voice ~ '^[A-Za-z0-9._-]{1,64}$' AND locale ~ '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$'"
+        },
+        {
+          "name": "ck_magpie_key_voices_kind_enum",
+          "predicate": "kind IN ('base','emotion')"
+        },
+        {
+          "name": "ck_magpie_key_voices_component_grammar",
+          "predicate": "(kind='base' AND voice ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}$') OR (kind='emotion' AND voice ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "key_id",
+            "profile_id",
+            "key_proof_revision"
+          ],
+          "references": "key_profile_proofs(key_id,profile_id,proof_revision)",
+          "on_delete": "RESTRICT",
+          "name": "magpie_key_voices_key_profile_proofs_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_magpie_key_voice_immutable",
+          "function": "nblb_guard_magpie_key_voice_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "key_id",
+        "profile_id",
+        "key_proof_revision",
+        "voice",
+        "locale",
+        "kind"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#magpie_key_voices"
+    },
+    {
+      "name": "magpie_pair_voice_maps",
+      "columns": [
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "pair_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "canonical_json",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "map_digest",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "profile_id",
+        "pair_proof_revision"
+      ],
+      "unique": [
+        {
+          "name": "uq_magpie_pair_voice_maps_1",
+          "columns": [
+            "profile_id",
+            "pair_proof_revision",
+            "map_digest"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_magpie_pair_voice_maps_profile_fixed",
+          "predicate": "profile_id='nvidia/magpie-tts-multilingual'"
+        },
+        {
+          "name": "ck_magpie_pair_voice_maps_canonical_jcs",
+          "predicate": "nblb_is_canonical_jcs(canonical_json)"
+        },
+        {
+          "name": "ck_magpie_pair_voice_maps_map_digest_length_32",
+          "predicate": "octet_length(map_digest)=32"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "profile_id",
+            "pair_proof_revision"
+          ],
+          "references": "pair_proofs(profile_id,pair_proof_revision)",
+          "on_delete": "RESTRICT",
+          "name": "magpie_pair_voice_maps_pair_proofs_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_magpie_pair_voice_map_immutable",
+          "function": "nblb_guard_magpie_pair_voice_map_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "name": "nblb_magpie_pair_sources_complete",
+          "function": "nblb_magpie_pair_sources_complete",
+          "events": [
+            "INSERT",
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "AFTER",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": true,
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "profile_id",
+        "pair_proof_revision",
+        "canonical_json",
+        "map_digest"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#magpie_pair_voice_maps"
+    },
+    {
+      "name": "magpie_pair_sources",
+      "columns": [
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "pair_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "slot_no",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "key_profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "key_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "key_map_digest",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "profile_id",
+        "pair_proof_revision",
+        "slot_no"
+      ],
+      "unique": [
+        {
+          "name": "uq_magpie_pair_sources_1",
+          "columns": [
+            "profile_id",
+            "pair_proof_revision",
+            "key_id"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_magpie_pair_sources_profile_fixed",
+          "predicate": "profile_id='nvidia/magpie-tts-multilingual' AND key_profile_id=profile_id"
+        },
+        {
+          "name": "ck_magpie_pair_sources_slot_set_exactly_1_2",
+          "predicate": "slot_no IN (1,2)"
+        },
+        {
+          "name": "ck_magpie_pair_sources_source_map_digest",
+          "predicate": "octet_length(key_map_digest)=32"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "profile_id",
+            "pair_proof_revision"
+          ],
+          "references": "pair_proofs(profile_id,pair_proof_revision)",
+          "on_delete": "RESTRICT",
+          "name": "magpie_pair_sources_pair_proofs_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "columns": [
+            "key_id",
+            "key_profile_id",
+            "key_proof_revision",
+            "key_map_digest"
+          ],
+          "references": "magpie_key_voice_maps(key_id,profile_id,key_proof_revision,map_digest)",
+          "on_delete": "RESTRICT",
+          "name": "magpie_pair_sources_magpie_key_voice_maps_fk_2",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_magpie_pair_sources_complete",
+          "function": "nblb_magpie_pair_sources_complete",
+          "events": [
+            "INSERT",
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "AFTER",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": true,
+          "deferrable": true,
+          "initially_deferred": true
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "profile_id",
+        "pair_proof_revision",
+        "slot_no",
+        "key_id",
+        "key_profile_id",
+        "key_proof_revision",
+        "key_map_digest"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#magpie_pair_sources"
+    },
+    {
+      "name": "magpie_pair_voices",
+      "columns": [
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "pair_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "voice",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "locale",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "profile_id",
+        "pair_proof_revision",
+        "voice"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_magpie_pair_voices_profile_fixed",
+          "predicate": "profile_id='nvidia/magpie-tts-multilingual'"
+        },
+        {
+          "name": "ck_magpie_pair_voices_voice_locale_grammar",
+          "predicate": "voice ~ '^[A-Za-z0-9._-]{1,64}$' AND locale ~ '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$'"
+        },
+        {
+          "name": "ck_magpie_pair_voices_kind_enum",
+          "predicate": "kind IN ('base','emotion')"
+        },
+        {
+          "name": "ck_magpie_pair_voices_component_grammar",
+          "predicate": "(kind='base' AND voice ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}$') OR (kind='emotion' AND voice ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "profile_id",
+            "pair_proof_revision"
+          ],
+          "references": "pair_proofs(profile_id,pair_proof_revision)",
+          "on_delete": "RESTRICT",
+          "name": "magpie_pair_voices_pair_proofs_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_magpie_pair_voice_immutable",
+          "function": "nblb_guard_magpie_pair_voice_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "profile_id",
+        "pair_proof_revision",
+        "voice",
+        "locale",
+        "kind"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#magpie_pair_voices"
+    },
+    {
+      "name": "published_magpie_map",
+      "columns": [
+        {
+          "name": "singleton",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "profile_id",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "pair_proof_revision",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "map_digest",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "singleton"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_published_magpie_map_singleton_1",
+          "predicate": "singleton=1"
+        },
+        {
+          "name": "ck_published_magpie_map_profile_fixed",
+          "predicate": "profile_id='nvidia/magpie-tts-multilingual'"
+        },
+        {
+          "name": "ck_published_magpie_map_map_digest_length_32",
+          "predicate": "octet_length(map_digest)=32"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "name": "published_magpie_map_pair_map_fk",
+          "columns": [
+            "profile_id",
+            "pair_proof_revision",
+            "map_digest"
+          ],
+          "references": "magpie_pair_voice_maps(profile_id,pair_proof_revision,map_digest)",
+          "match": "SIMPLE",
+          "on_delete": "RESTRICT",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_published_magpie_map_immutable",
+          "function": "nblb_guard_published_magpie_map_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "UPDATE"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "singleton",
+        "profile_id",
+        "pair_proof_revision",
+        "map_digest"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#published_magpie_map"
+    },
+    {
+      "name": "admin_operation_keys",
+      "columns": [
+        {
+          "name": "operation_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "key_id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "role",
+          "type": "text",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "operation_id",
+        "key_id"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_admin_operation_keys_role_enum",
+          "predicate": "role IN ('primary','replacement','superseded')"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "operation_id"
+          ],
+          "references": "admin_operations(id)",
+          "on_delete": "RESTRICT",
+          "name": "admin_operation_keys_admin_operations_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        },
+        {
+          "columns": [
+            "key_id"
+          ],
+          "references": "upstream_keys(id)",
+          "on_delete": "RESTRICT",
+          "name": "admin_operation_keys_upstream_keys_fk_2",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_admin_operation_key_immutable",
+          "function": "nblb_guard_admin_operation_key_immutable",
+          "events": [
+            "UPDATE",
+            "DELETE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "truncate_statement_guard": true,
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT",
+          "INSERT"
+        ],
+        "nblb_owner": [
+          "SELECT"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "operation_id",
+        "key_id",
+        "role"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#admin_operation_keys"
+    },
+    {
+      "name": "vault_key_binding",
+      "columns": [
+        {
+          "name": "singleton",
+          "type": "smallint",
+          "nullable": false
+        },
+        {
+          "name": "key_generation_id",
+          "type": "uuid",
+          "nullable": true
+        },
+        {
+          "name": "salt",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "verifier",
+          "type": "bytea",
+          "nullable": true
+        },
+        {
+          "name": "generation",
+          "type": "bigint",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "singleton"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_vault_key_binding_singleton_1",
+          "predicate": "singleton=1"
+        },
+        {
+          "name": "ck_vault_key_binding_salt_verifier_all_or_none",
+          "predicate": "(key_generation_id IS NULL AND salt IS NULL AND verifier IS NULL) OR (key_generation_id IS NOT NULL AND octet_length(salt)=32 AND octet_length(verifier)=32)"
+        },
+        {
+          "name": "ck_vault_key_binding_binding_generation",
+          "predicate": "generation >= 0"
+        }
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "key_generation_id"
+          ],
+          "references": "vault_key_generations(id)",
+          "on_delete": "RESTRICT",
+          "name": "vault_key_binding_vault_key_generations_fk_1",
+          "match": "SIMPLE",
+          "on_update": "NO ACTION",
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "triggers": [
+        {
+          "name": "nblb_guard_vault_binding_transition",
+          "function": "nblb_guard_vault_binding_transition",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT"
+        ],
+        "nblb_owner": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "singleton",
+        "key_generation_id",
+        "salt",
+        "verifier",
+        "generation"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#vault_key_binding"
+    },
+    {
+      "name": "vault_key_generations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid",
+          "nullable": false
+        },
+        {
+          "name": "state",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "created_at",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "retired_at",
+          "type": "timestamptz",
+          "nullable": true
+        },
+        {
+          "name": "manifest_digest",
+          "type": "bytea",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "id"
+      ],
+      "unique": [
+        {
+          "name": "uq_vault_key_generations_1",
+          "columns": [
+            "manifest_digest"
+          ],
+          "deferrable": false
+        }
+      ],
+      "partial_indexes": [
+        {
+          "name": "vault_key_generations_one_active",
+          "expressions": ["true"],
+          "predicate": "state='active'",
+          "unique": true
+        }
+      ],
+      "checks": [
+        {
+          "name": "ck_vault_key_generations_state_enum",
+          "predicate": "state IN ('active','retired')"
+        },
+        {
+          "name": "ck_vault_key_generations_retired_at_state_pair",
+          "predicate": "(state='active' AND retired_at IS NULL) OR (state='retired' AND retired_at IS NOT NULL)"
+        },
+        {
+          "name": "ck_vault_key_generations_manifest_digest_length_32",
+          "predicate": "octet_length(manifest_digest)=32"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [
+        {
+          "name": "nblb_guard_vault_generation_transition",
+          "function": "nblb_guard_vault_generation_transition",
+          "events": [
+            "INSERT",
+            "UPDATE"
+          ],
+          "timing": "BEFORE",
+          "level": "ROW",
+          "enabled": "ENABLE ALWAYS",
+          "constraint": false,
+          "deferrable": false,
+          "initially_deferred": false
+        }
+      ],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT"
+        ],
+        "nblb_owner": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "id",
+        "state",
+        "created_at",
+        "retired_at",
+        "manifest_digest"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#vault_key_generations"
+    },
+    {
+      "name": "_sqlx_migrations",
+      "schema": "nblb",
+      "columns": [
+        {
+          "name": "version",
+          "type": "bigint",
+          "nullable": false
+        },
+        {
+          "name": "description",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "installed_on",
+          "type": "timestamptz",
+          "nullable": false
+        },
+        {
+          "name": "success",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "checksum",
+          "type": "bytea",
+          "nullable": false
+        },
+        {
+          "name": "execution_time",
+          "type": "bigint",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "version"
+      ],
+      "unique": [],
+      "partial_indexes": [],
+      "checks": [
+        {
+          "name": "ck_sqlx_migrations_success_true",
+          "predicate": "success=true"
+        },
+        {
+          "name": "ck_sqlx_migrations_checksum_length_32",
+          "predicate": "octet_length(checksum)=32"
+        }
+      ],
+      "foreign_keys": [],
+      "triggers": [],
+      "owner": "nblb_owner",
+      "default_acl": {
+        "nblb_app": [
+          "SELECT"
+        ],
+        "nblb_owner": [
+          "SELECT",
+          "INSERT",
+          "UPDATE"
+        ],
+        "PUBLIC": [],
+        "function_execute": []
+      },
+      "canonical_projection": [
+        "version",
+        "description",
+        "installed_on",
+        "success",
+        "checksum",
+        "execution_time"
+      ],
+      "catalog_manifest_ref": "contracts/postgres/catalog-contract.v1.json#_sqlx_migrations"
+    }
+  ],
+  "column_order_rule": "columns are ordered physical columns; generated SQL must match this exact order",
+  "catalog_contract": "contracts/postgres/catalog-contract.v1.json"
+}

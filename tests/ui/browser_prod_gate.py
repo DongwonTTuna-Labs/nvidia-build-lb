@@ -34,7 +34,10 @@ from .browser_prod_states import (
     exercise_production_reload_logout,
     run_production_state_recovery,
 )
-from .browser_prod_upstream import run_production_upstream_journey
+from .browser_prod_upstream import (
+    complete_production_upstream_cleanup,
+    run_production_upstream_journey,
+)
 from .browser_public import capture_public_surfaces
 from .browser_runtime import (
     ManagedBrowserSession,
@@ -63,11 +66,11 @@ _REQUIRED_CAPTURES = (
     "admin-dashboard-post-login-cleanup",
     "admin-action-probe-503",
     "admin-action-enable-401",
-    "admin-destructive-confirmation-1280",
-    "admin-upstream-post-cleanup",
     "admin-downstream-form-1280",
     "admin-downstream-post-cleanup",
     "admin-cjk-xss-safe",
+    "admin-destructive-confirmation-1280",
+    "admin-upstream-post-cleanup",
     "admin-stale-offline",
     "admin-empty-injected",
     "admin-clipboard-failure-post-cleanup",
@@ -75,9 +78,9 @@ _REQUIRED_CAPTURES = (
     "native-showcase-focused-control",
     "native-admin-action-probe-503",
     "native-admin-action-enable-401",
-    "native-admin-upstream-post-cleanup",
     "native-admin-downstream-post-cleanup",
     "native-admin-cjk-xss-safe",
+    "native-admin-upstream-post-cleanup",
     "native-admin-stale-offline",
     "native-admin-empty-injected",
     "native-admin-clipboard-failure-post-cleanup",
@@ -295,8 +298,9 @@ def main() -> int:
             _ = client.seed_ready_key(run_name)
             session = open_production_session(managed.browser, qa)
             journey = ProductionJourney(qa=qa, session=session)
-            run_production_upstream_journey(journey)
+            upstream_cleanup = run_production_upstream_journey(journey)
             run_production_downstream_journey(journey)
+            complete_production_upstream_cleanup(journey, upstream_cleanup)
             run_production_state_recovery(journey)
             run_production_clipboard_failure(journey)
             exercise_production_reload_logout(journey)
@@ -306,7 +310,11 @@ def main() -> int:
                 _close_ordinary(journey, verify_custody=journey_completed)
             stop_managed_browser(managed)
         ordinary_cleanup = _phase_cleanup(baseline_processes, baseline_drivers, baseline_paths)
-        native, native_audit = run_production_native_phase(qa, start_native_headless_context)
+        native, native_audit = run_production_native_phase(
+            qa,
+            start_native_headless_context,
+            (upstream_cleanup.fingerprint,),
+        )
         assert session is not None
         assert_expected_errors(session.audit, native_audit)
         projection = network.verified()

@@ -880,7 +880,7 @@ def test_delete_success_keeps_its_upstream_location_across_reauthentication(
     expect(page.locator(f"#result-{FIRST_KEY_ID}")).to_have_count(0)
 
 
-def test_rejected_key_cleanup_beats_unrelated_disabled_key(
+def test_untracked_three_row_cleanup_does_not_guess_from_rejected_key(
     decision_browser: tuple[RunningFakeServer, BrowserContext, Page],
 ) -> None:
     server, _, page = decision_browser
@@ -888,10 +888,13 @@ def test_rejected_key_cleanup_beats_unrelated_disabled_key(
     _login(page, server)
     install_decision_scenario(page, "invalid", server.state)
     page.locator("#refresh-dashboard").click()
-    expect(page.locator("#decision-title")).to_have_text("Retire rejected Key bbbbbbbb")
-    expect(page.locator("#recommended-action")).to_have_text("Review Key bbbbbbbb")
+    expect(page.locator("#decision-title")).to_have_text("Return to exactly two upstream keys")
+    expect(page.locator("#recommended-action")).to_have_text("Review extra upstream keys")
+    expect(page.locator("#add-upstream")).to_be_disabled()
+    expect(page.locator("#issue-downstream")).to_be_disabled()
+    expect(page.locator("[id$='-replace']")).to_have_count(0)
     page.locator("#recommended-action").click()
-    expect(page.locator("#key-00000000-0000-4000-8000-000000000002-toggle")).to_be_focused()
+    expect(page.locator("#upstream-heading")).to_be_focused()
     expect(page.locator("#confirm-dialog")).not_to_have_attribute("open", "")
 
 

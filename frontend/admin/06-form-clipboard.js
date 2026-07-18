@@ -169,6 +169,7 @@ async function submitDownstream(event) {
     byId("one-time-token").value = oneTimeToken;
     setText("credential-title", `Store credential for ${compactLabel(issued.label)}`);
     setText("credential-target", `Client ${issued.label} · ${accessLabel(issued.scopes)}`);
+    byId("credential-id").value = issued.id;
     byId("clipboard-error").hidden = true;
     byId("downstream-form").reset();
     activeMutationContext = null;

@@ -213,7 +213,7 @@ def test_document_has_only_the_closed_external_module_and_no_brand_asset_when_re
     assert not any(attribute.startswith("on") for attribute in attributes)
     links = root.findall("head/link")
     assert [link.attrib for link in links] == [
-        {"href": "/showcase", "rel": "icon"},
+        {"href": "/assets/favicon.svg", "rel": "icon", "type": "image/svg+xml"},
         {"href": "/assets/showcase.css", "rel": "stylesheet"},
     ]
     scripts = root.findall("head/script")

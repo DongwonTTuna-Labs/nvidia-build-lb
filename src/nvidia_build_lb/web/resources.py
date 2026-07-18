@@ -13,6 +13,7 @@ class WebResource(StrEnum):
     ADMIN_DOCUMENT = "admin-document"
     ADMIN_STYLESHEET = "admin-stylesheet"
     ADMIN_SCRIPT = "admin-script"
+    FAVICON = "favicon"
     SHOWCASE_DOCUMENT = "showcase-document"
     SHOWCASE_STYLESHEET = "showcase-stylesheet"
     SHOWCASE_SCRIPT = "showcase-script"
@@ -37,6 +38,10 @@ _RESOURCE_LOCATIONS: Final = MappingProxyType(
         WebResource.ADMIN_SCRIPT: _ResourceLocation(
             package="nvidia_build_lb.web.static",
             filename="admin.js",
+        ),
+        WebResource.FAVICON: _ResourceLocation(
+            package="nvidia_build_lb.web.static",
+            filename="favicon.svg",
         ),
         WebResource.SHOWCASE_DOCUMENT: _ResourceLocation(
             package="nvidia_build_lb.web.templates",

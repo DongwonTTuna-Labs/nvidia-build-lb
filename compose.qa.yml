@@ -1,4 +1,29 @@
 services:
+  db-init:
+    image: ${NBLB_POSTGRES_IMAGE:?candidate postgres image required}
+    command: ["/usr/local/bin/nblb-pg-bootstrap"]
+    environment:
+      NVIDIA_BUILD_LB_MODE: db-init
+      NVIDIA_BUILD_LB_DATABASE_PASSWORD_FILE: /run/canonical-secrets/db_password
+      POSTGRES_DB: nvidia_build_lb
+      POSTGRES_USER: nvidia_build_lb
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - source: db_password
+        target: /run/canonical-secrets/db_password
+        mode: 0400
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    tmpfs:
+      - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    user: "0:0"
+    networks: [qa]
+    restart: "no"
+
   db:
     image: ${NBLB_POSTGRES_IMAGE:?candidate postgres image required}
     environment:
@@ -11,24 +36,15 @@ services:
       nvidia-build-lb.run: ${NBLB_QA_RUN_ID:?run id required}
       nvidia-build-lb.backup-source: ${NBLB_BACKUP_SOURCE:-true}
       nvidia-build-lb.restore-isolated: ${NBLB_RESTORE_ISOLATED:-false}
-    secrets:
-      - source: db_password
-        target: /run/canonical-secrets/db_password
-        mode: 0400
     volumes:
       - db-data:/var/lib/postgresql/data
     tmpfs:
-      - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
       - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m,mode=0775,uid=70,gid=70
       - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
     read_only: true
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-      - SETPCAP
+    user: "70:70"
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -36,6 +52,9 @@ services:
       interval: 2s
       timeout: 2s
       retries: 20
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
     networks:
       - qa
     restart: "no"
@@ -151,8 +170,18 @@ services:
       - source: qa_ca_cert
         target: /run/qa-ca/ca_cert
         mode: 0444
+    volumes:
+      - type: bind
+        source: /run/nvidia-build-lb
+        target: /run/nvidia-build-lb
+        read_only: true
+      - type: bind
+        source: /run/nvidia-build-lb-control
+        target: /run/nvidia-build-lb-control
+        read_only: false
     tmpfs:
       - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
+      - /run/nvidia-build-lb/media-spool:rw,noexec,nosuid,nodev,size=256m,mode=0730,uid=0,gid=65532
       - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
     read_only: true
     cap_drop:

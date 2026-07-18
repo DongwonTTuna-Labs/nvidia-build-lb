@@ -100,12 +100,22 @@ then run `wl-copy --clear`. If `wl-copy --paste-once` is unavailable, use an
 approved local password manager with one-time paste instead; never use `cat` to
 the terminal, a shell argument, or a saved browser field as a fallback.
 
-Complete the visible first-run sequence:
+Complete the visible first-run sequence for both owned NVIDIA credentials:
 
-1. add the first NVIDIA hosted API key; it is stored encrypted and disabled;
-2. probe that key and confirm a valid result;
-3. enable the verified key;
-4. verify gateway readiness before issuing any downstream credential.
+1. add key 1; it is stored encrypted and disabled;
+2. probe key 1, confirm `valid`, and enable it;
+3. add key 2 through the same one-time field, then probe and enable it;
+4. verify that the dashboard shows exactly two registered rows and two eligible
+   rows before issuing any downstream credential or starting Hermes cutover.
+
+For a planned key rotation, do not use the generic Add control. Start from
+**Replace** on the exact old row identified by its safe handle, ID, and
+fingerprint. Add, probe, and enable the replacement. The dashboard then owns the
+temporary three-row cleanup: follow its single action to disable the selected
+old row, then delete that same row, and stop unless the overview returns to
+`2 registered · 2 eligible`. If a reload loses the local replacement
+relationship, the dashboard marks 3+ rows as cleanup-required and directs
+review to the safe row evidence instead of choosing a deletion target.
 
 Now verify readiness:
 
@@ -113,9 +123,58 @@ Now verify readiness:
 curl --fail --header 'Host: 127.0.0.1:2456' http://127.0.0.1:2456/health
 ```
 
-The expected response after enable is `{"status":"ok","ready":true}`. Return
-to the still-authenticated tab and issue the first downstream token with only
-the scopes its client needs.
+The expected response after the first enable is `{"status":"ok","ready":true}`;
+readiness alone does not prove the required two-key deployment. Finish the
+second key sequence and confirm `2 registered / 2 eligible`. `MODE=one-key`
+still requires those same two registered rows: deliberately disable exactly one
+already-probed row before that matrix, then re-probe and enable it before
+`MODE=two-key`. Each matrix restores the enabled projection it observed at
+entry. A UI-issued downstream token is only for a named client that will
+actually use it; store its safe Internal ID with that client, verify the client,
+and revoke it when the client is retired. Do not issue a UI token for Hermes:
+the journal-aware `cycle` helper creates and owns the Hermes token itself.
+
+From the clean release checkout, bind all three live gates to the exact running
+application digest. With exactly two registered rows and one deliberately
+disabled row, run the one-key matrix first:
+
+```console
+RUNNING_REF=$(docker inspect --format '{{.Config.Image}}' nvidia-build-lb-app-1)
+IMAGE_DIGEST=${RUNNING_REF##*@}
+[[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || exit 1
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+sudo /usr/bin/make -C "$PWD" \
+  MODE=one-key IMAGE_DIGEST="$IMAGE_DIGEST" \
+  EVIDENCE_DIR="/opt/nvidia-build-lb/evidence/live-one-key-$STAMP" smoke-live
+```
+
+Re-probe and enable that exact disabled row, require `2 registered · 2
+eligible`, then run the two-key matrix against the unchanged digest:
+
+```console
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+sudo /usr/bin/make -C "$PWD" \
+  MODE=two-key IMAGE_DIGEST="$IMAGE_DIGEST" \
+  EVIDENCE_DIR="/opt/nvidia-build-lb/evidence/live-two-key-$STAMP" smoke-live
+```
+
+Only after both matrices pass, run the helper-issued Hermes cycle. It performs
+pre-issuance reconciliation, cutover, rollback, final reapply, previous-token
+revocation, restart, and the real tool-using agent check under one lock:
+
+```console
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+sudo /usr/bin/make -C "$PWD" \
+  IMAGE_DIGEST="$IMAGE_DIGEST" \
+  EVIDENCE_DIR="/opt/nvidia-build-lb/evidence/hermes-cycle-$STAMP" smoke-hermes
+```
+
+If that command fails or is interrupted, do not issue another token or edit a
+Hermes file. Run only `sudo /usr/bin/python3
+scripts/ops/hermes_cutover.py recover`, follow its safe `next_action`, and
+repeat recovery until terminal. Retire backup generations only after the
+receipt-required downstream and provider-side revocations; the infra stack
+README contains the exact ID comparison and retirement commands.
 
 Use only
 filtered container inspection for UID, capability, health, labels, and mount

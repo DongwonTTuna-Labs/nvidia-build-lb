@@ -20,6 +20,8 @@ def _abort(route: Route) -> None:
 def _activate_copy_with_keyboard(page: Page) -> None:
     expect(page.locator("#credential-title")).to_be_focused()
     page.keyboard.press("Tab")
+    expect(page.locator("#credential-id")).to_be_focused()
+    page.keyboard.press("Tab")
     expect(page.locator("#one-time-token")).to_be_focused()
     page.keyboard.press("Tab")
     expect(page.locator("#copy-token")).to_be_focused()

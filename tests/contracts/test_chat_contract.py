@@ -19,12 +19,14 @@ def test_chat_nonstream_preserves_safe_json(contract_client: ContractClient) -> 
     response = contract_client.request(
         "POST",
         "/v1/chat/completions",
-        headers=bearer(CHAT_TOKEN),
+        headers={**bearer(CHAT_TOKEN), "Accept-Encoding": "gzip"},
         json_body=_chat_body(stream=False),
     )
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/json"
+    assert "content-encoding" not in response.headers
+    assert "vary" not in response.headers
     assert response.content == (
         b'{"id":"contract-chat","object":"chat.completion","model":"z-ai/glm-5.2",'
         b'"choices":[{"index":0,"message":{"role":"assistant","content":"ok"}}]}'
@@ -35,12 +37,14 @@ def test_chat_stream_preserves_sse_and_done(contract_client: ContractClient) -> 
     response = contract_client.request(
         "POST",
         "/v1/chat/completions",
-        headers=bearer(CHAT_TOKEN),
+        headers={**bearer(CHAT_TOKEN), "Accept-Encoding": "gzip"},
         json_body=_chat_body(stream=True),
     )
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
+    assert "content-encoding" not in response.headers
+    assert "vary" not in response.headers
     assert response.content == (
         b'data: {"id":"contract-chat","choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
     )

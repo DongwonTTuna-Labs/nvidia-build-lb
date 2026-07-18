@@ -51,13 +51,42 @@ def _confirm_revoke(session: AuthenticatedSession) -> None:
     expect(page.locator("#confirm-dialog")).to_be_hidden()
 
 
-def _activate_copy_with_keyboard(page: Page) -> None:
+def _activate_copy_with_keyboard(page: Page) -> str:
     expect(page.locator("#credential-title")).to_be_focused()
     page.keyboard.press("Tab")
+    expect(page.locator("#credential-id")).to_be_focused()
+    credential_id = page.locator("#credential-id").input_value()
+    assert credential_id
+    page.keyboard.press("Control+A")
+    selected_id = int(
+        evaluate_string(
+            page,
+            """() => JSON.stringify(
+document.getElementById("credential-id").selectionEnd
+  - document.getElementById("credential-id").selectionStart
+)""",
+        )
+    )
+    assert selected_id == len(credential_id)
+    page.keyboard.press("Tab")
     expect(page.locator("#one-time-token")).to_be_focused()
+    bearer = page.locator("#one-time-token").input_value()
+    assert bearer
+    page.keyboard.press("Control+A")
+    selected_bearer = int(
+        evaluate_string(
+            page,
+            """() => JSON.stringify(
+document.getElementById("one-time-token").selectionEnd
+  - document.getElementById("one-time-token").selectionStart
+)""",
+        )
+    )
+    assert selected_bearer == len(bearer)
     page.keyboard.press("Tab")
     expect(page.locator("#copy-token")).to_be_focused()
     page.keyboard.press("Enter")
+    return credential_id
 
 
 def _open_issue_form(
@@ -99,22 +128,7 @@ def run_production_downstream_journey(journey: ProductionJourney) -> None:
     state = credential_state_observation(page)
     assert state.admin_bearer_present
     assert state.one_time_token_present
-    page.keyboard.press("Tab")
-    assert page.locator(":focus").get_attribute("id") == "one-time-token"
-    page.keyboard.press("Control+A")
-    selected = int(
-        evaluate_string(
-            page,
-            """() => JSON.stringify(
-document.getElementById("one-time-token").selectionEnd
-  - document.getElementById("one-time-token").selectionStart
-)""",
-        )
-    )
-    assert selected > 0
-    page.keyboard.press("Tab")
-    assert page.locator(":focus").get_attribute("id") == "copy-token"
-    page.keyboard.press("Enter")
+    credential_id = _activate_copy_with_keyboard(page)
     assert credential_state_observation(page).copied_credential
     page.keyboard.press("Tab")
     page.keyboard.press("Enter")
@@ -130,6 +144,7 @@ document.getElementById("one-time-token").selectionEnd
     assert _credential_shapes_absent(page)
     journey.qa.recorder.end_blackout()
     issued = next(item for item in journey.qa.client.tokens().items if item.id not in before_ids)
+    assert credential_id == str(issued.id)
     assert str(issued.label) == label
     revoke_id = f"token-{issued.id}-revoke"
     _phase(journey, f"{prefix}downstream_revoke")
@@ -186,7 +201,7 @@ readText: () => Promise.reject(new DOMException("synthetic denial"))}})"""
     journey.qa.recorder.begin_blackout("one-time token during synthetic clipboard denial")
     page.keyboard.press("Enter")
     expect(page.locator("#credential-dialog")).to_be_visible()
-    _activate_copy_with_keyboard(page)
+    _ = _activate_copy_with_keyboard(page)
     expect(page.locator("#clipboard-error")).to_be_visible()
     page.locator("#dismiss-token").focus()
     page.keyboard.press("Enter")

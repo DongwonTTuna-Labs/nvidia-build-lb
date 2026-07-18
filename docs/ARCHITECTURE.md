@@ -1,5 +1,14 @@
 # NVIDIA Build LB Architecture Contract
 
+> **RETIRED BEHAVIOR ORACLE — NOT V2 SHIPPING AUTHORITY.** This document
+> describes the Python/FastAPI implementation at PR head `d306620` and its
+> subsequent uncommitted parity work. The user-approved Rust/Svelte/Bun/SQLx,
+> multimodal, public-ingress product is governed only by `DESIGN.md`. No clause
+> below may override that canonical v2 contract or serve as final completion
+> evidence. The document remains temporarily so framework-neutral fixtures can
+> preserve valid safety and behavior during the rewrite; it is removed or
+> archived when parity migration completes.
+
 This document freezes the implemented product boundary and its verification
 contract. The repository contains the typed gateway, migrations, production
 Compose surface, and local release gates. When an implementation and this
@@ -38,8 +47,17 @@ handle upstream credentials.
 | `GET /showcase` | Explicit unauthenticated no-op | `200 text/html` secret-free primitive showcase | `404` only if the showcase is absent |
 | `GET /assets/admin.css` | Explicit unauthenticated no-op | `200 text/css` | `404` |
 | `GET /assets/admin.js` | Explicit unauthenticated no-op | `200 text/javascript` | `404` |
+| `GET /assets/favicon.svg` | Explicit unauthenticated no-op | `200 image/svg+xml` original neutral routing icon | `404` |
 | `GET /assets/showcase.css` | Explicit unauthenticated no-op | `200 text/css` | `404` |
 | `GET /assets/showcase.js` | Explicit unauthenticated no-op | `200 text/javascript` | `404` |
+
+The seven shell and asset responses negotiate deterministic `Content-Encoding:
+gzip` when `Accept-Encoding` explicitly permits it and otherwise return the
+byte-exact identity representation. They always emit `Vary: Accept-Encoding`.
+Malformed qvalues or encoding parameters select identity, and repeated header
+fields are combined before negotiation.
+This is route-local static compression: no admin API, public JSON API, or SSE
+stream passes through a buffering compression middleware.
 
 No other asset route exists. In particular, `/assets/{path}` is not a generic
 filesystem mount: every other asset name is `404`. A method not listed for a
@@ -627,6 +645,10 @@ X-Content-Type-Options: nosniff
 Content-Security-Policy: default-src 'none'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self'; object-src 'none'; script-src 'self'; style-src 'self'
 ```
 
+The seven static shell and exact-asset responses additionally include `Vary:
+Accept-Encoding`. Admin API responses do not negotiate compression and do not
+add that representation-selection header.
+
 Inline/eval/third-party script, style, font, image, and connection origins are
 forbidden. Bearer headers plus no cookies form the CSRF boundary; Host and
 Origin checks protect the loopback surface from DNS rebinding and cross-site
@@ -726,7 +748,12 @@ requests. Natural keyboard traversal reaches every enabled control; each
 focused border-plus-outline rectangle stays inside the visual viewport, has
 clipped/hidden/covered counts zero, and is not intersected by a fixed/sticky
 nonancestor. Each stable state's serialized-DOM SHA-256 is equal before and
-after read-only observation. Reduced-motion QA observes matching media true,
+after read-only observation. Cross-run comparison normalizes only UUIDs,
+timestamps, full SHA fingerprints, a `Key <first-eight-hex>` handle bound to a
+full fingerprint observed by the typed QA admin client during that run, long
+opaque hexadecimal IDs, and observed event latency. Invalid sidecar values fail
+closed, and an eight-hex phrase outside that sidecar remains significant.
+Reduced-motion QA observes matching media true,
 all computed transition duration/delay zero, and active transform none.
 Initial-503 recovery naturally Tabs to visible Retry, presses Enter, and then
 observes dashboard-title focus; direct focus injection is not evidence.
@@ -746,7 +773,8 @@ installed distribution, and loading both showcase HTML and CSS through the
 public resource loader. Later admin resources join the same explicit allowlist
 and wheel-install proof; no generic static mount is introduced. The browser
 resource set is exactly `/admin`, `/showcase`, `/assets/admin.css`,
-`/assets/admin.js`, `/assets/showcase.css`, and `/assets/showcase.js`; an extra browser asset or route
+`/assets/admin.js`, `/assets/favicon.svg`, `/assets/showcase.css`, and
+`/assets/showcase.js`; an extra browser asset or route
 fails the closed-set assertion.
 
 ### 9.4 Browser evidence integrity and cleanup
@@ -885,45 +913,83 @@ volume. A missing/mismatched key fails closed.
 
 ## 12. Hermes durable two-file transaction
 
-The lock is the stable root-owned mode-0600 file
-`/opt/agent-apps/data/hermes/.nvidia-build-lb-cutover.lock`. Every cutover,
-rollback, reapply, recovery invocation, and gateway pre-restart recovery opens
-it once and holds an FD-backed exclusive `flock` through prior-intake-state
-restoration and verification.
+The lock is the stable root-owned mode-0600 host-only file
+`/opt/nvidia-build-lb/hermes-cutover-state/cutover.lock`. The secret-free
+transaction journal is in the same root-owned mode-0700 directory, and immutable
+rollback generations are under the separate root-owned mode-0700
+`/opt/nvidia-build-lb/hermes-cutover-backups/` directory. Neither directory is
+within `/opt/agent-apps`, physically backed by the Hermes tree through a bind
+mount, or mounted into Hermes. Backup generations also reject nested mount
+points before read, restore, or retirement. Every cutover, rollback,
+reapply, and recovery invocation opens the lock once. A full `cycle` keeps the
+same FD-backed exclusive `flock` from pre-issuance reconciliation through final
+prior-downstream-token revocation, when one exists, and terminal journal
+persistence. A restored direct-upstream source is also a valid cycle start; its
+provider credential is revoked separately only after final reapply. The live
+matrix and the delayed agent-app updater acquire this same inode before reading
+or changing Hermes state, so no Hermes writer runs concurrently.
+
+The operator `preflight` reconciles any nonterminal journal under that lock and
+returns `issuance_allowed=true` only when a new candidate may be created. The
+supported `cycle` command repeats that gate, persists a unique issuance label,
+and then creates the scoped candidate through the admin API while still holding
+the same lock. No production CLI command accepts a bearer through stdin or
+argv. An `ACTION_REQUIRED` journal therefore returns nonzero before issuance,
+and every successfully created candidate has durable reconciliation authority.
 
 Under the lock, the transaction:
 
 1. Captures `config.yaml` and the root-only live `.env` as tuples
    `(sha256, uid, gid, mode, regular-file/no-symlink)`.
-2. Creates unique immutable backups and same-directory candidate temps for both
-   files. It fsyncs each file and backup directory before mutation.
+2. Creates unique immutable host-only backups whose directory is mode `0700`
+   and whose three exact regular files are root-owned, single-link, mode `0600`,
+   and hash-bound to the manifest. Same-directory candidate temps for the two
+   live files exist only while Hermes is stopped. It fsyncs every file and
+   affected directory before mutation.
+   An exact root-owned single-link mode-0600 atomic-manifest temp left by process
+   death is removed under the transaction lock before validation or partial
+   generation discard; any other entry still fails closed.
 3. Durably writes the root-only phase journal
-   `/opt/agent-apps/data/hermes/.nvidia-build-lb-cutover.journal` through a
+   `/opt/nvidia-build-lb/hermes-cutover-state/journal.json` through a
    same-directory mode-0600 temp, file fsync, atomic rename, and parent fsync.
    The journal contains only attempt ID, source/target tuples, immutable backup
-   paths, unique issuance label, nullable candidate downstream token ID, prior
-   intake state, and phase. It never contains token plaintext.
+   IDs, unique issuance label, nullable candidate downstream token ID,
+   candidate provenance, candidate-revocation confirmation, manual-candidate
+   review intent, reconciliation terminal phase, source/target tuples, commit
+   decision, any pending one-key exclusion intent, and phase. It never contains
+   token plaintext.
 4. Before issuing a token, persists the attempt UUID, exact unique label
    `hermes-cutover:<attempt-uuid>`, and null token ID. It POSTs exactly once. On
-   success it immediately writes and fsyncs plaintext only into the `.env`
-   candidate, then durably records the token ID. For an ambiguous result it lists
-   every token and matches the exact label; the database constraint makes the
-   result zero or one row. Zero rows starts a new transaction with a new attempt
-   UUID and label. One row cannot recover plaintext: only after both files and
-   the running generation prove that ID unreferenced is it revoked, then a new
-   attempt begins. Blind retry with the same label is forbidden and returns 409.
-5. Records exact bounded intake query, close, close acknowledgement/barrier,
-   in-flight-zero, reopen, and reopen-verification commands. It closes intake,
-   requires ACK and observed in-flight zero, then recomputes both live tuples
-   immediately before the first rename.
+   success it durably records the token ID and `helper_issued` provenance while
+   plaintext remains process-only.
+   For an ambiguous result it lists every token and matches the exact label. A
+   unique row is revoked and verified because its one-time plaintext cannot be
+   recovered; multiple rows fail closed. It never retries issuance with the same
+   label.
+5. Stops only the Hermes service, verifies that the container is no longer
+   running, recomputes both live tuples, validates exact candidate token state
+   and scopes, and proves the process-held helper-issued bearer belongs to that
+   token ID using an attributed request-count probe. Only then may it create
+   candidate files. The retired manual-bearer command is not exposed by the
+   production parser, but recovery still accepts its already-durable journals.
+   If a legacy manual probe may have succeeded but its response or following
+   journal write was lost, recovery restores the protected source and stays at
+   `candidate_reconciliation_required`. It returns the safe token ID,
+   `manual_candidate_requires_review=true`, and
+   `candidate_revoked_confirmed=false`; no cutover, rollback, cycle, or new
+   issuance may advance until the owner revokes that exact UI row and recovery
+   verifies `revoked_at`.
 6. If either pre-write CAS drifts, leaves both live files untouched,
-   restores/verifies prior intake, and revokes only a proven-unreferenced
-   candidate token.
-7. Fsyncs candidates, journals each phase durably, atomically renames the pair
-   one at a time, and fsyncs the destination directory after each rename.
+   keeps Hermes stopped, and revokes only a helper-issued or positively bound
+   candidate token. Unknown tuples are never replaced by an old backup.
+7. Fsyncs candidates, journals before and after each rename, atomically renames
+   the pair one file at a time, and fsyncs the destination directory after each
+   rename.
 8. Restarts only the Hermes gateway. It verifies the running generation's
    effective provider, base URL `http://127.0.0.1:2456/v1`, model
-   `z-ai/glm-5.2`, and token ID against the journal target before intake opens.
+   `z-ai/glm-5.2`, and token ID against the journal target before intake opens,
+   then runs Korean non-streaming, `[DONE]` streaming, and a `/v1/runs` task
+   that must emit both `tool.started` and `tool.completed`.
 
 Recovery recognizes only the journal's exact source, target, or recorded
 intermediate mixed tuple between the two renames. It uses fresh same-directory
@@ -931,19 +997,45 @@ temps. Any unknown tuple or unknown mixed pair is never overwritten and leaves
 intake fail-closed as `recovery_required`.
 
 A token may be revoked only after both files and the running generation prove
-it unreferenced. Ambiguous references remain enabled as `revoke_pending` with
-intake closed. Verified rollback-only exit revokes its candidate. Verified final
-reapply retains exactly one enabled referenced Hermes token and proves every
-replaced or aborted unreferenced token revoked.
+it unreferenced. Ambiguous references keep intake closed as
+`recovery_required`. Verified rollback-only exit revokes its bound candidate.
+Verified final reapply writes and reads back `commit_decided` before revoking a
+previous downstream token. Recovery before that decision restores the source;
+recovery after it completes the target and previous-token revocation. A direct
+upstream source has no downstream token to revoke and remains subject to the
+separate provider-revocation gate. Recovery receipts expose only safe backup and
+token IDs plus an exact `next_action`. An unresolved manual token returns
+`ACTION_REQUIRED` and `review_and_revoke_candidate_token`; only a subsequent
+receipt with `candidate_revoked_confirmed=true` may return
+`issue_new_candidate`. Loss of the original stdout therefore does not remove
+rollback, reconciliation, or retirement authority.
 
-Rollback and final reapply are separate full transactions, each repeating
-`lock -> paired snapshot/journal -> close+ACK+drain -> dual CAS -> durable pair
-replace -> gateway-only restart -> effective generation verification -> prior
-intake restore`. Copy-fixture and live gates inject process death, file and
-directory fsync failure, first/second rename failure, restart/health failure,
-intake reopen failure, issuance ambiguity, and revoke failure. Each ends in a
-verified source/target generation or an explicit recoverable fail-closed
-journal, never silent mixed state.
+Rollback and final reapply are separately journalled paired replacements inside
+the same cycle lock. Each repeats `close -> dual CAS -> durable pair replace ->
+gateway-only restart -> effective generation verification`. Targeted fixtures
+cover first-rename interruption, recorded mixed-pair recovery, unknown-drift
+preservation, backup integrity/type rejection, bearer/ID binding, ambiguous
+issuance reconciliation, and single-lock cycle continuity. Live gates add the
+real restart, rollback, reapply, token-revocation, one-key exclusion, and Hermes
+tool-run evidence. One-key exclusion journals the excluded and alternate IDs
+before disable, restores and verifies the original two-key eligible projection
+on normal exit, exception, or fresh recovery, and never relies on an in-memory
+`finally` alone.
+
+`scripts/ops/hermes_cutover.py retire-backup` is the only normal retirement
+path. It accepts one exact generated backup ID, holds the same lock, requires a
+terminal manifest, verifies any prior downstream token is revoked, and refuses
+an upstream-bearing generation unless the operator explicitly confirms provider
+revocation. It then atomically renames the generation to a direct-child
+retirement tombstone, keeps the validated manifest until last, removes the
+credential-bearing file first with directory fsyncs, and removes the empty
+tombstone with a parent fsync. A repeated command resumes any interrupted
+tombstone while rejecting links, mounts, unexpected entries, metadata drift, or
+hash drift. A pre-existing tombstone is first stabilized with a backup-parent
+fsync and an `original absent / tombstone present` recheck; no child unlink
+precedes that durability gate. A separate root-only secret-free pending/complete receipt is durable
+before deletion; if unlink and parent fsync finish before stdout, retrying the
+same ID promotes the pending receipt to complete and returns the prior PASS.
 
 ## 13. Stable Make verification contract
 
@@ -951,14 +1043,19 @@ journal, never silent mixed state.
 `POSTGRES_IMAGE_DIGEST` are the immutable local image IDs emitted together by
 one `build-candidate` run. `SOURCE_MANIFEST` is that run's exact manifest file;
 later gates require byte equality before and after execution. `MODE` is exactly
-`one-key` or `two-key`. No target accepts a credential through argv, and no
-target may print a credential-bearing environment.
+`one-key` or `two-key`. Both modes require exactly two registered upstream rows;
+the names mean exactly one or two rows are eligible at entry. No target accepts
+a credential through argv, and no target may print a credential-bearing
+environment. Database-only sensors run `psql` as the container's PostgreSQL OS
+user over its local peer-authenticated socket; no database password is placed in
+argv or a process environment.
 
 Every completed target writes `manual-qa.json`, `adversarial.json`, and
 `cleanup.json` under its evidence directory. Artifacts contain only exit codes,
 hashes, internal IDs/fingerprints, safe status classes, and redacted counts.
 Cleanup proves all target-created PIDs, ports, containers, browsers, and temp
-paths absent. On interruption or failure, cleanup still runs before exit.
+paths absent. On HUP, INT, TERM, failure, or a first app-recreate error, bounded
+cleanup/recovery still runs before exit.
 Browser targets apply Section 9.4's stricter fresh task-owned leaf, pre-receipt
 capture rehash, observed nested cleanup, and two-fresh-run determinism rules.
 
@@ -973,14 +1070,14 @@ capture rehash, observed nested cleanup, and two-fresh-run determinism rules.
 | `test-browser-prod` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/test-browser-prod.sh` | exact app/PG pair, byte-identical 6A manifest, fresh task-6b-owned `EVIDENCE_DIR` | Exact 1280 structures, ordinary owner journeys, and native-200% low-vision repeat on the same pair pass deterministic runs, cold audits, and two artifact-bound visual reviews | Same Section 9.4 nested zero-resource observations; both candidate image IDs remain unchanged | Implemented; missing required input exits 64 |
 | `verify-local` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/verify-local.sh` | exact app/PG pair, manifest, evidence directory | Static/tests/migration/compose/restart/backup/isolated restore and exact DB-down 503 pass; codex-lb remains 200 | All QA stack and restore resources absent; both candidate IDs remain | Implemented; missing required input exits 64 |
 | `scan-release` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/scan-release.sh` | exact app/PG pair, manifest, evidence directory | Dependency/source/history/action-pin plus both-image vulnerability/secret scans exit 0 without ignoring unfixed findings | Scanner containers/temp exports absent; manifest bytes and both image IDs unchanged | Implemented; missing required input exits 64 |
-| `smoke-live` | `MODE="$(MODE)" IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-live.sh` | All three variables | Requested live matrix true; one-key never claims distribution | Plaintext temp/FD/process copies and task-owned runtime resources absent | Script intentionally unavailable until Todo 10A/10B; invalid input 64, missing script 78 |
-| `smoke-hermes` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-hermes.sh` | Both variables | Cutover, agent task, restart, failure path, rollback, final reapply pass | Lock released; intake restored; no temp plaintext; journal terminal or explicit fail-closed | Script intentionally unavailable until Todo 11B; 64/78 behavior as above |
+| `smoke-live` | `MODE="$(MODE)" IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-live.sh` | All three variables; root custody; exactly two registered rows and MODE-selected eligible count | Per-key meaningful real responses, three core repetitions, exact six-attempt alternating 3:3 routing, disabled exclusion, controlled synthetic 401 failover, controlled future-cooldown exclusion, scope/revoke, and post-recreate per-key calls pass; one-key never claims distribution | Actual task-label active-token count and synthetic-row count are zero; full safe upstream projection, scheduler cursor, old/new app logs from matrix start, filtered args/env, prior Hermes state, and healthy gateway are restored | Implemented; invalid input 64, non-root 77, missing executable regression 78 |
+| `smoke-hermes` | `IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-hermes.sh` | Both variables; root custody | New dedicated token cutover, Korean stream/non-stream, tool event proof, rollback, final reapply, one-key exclusion, and restart pass | Lock released; replaced token revoke confirmed; candidate-file count exactly zero and journal exactly terminal `reapplied` in cleanup gate | Implemented; invalid input 64, non-root 77, missing executable regression 78 |
 
-Recipe status 64 means a required non-secret Make input is invalid. Recipe
-status 78 remains reserved for `smoke-live` and `smoke-hermes`, whose later live
-operator scripts are intentionally not implemented yet. GNU Make reports either
-failed recipe as process exit 2 while preserving
-the exact `Error 64` or `Error 78` classification and the stable diagnostic.
+Recipe status 64 means a required non-secret Make input is invalid. Status 77
+means the two live targets lack root custody. Status 78 means a required live
+operator executable was removed from the release. GNU Make reports these failed
+recipes as process exit 2 while preserving the exact `Error 64`, `Error 77`, or
+`Error 78` classification and the stable diagnostic.
 These explicit failures are never PASS evidence. `make help` must always parse
 and exit zero.
 

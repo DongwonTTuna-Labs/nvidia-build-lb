@@ -32,7 +32,7 @@ function renderOverview(snapshot, reference) {
   const readiness = snapshotCurrent ? currentReadiness : "Stale · Readiness requires refresh";
   const valuePrefix = snapshotCurrent ? "" : "Last confirmed · ";
   setText("gateway-status", readiness);
-  setText("eligible-count", `${valuePrefix}${overview.upstream_keys.eligible} eligible`);
+  setText("eligible-count", `${valuePrefix}${overview.upstream_keys.total} registered · ${overview.upstream_keys.eligible} eligible`);
   setText("cooling-count", `${valuePrefix}${overview.upstream_keys.cooling} temporarily excluded`);
   setText("request-count", `${valuePrefix}${overview.request_count} observed`);
   setText("active-token-count", snapshotCurrent ? String(overview.downstream_tokens.active) : `Last confirmed: ${overview.downstream_tokens.active}`);

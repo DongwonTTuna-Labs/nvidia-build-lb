@@ -1,7 +1,18 @@
 {
-  "name": "nvidia-build-lb-qa",
+  "name": "nvidia-build-lb",
   "private": true,
+  "workspaces": [
+    "apps/admin"
+  ],
+  "scripts": {
+    "admin:build": "npm --workspace @nvidia-build-lb/admin run build",
+    "admin:check": "npm --workspace @nvidia-build-lb/admin run check",
+    "format": "biome check .",
+    "knip": "knip"
+  },
   "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "knip": "^5.63.0",
     "lighthouse": "13.4.0"
   }
 }

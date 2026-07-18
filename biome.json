@@ -1,0 +1,21 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.4/schema.json",
+  "files": {
+    "includes": [
+      "apps/admin/**/*.js",
+      "apps/admin/**/*.ts",
+      "apps/admin/**/*.svelte",
+      "apps/admin/**/*.json",
+      "package.json",
+      "biome.json",
+      "knip.json",
+      "!apps/admin/.svelte-kit",
+      "!apps/admin/build",
+      "!node_modules",
+      "!.venv"
+    ]
+  },
+  "formatter": { "enabled": true, "indentStyle": "space", "lineWidth": 100 },
+  "linter": { "enabled": true, "rules": { "preset": "recommended" } },
+  "overrides": [{ "includes": ["apps/admin/**/*.svelte"], "linter": { "enabled": false } }]
+}

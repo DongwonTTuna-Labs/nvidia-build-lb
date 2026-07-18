@@ -1,5 +1,6 @@
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from hashlib import sha256
 
 from playwright.sync_api import Page, Route, expect
@@ -9,6 +10,14 @@ from .browser_checks import assert_no_page_overflow
 from .browser_credentials import assert_secret_absent, credential_state_observation
 from .browser_evidence import CaptureSpec, ManualScenario
 from .browser_prod_context import ProductionJourney
+
+
+@dataclass(frozen=True)
+class ProductionUpstreamCleanup:
+    item_id: str
+    fingerprint: str
+    toggle_id: str
+    delete_id: str
 
 
 def _phase(journey: ProductionJourney, name: str) -> None:
@@ -232,10 +241,8 @@ def _disable_and_delete(
     journey: ProductionJourney, item_id: str, toggle_id: str, delete_id: str
 ) -> None:
     page = journey.session.page
-    _phase(journey, f"{journey.capture_prefix}upstream_enable")
+    _phase(journey, f"{journey.capture_prefix}upstream_cleanup")
     page.locator(f"#{toggle_id}").focus()
-    page.keyboard.press("Enter")
-    expect(page.locator(f"#{toggle_id}")).to_have_text("Disable")
     page.keyboard.press("Enter")
     if not journey.native_zoom:
         journey.qa.recorder.capture(
@@ -259,7 +266,9 @@ def _disable_and_delete(
     assert item_id not in {str(item.id) for item in journey.qa.client.upstreams().items}
 
 
-def run_production_upstream_journey(journey: ProductionJourney) -> None:
+def run_production_upstream_journey(
+    journey: ProductionJourney,
+) -> ProductionUpstreamCleanup:
     page = journey.session.page
     prefix = journey.capture_prefix
     _phase(journey, f"{prefix}upstream_cancel")
@@ -283,9 +292,34 @@ def run_production_upstream_journey(journey: ProductionJourney) -> None:
     created = next(
         item for item in journey.qa.client.upstreams().items if item.id not in before_ids
     )
-    _exercise_action_failures(journey, str(created.id))
-    toggle_id, delete_id = _probe_once(journey, str(created.id))
-    _disable_and_delete(journey, str(created.id), toggle_id, delete_id)
+    item_id = str(created.id)
+    _exercise_action_failures(journey, item_id)
+    toggle_id, delete_id = _probe_once(journey, item_id)
+    _phase(journey, f"{prefix}upstream_enable")
+    page.locator(f"#{toggle_id}").focus()
+    page.keyboard.press("Enter")
+    expect(page.locator(f"#{toggle_id}")).to_have_text("Disable")
+    expect(page.locator("#issue-downstream")).to_be_enabled()
+    return ProductionUpstreamCleanup(
+        item_id=item_id,
+        fingerprint=str(created.fingerprint),
+        toggle_id=toggle_id,
+        delete_id=delete_id,
+    )
+
+
+def complete_production_upstream_cleanup(
+    journey: ProductionJourney,
+    cleanup: ProductionUpstreamCleanup,
+) -> None:
+    page = journey.session.page
+    prefix = journey.capture_prefix
+    _disable_and_delete(
+        journey,
+        cleanup.item_id,
+        cleanup.toggle_id,
+        cleanup.delete_id,
+    )
     assert_no_page_overflow(page)
     journey.qa.recorder.capture(
         page,
@@ -302,8 +336,8 @@ def run_production_upstream_journey(journey: ProductionJourney) -> None:
             actions=(
                 "Actual UI add",
                 "Inject probe 503 and enable 401",
-                "Reauthenticate then hold one probe",
-                "Enable disable delete",
+                "Reauthenticate, probe, and enable the second key",
+                "Issue and revoke a client credential, then disable and delete the key",
             ),
             observables=(
                 "Exact safe problem identity remains visible with stale data",

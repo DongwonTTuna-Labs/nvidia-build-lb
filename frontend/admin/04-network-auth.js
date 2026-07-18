@@ -37,7 +37,8 @@ function clearSensitiveUi(preserveRecovery = false) {
   byId("one-time-token").value = "";
   setText("credential-title", "Store this credential now");
   setText("credential-target", "");
-  byId("copy-token").textContent = "Copy credential";
+  byId("credential-id").value = "";
+  byId("copy-token").textContent = "Copy one-time bearer";
   byId("credential-status").hidden = true;
   byId("credential-status").textContent = "";
   byId("credential-busy").hidden = true;
@@ -74,8 +75,11 @@ function mountLogin(authFailed = false, serviceOffline = false, interrupted = nu
   byId("dashboard").hidden = true;
   byId("logout").hidden = true;
   byId("auth-view").hidden = false;
-  byId("login-slot").replaceChildren(byId("login-template").content.cloneNode(true));
+  byId("login-slot").replaceChildren(loginTemplate.cloneNode(true));
   const field = byId("admin-bearer");
+  const submit = byId("login-submit");
+  field.disabled = false;
+  submit.disabled = false;
   const hasRecovery = Boolean(interrupted || recovery);
   if (hasRecovery) {
     setText("login-interrupted", [interrupted ? `${interrupted} was interrupted. Its result is unknown; reauthenticate and refresh before retrying.` : null, recovery].filter(Boolean).join(" "));

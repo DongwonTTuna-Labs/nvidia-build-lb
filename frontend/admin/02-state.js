@@ -1,4 +1,5 @@
 const byId = (id) => document.getElementById(id);
+const loginTemplate = byId("login-form").cloneNode(true);
 const apiRoot = "/admin/api/v1";
 const snapshotTtlMs = 60_000;
 const readDeadlineMs = 8_000;

@@ -607,11 +607,24 @@ def _assert_run_receipts(evidence: _RunEvidence) -> None:
         _EXPECTED_NATIVE_CAPTURE_COUNT,
         "native capture identity count changed",
     )
+    _assert_native_capture_ids(manual.native.capture_ids, capture)
 
 
 def _assert_exact(left: object, right: object, reason: str) -> None:
     if left != right:
         raise AssertionError(reason)
+
+
+def _assert_native_capture_ids(
+    receipt_ids: tuple[str, ...],
+    capture: CaptureIndex,
+) -> None:
+    indexed_ids = tuple(record.name for record in capture.captures if record.native_zoom)
+    _assert_exact(
+        receipt_ids,
+        indexed_ids,
+        "native capture identity or order changed",
+    )
 
 
 def main() -> int:

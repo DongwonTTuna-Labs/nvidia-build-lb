@@ -1,0 +1,13 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "ignoreDependencies": ["lighthouse"],
+  "workspaces": {
+    ".": {
+      "ignore": ["frontend/admin/**", "src/nvidia_build_lb/web/static/**", "tests/ui/vendor/**"]
+    },
+    "apps/admin": {
+      "entry": ["src/routes/**/*.svelte"],
+      "project": ["src/**/*.{ts,svelte}"]
+    }
+  }
+}

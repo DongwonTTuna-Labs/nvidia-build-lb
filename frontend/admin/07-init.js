@@ -90,6 +90,10 @@ async function runRecommendedAction() {
     byId("ledger-recovery-summary").focus();
     return;
   }
+  if (kind === "upstreams") {
+    byId("upstream-heading").focus();
+    return;
+  }
   if (kind === "review") {
     const target = targetAction === "revoke"
       ? byId(`token-${targetId}-revoke`)

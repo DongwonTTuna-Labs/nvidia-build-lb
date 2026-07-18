@@ -12,15 +12,9 @@ function setRecommendation(kind, labelText, targetId = null, targetAction = null
   byId("refresh-dashboard").hidden = kind === "refresh";
   refreshMutationLocks();
 }
-function setIssuePrerequisite(snapshot) {
-  const button = byId("issue-downstream");
-  const reason = byId("issue-downstream-reason");
-  let message = "";
-  if (!snapshotCurrent) message = "Current state is unknown. Refresh before issuing a downstream token.";
-  else if (orphanedToken) message = "Revoke the credential whose one-time response was lost before issuing a replacement.";
-  else if (snapshot.readinessCause === "runtime_unavailable") message = "Issue is locked until the local runtime is restored.";
-  else if (snapshot.readinessCause === "ledger_capacity_exhausted") message = "Issue is locked while ledger capacity blocks new requests and changes.";
-  else if (snapshot.overview.upstream_keys.eligible === 0) message = "Issue is available after at least one verified key is enabled and eligible.";
+function setControlPrerequisite(controlId, reasonId, message) {
+  const button = byId(controlId);
+  const reason = byId(reasonId);
   if (message) {
     button.dataset.prerequisite = "blocked";
     button.setAttribute("aria-describedby", reason.id);
@@ -29,9 +23,30 @@ function setIssuePrerequisite(snapshot) {
   } else {
     delete button.dataset.prerequisite;
     button.removeAttribute("aria-describedby");
+    reason.textContent = "";
     reason.hidden = true;
   }
   refreshMutationLocks();
+}
+function setAddPrerequisite(snapshot) {
+  let message = "";
+  if (!snapshotCurrent) message = "Current state is unknown. Refresh before adding an upstream key.";
+  else if (snapshot.readinessCause === "runtime_unavailable") message = "Add is locked until the local runtime is restored.";
+  else if (snapshot.readinessCause === "ledger_capacity_exhausted") message = "Add is locked while ledger capacity blocks new requests and changes.";
+  else if (snapshot.upstreams.length > 2) message = "Return to exactly two registered upstream keys before adding another key.";
+  setControlPrerequisite("add-upstream", "add-upstream-reason", message);
+}
+function setIssuePrerequisite(snapshot) {
+  let message = "";
+  if (!snapshotCurrent) message = "Current state is unknown. Refresh before issuing a downstream token.";
+  else if (orphanedToken) message = "Revoke the credential whose one-time response was lost before issuing a replacement.";
+  else if (snapshot.readinessCause === "runtime_unavailable") message = "Issue is locked until the local runtime is restored.";
+  else if (snapshot.readinessCause === "ledger_capacity_exhausted") message = "Issue is locked while ledger capacity blocks new requests and changes.";
+  else if (snapshot.upstreams.length > 2) message = "Return to exactly two registered upstream keys before issuing a downstream token.";
+  else if (snapshot.overview.downstream_tokens.total === 0
+    && (snapshot.upstreams.length !== 2 || snapshot.overview.upstream_keys.eligible !== 2)) message = "The first client credential is available after exactly two registered keys are verified, enabled, and eligible.";
+  else if (snapshot.overview.upstream_keys.eligible === 0) message = "Issue is available after at least one verified key is enabled and eligible.";
+  setControlPrerequisite("issue-downstream", "issue-downstream-reason", message);
 }
 function renderUnavailableDecision() {
   byId("ledger-recovery").hidden = true;
@@ -52,10 +67,8 @@ function renderUnavailableDecision() {
   setText("activity-summary", "Recent activity is unavailable until refresh succeeds.");
   tableMessage("events-body", 5, "Unavailable. Refresh current state to load recent events.");
   setText("audit-summary", "Audit details · unavailable");
-  const issueReason = byId("issue-downstream-reason");
-  setText("issue-downstream-reason", "Issue is locked until current state is refreshed.");
-  issueReason.hidden = false;
-  byId("issue-downstream").setAttribute("aria-describedby", issueReason.id);
+  setControlPrerequisite("add-upstream", "add-upstream-reason", "Add is locked until current state is refreshed.");
+  setControlPrerequisite("issue-downstream", "issue-downstream-reason", "Issue is locked until current state is refreshed.");
   setRecommendation("refresh", "Refresh current state");
 }
 function excludedState(overview) {
@@ -102,16 +115,19 @@ function recommendCoolingKey(cooling, overview, reference) {
   }
   setRecommendation("none", "");
 }
-function renderDecision(snapshot, reference) {
-  const {overview, upstreams, events} = snapshot;
-  byId("ledger-recovery").hidden = true;
-  byId("ledger-recovery").open = false;
+function reconcileReplacementContext(upstreams) {
   if (replacementContext && (
     !upstreams.some((item) => item.id === replacementContext.sourceId)
     || !upstreams.some((item) => item.id === replacementContext.replacementId)
   )) replacementContext = null;
+}
+function renderDecision(snapshot, reference) {
+  const {overview, upstreams, events} = snapshot;
+  byId("ledger-recovery").hidden = true;
+  byId("ledger-recovery").open = false;
   reconcileLocalIntent(upstreams, events);
   renderOperationSummary();
+  setAddPrerequisite(snapshot);
   setIssuePrerequisite(snapshot);
   if (!snapshotCurrent) {
     setText("decision-state", "Stale · Current state is unknown");
@@ -171,12 +187,19 @@ function renderDecision(snapshot, reference) {
     setRecommendation("add", "Add first key");
     return;
   }
-  if (overview.upstream_keys.eligible > 0 && overview.downstream_tokens.active === 0
-    && overview.downstream_tokens.total === 0) {
+  if (upstreams.length === 2 && overview.upstream_keys.eligible === 2
+    && overview.downstream_tokens.active === 0 && overview.downstream_tokens.total === 0) {
     setText("decision-state", "Setup · Gateway is ready");
     setText("decision-title", "Issue a downstream token");
     setText("decision-explanation", "Create one client credential with only the scopes that client needs.");
     setRecommendation("issue", "Issue downstream token");
+    return;
+  }
+  if (upstreams.length > 2 && !replacementContext) {
+    setText("decision-state", `Cleanup required · ${upstreams.length} registered keys`);
+    setText("decision-title", "Return to exactly two upstream keys");
+    setText("decision-explanation", "No new client credential can be issued in this state. Review the safe IDs and fingerprints, then disable and delete one unintended extra key.");
+    setRecommendation("upstreams", "Review extra upstream keys");
     return;
   }
   if (recommendExcludedKey(upstreams, overview, reference)) return;

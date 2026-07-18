@@ -27,8 +27,14 @@ publishing token digests. Store the database and key roots in separate custody
 domains. Losing either half makes recovery impossible.
 
 The three parent roots must already exist as distinct, non-nested,
-`root:root` mode-`0700` directories. The backup script deliberately will not
-create or repair these custody roots:
+`root:root` mode-`0700` directories. Directory separation is an access-custody
+boundary, not a disk-failure boundary. On the current single-LV host, `/srv`,
+`/opt`, and the Docker volume share one physical failure domain, so a local tuple
+proves application recovery only. Copy the database dump and manifest together
+to verified off-host storage and the vault key through a separately controlled,
+encrypted channel before claiming disaster-recovery readiness. Verify both
+copies by hash and perform this isolated restore from the off-host copy. The
+backup script deliberately will not create or repair these custody roots:
 
 ```console
 sudo install -d -o root -g root -m 0700 \
@@ -153,6 +159,8 @@ before it creates the isolated secret directory, database, or volume.
 set -Eeuo pipefail
 set +x
 export BACKUP_ID="replace-with-verified-backup-id"
+PRESERVE_RESTORE_GENERATION=${PRESERVE_RESTORE_GENERATION:-0}
+case "$PRESERVE_RESTORE_GENERATION" in 0|1) ;; *) printf '%s\n' restore_preserve_mode_invalid >&2; exit 64 ;; esac
 [[ "$BACKUP_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
   || { printf '%s\n' restore_backup_id_invalid >&2; exit 64; }
 APP_IMAGE_REF="$(scripts/ops/production-compose.sh config --format json | jq -er '.services.app.image')"
@@ -271,6 +279,13 @@ while [ "$RESTORE_RUNTIME_ATTEMPT" -lt 30 ]; do
   sleep 1
 done
 [ "$RESTORE_RUNTIME_READY" -eq 1 ] || { printf '%s\n' restore_runtime_timeout >&2; exit 1; }
+if [ "$PRESERVE_RESTORE_GENERATION" -eq 1 ]; then
+  trap - EXIT HUP INT TERM
+  printf '%s\n' "$RESTORE_RECEIPT"
+  printf 'Preserved isolated restore project: %s\n' "$RESTORE_PROJECT"
+  printf 'Preserved isolated restore secret directory: %s\n' "$RESTORE_SECRET_DIR"
+  exit 0
+fi
 set +e
 cleanup_restore_attempt
 CLEANUP_STATUS=$?
@@ -298,6 +313,15 @@ or PASS receipt is allowed and the attempt-owned resources are cleaned.
 Persistent inputs are validated before those resources are created, and restore
 never reaches `psql` until the isolated PostgreSQL container reports healthy
 within the bounded wait.
+
+The default drill cleans its isolated project, volume, and secret directory.
+Set `PRESERVE_RESTORE_GENERATION=1` only when a separately reviewed production
+state-cutover decision needs the verified generation retained. Its printed
+project and secret-directory identifiers are safe metadata; keep both root-only
+and do not use either as the live pair. After that decision, remove the preserved
+project with the same release-matched Compose wrapper and remove only its exact
+printed secret directory. A routine drill must leave the default at `0` and
+prove zero-resource cleanup.
 
 Restore refuses a nonempty target database, a non-isolated label, mismatched
 artifact hash, wrong key length, unsafe root artifact, unknown manifest field,

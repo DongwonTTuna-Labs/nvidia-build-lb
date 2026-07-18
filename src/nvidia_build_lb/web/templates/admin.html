@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="description" content="Owner administration for NVIDIA Build LB." />
   <title>NVIDIA Build LB administration</title>
-  <link href="/admin" rel="icon" />
+  <link href="/assets/favicon.svg" rel="icon" type="image/svg+xml" />
   <link href="/assets/admin.css" rel="stylesheet" />
   <script defer="defer" src="/assets/admin.js" type="module"></script>
 </head>
@@ -30,7 +30,21 @@
     </aside>
     <main id="main-content" tabindex="-1">
       <section id="auth-view" aria-labelledby="login-title">
-        <div id="login-slot"></div>
+        <div id="login-slot">
+          <form class="login-form" id="login-form" novalidate="novalidate">
+            <p class="metadata">Per-tab credential custody</p>
+            <h1 id="login-title">Authenticate locally</h1>
+            <p>The admin bearer is kept only for this tab. Reload and logout erase it; this page never saves it.</p>
+            <p class="recovery-panel" hidden="hidden" id="login-busy" role="status" tabindex="-1">Authenticating locally…</p>
+            <div class="error-panel" hidden="hidden" id="login-error" role="alert" tabindex="-1"><p id="login-error-message">Authentication failed. Enter the current admin bearer and try again.</p></div>
+            <p class="recovery-panel" hidden="hidden" id="login-interrupted"></p>
+            <div class="error-panel" hidden="hidden" id="login-offline" role="alert" tabindex="-1"><p>Service unavailable. The local administration service could not be reached. Your entered bearer was cleared; try again when the service is available.</p></div>
+            <label for="admin-bearer">Admin bearer</label>
+            <input aria-describedby="admin-bearer-help" autocomplete="off" disabled="disabled" id="admin-bearer" required="required" spellcheck="false" type="password" />
+            <p class="helper" id="admin-bearer-help">Never place this value in a URL, cookie, or saved browser storage.</p>
+            <button class="control primary" disabled="disabled" id="login-submit" type="submit">Open administration</button>
+          </form>
+        </div>
       </section>
       <section hidden="hidden" id="dashboard" aria-labelledby="dashboard-title">
         <header class="page-heading">
@@ -67,7 +81,7 @@
           <p hidden="hidden" id="refresh-status" role="status" tabindex="-1"></p>
         </section>
         <section id="upstream-keys" aria-labelledby="upstream-heading" aria-busy="true">
-          <div class="section-heading"><div><p class="metadata">Encrypted upstream vault</p><h2 id="upstream-heading" tabindex="-1">Upstream keys</h2></div><div><p>See which keys are eligible, then act on one stable key handle. Audit values stay one disclosure away.</p><button class="control secondary" data-mutation="true" id="add-upstream" type="button">Add upstream key</button></div></div>
+          <div class="section-heading"><div><p class="metadata">Encrypted upstream vault</p><h2 id="upstream-heading" tabindex="-1">Upstream keys</h2></div><div><p>See which keys are eligible, then act on one stable key handle. Audit values stay one disclosure away.</p><button class="control secondary" data-mutation="true" id="add-upstream" type="button">Add upstream key</button><p class="action-reason" hidden="hidden" id="add-upstream-reason"></p></div></div>
           <p class="row-result section-result" hidden="hidden" id="upstream-result" tabindex="-1"></p>
           <table><caption class="visually-hidden">Upstream key routing, health, and actions</caption><thead><tr><th scope="col">Key</th><th scope="col">Routing</th><th scope="col">Health</th><th scope="col">Actions</th></tr></thead><tbody id="upstream-body"><tr><td colspan="4">Loading upstream keys…</td></tr></tbody></table>
         </section>
@@ -84,22 +98,6 @@
     </main>
   </div>
   <footer><p>Copyright 2026 DongwonTTuna-Labs. Independent implementation; third-party names remain the property of their respective owners.</p></footer>
-
-  <template id="login-template">
-    <form class="login-form" id="login-form" novalidate="novalidate">
-      <p class="metadata">Per-tab credential custody</p>
-      <h1 id="login-title">Authenticate locally</h1>
-      <p>The admin bearer is kept only for this tab. Reload and logout erase it; this page never saves it.</p>
-      <p class="recovery-panel" hidden="hidden" id="login-busy" role="status" tabindex="-1">Authenticating locally…</p>
-      <div class="error-panel" hidden="hidden" id="login-error" role="alert" tabindex="-1"><p id="login-error-message">Authentication failed. Enter the current admin bearer and try again.</p></div>
-      <p class="recovery-panel" hidden="hidden" id="login-interrupted"></p>
-      <div class="error-panel" hidden="hidden" id="login-offline" role="alert" tabindex="-1"><p>Service unavailable. The local administration service could not be reached. Your entered bearer was cleared; try again when the service is available.</p></div>
-      <label for="admin-bearer">Admin bearer</label>
-      <input aria-describedby="admin-bearer-help" autocomplete="off" id="admin-bearer" name="admin-bearer" required="required" spellcheck="false" type="password" />
-      <p class="helper" id="admin-bearer-help">Never place this value in a URL, cookie, or saved browser storage.</p>
-      <button class="control primary" id="login-submit" type="submit">Open administration</button>
-    </form>
-  </template>
 
   <dialog aria-describedby="upstream-description" aria-labelledby="upstream-title" id="upstream-dialog">
     <form id="upstream-form" method="dialog" novalidate="novalidate">
@@ -135,14 +133,17 @@
     </form>
   </dialog>
 
-  <dialog aria-describedby="credential-target credential-description" aria-labelledby="credential-title" id="credential-dialog">
+  <dialog aria-describedby="credential-target credential-description credential-id-help" aria-labelledby="credential-title" id="credential-dialog">
     <h2 id="credential-title" tabindex="-1">Store this credential now</h2><p id="credential-description"><strong>Copy</strong> writes it to the clipboard. <strong>Dismiss</strong> removes it from this page and, when clipboard access exists, verifies the clipboard is empty. It cannot be recovered afterward.</p>
     <p id="credential-target"></p>
-    <textarea aria-label="One-time credential. Press Control A or Command A to select only this credential." class="credential" id="one-time-token" readonly="readonly" rows="3" spellcheck="false"></textarea>
+    <label for="credential-id"><strong>Internal ID</strong></label>
+    <input aria-describedby="credential-id-help" class="credential-id machine-id" id="credential-id" readonly="readonly" spellcheck="false" type="text" />
+    <p class="helper" id="credential-id-help">Safe metadata. Store this Internal ID with the client record so you can identify or revoke the credential after the bearer leaves this page.</p>
+    <textarea aria-label="One-time bearer. Press Control A or Command A to select only this bearer." class="credential" id="one-time-token" readonly="readonly" rows="3" spellcheck="false"></textarea>
     <p hidden="hidden" id="credential-status" role="status"></p>
     <p class="recovery-panel" hidden="hidden" id="credential-busy" role="status" tabindex="-1"></p>
     <div class="error-panel" hidden="hidden" id="clipboard-error" role="alert" tabindex="-1"><p id="clipboard-error-message">Clipboard cleanup failed. Restore access, then dismiss again.</p></div>
-    <div class="dialog-actions"><button class="control secondary" id="copy-token" type="button">Copy credential</button><button class="control primary" id="dismiss-token" type="button">Dismiss and remove</button></div>
+    <div class="dialog-actions"><button class="control secondary" id="copy-token" type="button">Copy one-time bearer</button><button class="control primary" id="dismiss-token" type="button">Dismiss and remove</button></div>
   </dialog>
   <p aria-live="polite" class="visually-hidden" id="live-region"></p>
 </body>

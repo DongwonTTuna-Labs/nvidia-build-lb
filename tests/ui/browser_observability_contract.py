@@ -54,6 +54,7 @@ def network_observation_is_allowed(item: SafeNetworkObservation) -> bool:
         ("GET", "/showcase", 200),
         ("GET", "/assets/admin.css", 200),
         ("GET", "/assets/admin.js", 200),
+        ("GET", "/assets/favicon.svg", 200),
         ("GET", "/assets/showcase.css", 200),
         ("GET", "/assets/showcase.js", 200),
         ("GET", "/admin/api/v1/dashboard", 200),

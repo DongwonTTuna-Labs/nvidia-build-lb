@@ -7,29 +7,24 @@ services:
       POSTGRES_DB: nvidia_build_lb
       POSTGRES_USER: nvidia_build_lb
       PGDATA: /var/lib/postgresql/data/pgdata
+    secrets:
+      - source: db_password
+        target: /run/canonical-secrets/db_password
+        mode: 0400
     labels:
       nvidia-build-lb.component: database
       nvidia-build-lb.backup-source: ${NBLB_BACKUP_SOURCE:-true}
       nvidia-build-lb.restore-isolated: ${NBLB_RESTORE_ISOLATED:-false}
       com.centurylinklabs.watchtower.enable: "false"
-    secrets:
-      - source: db_password
-        target: /run/canonical-secrets/db_password
-        mode: 0400
     volumes:
       - db-data:/var/lib/postgresql/data
     tmpfs:
-      - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
       - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m,mode=0775,uid=70,gid=70
       - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
     read_only: true
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-      - SETPCAP
+    user: "70:70"
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -44,10 +39,9 @@ services:
 
   migrate:
     image: ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_APP_REGISTRY_DIGEST:?raw application registry digest required}
+    command: ["/usr/local/bin/nblb-migrate"]
     environment:
-      NVIDIA_BUILD_LB_MODE: migrate
-      NVIDIA_BUILD_LB_DATABASE_URL: postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb
-      NVIDIA_BUILD_LB_DATABASE_PASSWORD_FILE: /run/nvidia-build-lb/secrets/db_password
+      NBLB_DATABASE_URL: postgres://nvidia_build_lb@db/nvidia_build_lb
     labels:
       nvidia-build-lb.component: migration
       com.centurylinklabs.watchtower.enable: "false"
@@ -79,11 +73,8 @@ services:
   app:
     image: ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_APP_REGISTRY_DIGEST:?raw application registry digest required}
     environment:
-      NVIDIA_BUILD_LB_MODE: app
-      NVIDIA_BUILD_LB_DATABASE_URL: postgresql+asyncpg://nvidia_build_lb@db/nvidia_build_lb
-      NVIDIA_BUILD_LB_DATABASE_PASSWORD_FILE: /run/nvidia-build-lb/secrets/db_password
-      NVIDIA_BUILD_LB_ADMIN_TOKEN_FILE: /run/nvidia-build-lb/secrets/admin_token
-      NVIDIA_BUILD_LB_VAULT_KEY_FILE: /run/nvidia-build-lb/secrets/vault_master_key
+      NBLB_DATABASE_URL: postgres://nvidia_build_lb@db/nvidia_build_lb
+      NBLB_VAULT_MASTER_KEY_FILE: /run/nvidia-build-lb/secrets/vault_master_key
       NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_PORT:-2456}
       NVIDIA_BUILD_LB_ADMIN_EVENT_MAX_ROWS: ${NBLB_ADMIN_EVENT_MAX_ROWS:-100000}
       NVIDIA_BUILD_LB_ADMIN_ATTEMPT_MAX_ROWS: ${NBLB_ADMIN_ATTEMPT_MAX_ROWS:-40000}
@@ -101,8 +92,19 @@ services:
       - source: db_password
         target: /run/canonical-secrets/db_password
         mode: 0400
+    volumes:
+      - type: bind
+        source: /run/nvidia-build-lb
+        target: /run/nvidia-build-lb
+        read_only: true
+      - type: bind
+        source: /run/nvidia-build-lb-control
+        target: /run/nvidia-build-lb-control
+        read_only: false
+      - vault-data:/var/lib/nvidia-build-lb
     tmpfs:
       - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
+      - /run/nvidia-build-lb/media-spool:rw,noexec,nosuid,nodev,size=256m,mode=0730,uid=0,gid=65532
       - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
     read_only: true
     cap_drop:
@@ -142,3 +144,4 @@ networks:
 
 volumes:
   db-data:
+  vault-data:

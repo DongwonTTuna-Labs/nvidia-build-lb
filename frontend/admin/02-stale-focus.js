@@ -37,7 +37,12 @@ function restoreRefreshFocus(captured, restoreFocusId) {
   const targetId = restoreFocusId === "retry-dashboard" && mutationRecoveryFocusId
     ? mutationRecoveryFocusId : restoreFocusId;
   const target = deleteFocusCandidateIds.length ? consumeDeleteFocusTarget() : byId(targetId);
-  (target?.getClientRects().length && !target.disabled ? target : byId("dashboard-title")).focus();
+  const recommendation = byId("recommended-action");
+  const mutationTargetWasLost = Boolean(restoreFocusId)
+    && !["refresh-dashboard", "retry-dashboard", "recommended-action"].includes(restoreFocusId);
+  const fallback = mutationTargetWasLost && !recommendation.hidden && !recommendation.disabled
+    && recommendation.getClientRects().length ? recommendation : byId("dashboard-title");
+  (target?.getClientRects().length && !target.disabled ? target : fallback).focus();
 }
 function markSnapshotStale(reason, showDialogWarning = true) {
   const focusedElement = document.activeElement;

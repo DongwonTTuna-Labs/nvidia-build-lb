@@ -951,7 +951,7 @@ def test_malformed_mutation_successes_are_invalid_responses_not_transport_failur
                 stop_fake_server(server)
 
 
-def test_one_time_credential_names_client_and_access_then_clears_target() -> None:
+def test_one_time_credential_names_client_and_access_then_clears_target() -> None:  # noqa: PLR0915
     server = start_fake_server()
     managed = start_managed_browser()
     context = managed.browser.new_context(viewport={"width": 375, "height": 812})
@@ -975,12 +975,14 @@ def test_one_time_credential_names_client_and_access_then_clears_target() -> Non
         page.locator("#submit-downstream").click()
 
         expect(page.locator("#credential-dialog")).to_be_visible()
+        issued = next(item for item in server.state.tokens().items if item.label == label)
         expect(page.locator("#credential-title")).to_have_text(
             f"Store credential for {label[:48]}…"
         )
         expect(page.locator("#credential-target")).to_have_text(
             f"Client {label} · Read models · Write chat"
         )
+        expect(page.locator("#credential-id")).to_have_value(str(issued.id))
         expect(page.locator("#credential-title")).to_be_focused()
         assert '"id":"downstream-dialog-busy"' in _live_changes(page)
         assert '"id":"live-region"' not in _live_changes(page)
@@ -1006,6 +1008,7 @@ document.documentElement.scrollWidth <= document.documentElement.clientWidth
         page.locator("#dismiss-token").click()
         expect(page.locator("#credential-dialog")).to_be_hidden()
         expect(page.locator("#credential-target")).to_be_empty()
+        expect(page.locator("#credential-id")).to_have_value("")
         expect(page.locator("#credential-title")).to_have_text("Store this credential now")
         expect(page.locator("#one-time-token")).to_be_empty()
     finally:
@@ -1728,7 +1731,7 @@ def test_snapshot_expires_at_known_cooldown_transition_and_moves_focus_to_refres
         ("normal", "No action required", None),
         ("quarantined", "Probe Key bbbbbbbb", "Probe Key bbbbbbbb"),
         ("invalid", "Retire rejected Key bbbbbbbb", "Review Key bbbbbbbb"),
-        ("invalid-no-client", "Issue a downstream token", "Issue downstream token"),
+        ("invalid-no-client", "Retire rejected Key bbbbbbbb", "Review Key bbbbbbbb"),
         (
             "credits",
             "Restore credits for Key bbbbbbbb",
@@ -1741,7 +1744,7 @@ def test_snapshot_expires_at_known_cooldown_transition_and_moves_focus_to_refres
         ("disabled", "No action required", None),
     ],
 )
-def test_decision_matrix_exposes_cause_target_and_one_action(
+def test_decision_matrix_exposes_cause_target_and_one_action(  # noqa: PLR0915
     scenario: str,
     title: str,
     action: str | None,
@@ -1777,6 +1780,11 @@ def test_decision_matrix_exposes_cause_target_and_one_action(
             expect(page.locator(f"#key-{_SECOND_KEY_ID}-probe-reason")).to_contain_text("in 5m")
         if scenario == "invalid":
             expect(page.locator(f"#key-{_SECOND_KEY_ID}-probe")).to_be_disabled()
+        if scenario == "invalid-no-client":
+            expect(page.locator("#issue-downstream")).to_be_disabled()
+            expect(page.locator("#issue-downstream-reason")).to_contain_text(
+                "exactly two registered keys"
+            )
         if scenario == "credits":
             probe = page.locator(f"#key-{_SECOND_KEY_ID}-probe")
             expect(probe).to_be_enabled()
@@ -1791,6 +1799,45 @@ def test_decision_matrix_exposes_cause_target_and_one_action(
             row = page.locator(f"#key-{_SECOND_KEY_ID}-probe").locator("xpath=ancestor::tr")
             expect(row).to_contain_text("Cooldown ended · Probe the disabled key")
             expect(page.locator(f"#key-{_SECOND_KEY_ID}-probe")).to_be_enabled()
+    finally:
+        try:
+            context.close()
+        finally:
+            try:
+                stop_managed_browser(managed)
+            finally:
+                stop_fake_server(server)
+
+
+def test_first_token_gate_flows_from_one_to_two_eligible_keys() -> None:
+    server = start_fake_server()
+    managed = start_managed_browser()
+    context = managed.browser.new_context(viewport={"width": 768, "height": 900})
+    page = context.new_page()
+    page.set_default_timeout(5_000)
+    pattern = "**/admin/api/v1/dashboard"
+    try:
+        _ = page.goto(f"{UI_ORIGIN}/admin", wait_until="domcontentloaded")
+        page.locator("#admin-bearer").fill(server.state.admin_bearer)
+        page.keyboard.press("Enter")
+        expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+
+        _install_decision_scenario(page, "invalid-no-client", server.state)
+        _refresh_dashboard_from(page, "#refresh-dashboard")
+        expect(page.locator("#eligible-count")).to_have_text("2 registered · 1 eligible")
+        expect(page.locator("#issue-downstream")).to_be_disabled()
+        expect(page.locator("#issue-downstream-reason")).to_contain_text(
+            "exactly two registered keys"
+        )
+        expect(page.locator("#recommended-action")).to_have_text("Review Key bbbbbbbb")
+
+        page.unroute(pattern)
+        _install_decision_scenario(page, "normal-no-client", server.state)
+        _refresh_dashboard_from(page, "#refresh-dashboard")
+        expect(page.locator("#eligible-count")).to_have_text("2 registered · 2 eligible")
+        expect(page.locator("#issue-downstream")).to_be_enabled()
+        expect(page.locator("#issue-downstream-reason")).to_be_hidden()
+        expect(page.locator("#recommended-action")).to_have_text("Issue downstream token")
     finally:
         try:
             context.close()
@@ -1866,15 +1913,141 @@ def test_tracked_replacement_retires_invalid_key_when_it_is_the_only_eligible_ke
         page.locator("#recommended-action").click()
         expect(page.locator("#decision-title")).to_have_text(f"Enable Key {replacement_handle}")
         page.locator("#recommended-action").click()
-        expect(page.locator("#eligible-count")).to_have_text("1 eligible")
-        expect(page.locator("#decision-title")).to_have_text("Retire rejected Key bbbbbbbb")
+        expect(page.locator("#eligible-count")).to_have_text("3 registered · 1 eligible")
+        expect(page.locator("#decision-title")).to_have_text("Disable replaced Key bbbbbbbb")
         _start_reviewed_row_action(page, f"key-{_SECOND_KEY_ID}-toggle")
         page.locator("#confirm-action").click()
-        expect(page.locator("#decision-title")).to_have_text("Retire rejected Key bbbbbbbb")
+        expect(page.locator("#decision-title")).to_have_text("Delete replaced Key bbbbbbbb")
         _start_reviewed_row_action(page, f"key-{_SECOND_KEY_ID}-delete")
         page.locator("#confirm-action").click()
         expect(page.locator("#decision-title")).to_have_text("Probe Key aaaaaaaa")
         expect(page.locator("#decision-title")).not_to_contain_text("Add replacement")
+    finally:
+        try:
+            context.close()
+        finally:
+            try:
+                stop_managed_browser(managed)
+            finally:
+                stop_fake_server(server)
+
+
+def test_row_replace_tracks_source_through_three_row_cleanup() -> None:  # noqa: PLR0915
+    server = start_fake_server()
+    _ = server.state.change_upstream(UUID(_FIRST_KEY_ID), "probe")
+    _ = server.state.change_upstream(UUID(_FIRST_KEY_ID), "enable")
+    _ = server.state.change_upstream(UUID(_SECOND_KEY_ID), "probe")
+    managed = start_managed_browser()
+    context = managed.browser.new_context(viewport={"width": 768, "height": 900})
+    page = context.new_page()
+    page.set_default_timeout(5_000)
+    replacement = "synthetic-healthy-row-replacement"
+    replacement_handle = sha256(replacement.encode()).hexdigest()[:8]
+    try:
+        _ = page.goto(f"{UI_ORIGIN}/admin", wait_until="domcontentloaded")
+        page.locator("#admin-bearer").fill(server.state.admin_bearer)
+        page.keyboard.press("Enter")
+        expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+        expect(page.locator("#eligible-count")).to_have_text("2 registered · 2 eligible")
+
+        page.locator(f"#key-{_FIRST_KEY_ID}-replace").click()
+        expect(page.locator("#upstream-title")).to_have_text("Replace Key aaaaaaaa")
+        page.locator("#upstream-key").fill(replacement)
+        page.locator("#submit-upstream").click()
+        expect(page.locator("#decision-title")).to_have_text(f"Probe Key {replacement_handle}")
+        page.locator("#recommended-action").click()
+        expect(page.locator("#decision-title")).to_have_text(f"Enable Key {replacement_handle}")
+        page.locator("#recommended-action").click()
+
+        expect(page.locator("#eligible-count")).to_have_text("3 registered · 3 eligible")
+        expect(page.locator("#add-upstream")).to_be_disabled()
+        expect(page.locator("#add-upstream")).to_have_attribute(
+            "aria-describedby", "add-upstream-reason"
+        )
+        expect(page.locator("#add-upstream-reason")).to_have_text(
+            "Return to exactly two registered upstream keys before adding another key."
+        )
+        expect(page.locator("#issue-downstream")).to_be_disabled()
+        expect(page.locator("#issue-downstream")).to_have_attribute(
+            "aria-describedby", "issue-downstream-reason"
+        )
+        expect(page.locator("#issue-downstream-reason")).to_have_text(
+            "Return to exactly two registered upstream keys before issuing a downstream token."
+        )
+        upstreams_before_disabled_clicks = server.state.upstreams().items
+        tokens_before_disabled_clicks = server.state.tokens().items
+        server.state.reset_network_audit()
+        page.locator("#add-upstream").evaluate("button => button.click()")
+        page.locator("#issue-downstream").evaluate("button => button.click()")
+        assert server.state.upstreams().items == upstreams_before_disabled_clicks
+        assert server.state.tokens().items == tokens_before_disabled_clicks
+        assert not any(item.method == "POST" for item in server.state.network_audit())
+        expect(page.locator("#upstream-dialog")).to_be_hidden()
+        expect(page.locator("#downstream-dialog")).to_be_hidden()
+        expect(page.locator("#decision-title")).to_have_text("Disable replaced Key aaaaaaaa")
+        _start_reviewed_row_action(page, f"key-{_FIRST_KEY_ID}-toggle")
+        page.locator("#confirm-action").click()
+        expect(page.locator("#decision-title")).to_have_text("Delete replaced Key aaaaaaaa")
+        _start_reviewed_row_action(page, f"key-{_FIRST_KEY_ID}-delete")
+        page.locator("#confirm-action").click()
+
+        expect(page.locator("#eligible-count")).to_have_text("2 registered · 2 eligible")
+        expect(page.locator(f"#key-{_FIRST_KEY_ID}-probe")).to_have_count(0)
+        expect(page.locator("#decision-title")).to_have_text("No action required")
+        expect(page.locator("[id$='-replace']")).to_have_count(2)
+    finally:
+        try:
+            context.close()
+        finally:
+            try:
+                stop_managed_browser(managed)
+            finally:
+                stop_fake_server(server)
+
+
+def test_untracked_three_row_state_requires_review_without_guessing_target() -> None:
+    server = start_fake_server()
+    _ = server.state.add_upstream(UpstreamKeyCreateRequest(key="synthetic-untracked-extra-key"))
+    managed = start_managed_browser()
+    context = managed.browser.new_context(viewport={"width": 768, "height": 900})
+    page = context.new_page()
+    page.set_default_timeout(5_000)
+    try:
+        _ = page.goto(f"{UI_ORIGIN}/admin", wait_until="domcontentloaded")
+        page.locator("#admin-bearer").fill(server.state.admin_bearer)
+        page.keyboard.press("Enter")
+        expect(page.locator("#overview")).to_have_attribute("aria-busy", "false")
+
+        expect(page.locator("#decision-state")).to_have_text("Cleanup required · 3 registered keys")
+        expect(page.locator("#decision-title")).to_have_text("Return to exactly two upstream keys")
+        expect(page.locator("#recommended-action")).to_have_text("Review extra upstream keys")
+        expect(page.locator("#add-upstream")).to_be_disabled()
+        expect(page.locator("#add-upstream")).to_have_attribute(
+            "aria-describedby", "add-upstream-reason"
+        )
+        expect(page.locator("#add-upstream-reason")).to_have_text(
+            "Return to exactly two registered upstream keys before adding another key."
+        )
+        expect(page.locator("#issue-downstream")).to_be_disabled()
+        expect(page.locator("#issue-downstream")).to_have_attribute(
+            "aria-describedby", "issue-downstream-reason"
+        )
+        expect(page.locator("#issue-downstream-reason")).to_have_text(
+            "Return to exactly two registered upstream keys before issuing a downstream token."
+        )
+        upstreams_before_disabled_clicks = server.state.upstreams().items
+        tokens_before_disabled_clicks = server.state.tokens().items
+        server.state.reset_network_audit()
+        page.locator("#add-upstream").evaluate("button => button.click()")
+        page.locator("#issue-downstream").evaluate("button => button.click()")
+        assert server.state.upstreams().items == upstreams_before_disabled_clicks
+        assert server.state.tokens().items == tokens_before_disabled_clicks
+        assert not any(item.method == "POST" for item in server.state.network_audit())
+        expect(page.locator("#upstream-dialog")).to_be_hidden()
+        expect(page.locator("#downstream-dialog")).to_be_hidden()
+        expect(page.locator("[id$='-replace']")).to_have_count(0)
+        page.locator("#recommended-action").click()
+        expect(page.locator("#upstream-heading")).to_be_focused()
     finally:
         try:
             context.close()

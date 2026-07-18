@@ -57,7 +57,7 @@ def _confirm_with_keyboard(page: Page) -> None:
 def _assert_focus_moves_to_first_available_next_row_action(page: Page) -> None:
     next_key = "key-00000000-0000-4000-8000-000000000002"
     expect(page.locator(f"#{next_key}-probe")).to_be_disabled()
-    expect(page.locator(f"#{next_key}-toggle")).to_be_focused()
+    expect(page.locator(f"#{next_key}-replace")).to_be_focused()
 
 
 def _exercise_busy_probe(session: AuthenticatedSession, state: FakeAdminState) -> str:
@@ -112,7 +112,8 @@ def run_upstream_journey(
 
     created = state.upstreams().items[-1]
     assert created.enabled is False
-    assert page.locator(":focus").get_attribute("id") == "add-upstream"
+    expect(page.locator("#recommended-action")).to_have_text("Review extra upstream keys")
+    expect(page.locator("#recommended-action")).to_be_focused()
     probe_id = f"key-{created.id}-probe"
     toggle_id = f"key-{created.id}-toggle"
     delete_id = f"key-{created.id}-delete"
@@ -189,6 +190,21 @@ def run_upstream_journey(
 
 def _select_one_time_credential(page: Page) -> None:
     page.keyboard.press("Tab")
+    assert page.locator(":focus").get_attribute("id") == "credential-id"
+    page.keyboard.press("Control+A")
+    assert (
+        int(
+            evaluate_string(
+                page,
+                """() => JSON.stringify(
+document.getElementById("credential-id").selectionEnd
+  - document.getElementById("credential-id").selectionStart
+)""",
+            )
+        )
+        > 0
+    )
+    page.keyboard.press("Tab")
     assert page.locator(":focus").get_attribute("id") == "one-time-token"
     page.keyboard.press("Control+A")
     assert (
@@ -207,7 +223,7 @@ document.getElementById("one-time-token").selectionEnd
     assert page.locator(":focus").get_attribute("id") == "copy-token"
 
 
-def run_downstream_journey(
+def run_downstream_journey(  # noqa: PLR0915
     session: AuthenticatedSession,
     recorder: EvidenceRecorder,
     state: FakeAdminState,
@@ -241,9 +257,11 @@ def run_downstream_journey(
     expect(page.locator("#credential-title")).to_have_text(
         "Store credential for Browser owner journey"
     )
+    issued = next(item for item in state.tokens().items if item.label == "Browser owner journey")
     expect(page.locator("#credential-target")).to_have_text(
         "Client Browser owner journey · Read models · Write chat"
     )
+    expect(page.locator("#credential-id")).to_have_value(str(issued.id))
     state_before_copy = credential_state_observation(page)
     assert state_before_copy.admin_bearer_present
     assert state_before_copy.one_time_token_present
@@ -262,10 +280,10 @@ def run_downstream_journey(
     assert state_after_dismissal.one_time_token_present is False
     assert state_after_dismissal.copied_credential is False
     expect(page.locator("#credential-target")).to_be_empty()
+    expect(page.locator("#credential-id")).to_have_value("")
     expect(page.locator("#credential-title")).to_have_text("Store this credential now")
     recorder.end_blackout()
 
-    issued = next(item for item in state.tokens().items if item.label == "Browser owner journey")
     revoke_id = f"token-{issued.id}-revoke"
     page.locator(f"#{revoke_id}").focus()
     page.keyboard.press("Enter")

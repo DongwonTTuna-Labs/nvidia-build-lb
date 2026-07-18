@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.18
+FROM node:22-bookworm AS admin
+WORKDIR /src
+COPY package.json package-lock.json ./
+COPY apps/admin/package.json apps/admin/package.json
+RUN npm ci --ignore-scripts
+COPY apps/admin ./apps/admin
+RUN npm --workspace @nvidia-build-lb/admin run build
+
+FROM rust:1.96-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+COPY crates ./crates
+COPY migrations/sqlx ./migrations/sqlx
+RUN cargo build --release -p nvidia-build-lb-gateway
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes util-linux ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin nblb \
+    && install -d -o 65532 -g 65532 -m 0755 /var/lib/nvidia-build-lb /app
+COPY --from=build /src/target/release/nvidia-build-lb-gateway /usr/local/bin/nvidia-build-lb-gateway
+COPY --from=build /src/target/release/nblb-pg-bootstrap /usr/local/bin/nblb-pg-bootstrap
+COPY --from=build /src/target/release/nblb-migrate /usr/local/bin/nblb-migrate
+COPY migrations/sqlx /app/migrations/sqlx
+COPY --from=admin /src/apps/admin/build /app/static
+COPY docker/rust-entrypoint.sh /usr/local/bin/rust-entrypoint
+RUN chmod 0555 /usr/local/bin/rust-entrypoint
+WORKDIR /app
+ENV NVIDIA_BUILD_LB_PUBLIC_PORT=2456 NVIDIA_BUILD_LB_STAGE=production
+EXPOSE 2456
+ENTRYPOINT ["/usr/local/bin/rust-entrypoint"]

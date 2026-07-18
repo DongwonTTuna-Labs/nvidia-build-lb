@@ -1,4 +1,5 @@
 from importlib.resources.abc import Traversable
+from xml.etree.ElementTree import fromstring
 
 import pytest
 
@@ -14,6 +15,7 @@ from nvidia_build_lb.web.resources import WebResource, load_web_resource
         (WebResource.SHOWCASE_DOCUMENT, "<!doctype html>"),
         (WebResource.SHOWCASE_STYLESHEET, ":root"),
         (WebResource.SHOWCASE_SCRIPT, "syncShowcaseNavigation"),
+        (WebResource.FAVICON, "<svg"),
     ],
 )
 def test_allowlisted_package_resource_is_read_when_requested(
@@ -26,6 +28,48 @@ def test_allowlisted_package_resource_is_read_when_requested(
 
     # Then: the expected packaged artifact is returned as text.
     assert marker in content
+
+
+def test_favicon_is_the_exact_passive_neutral_routing_graphic() -> None:
+    source = load_web_resource(WebResource.FAVICON)
+    expected = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">\n'
+        "  <title>NVIDIA Build LB</title>\n"
+        '  <rect width="64" height="64" rx="8" fill="#171C20" />\n'
+        '  <path d="M32 18v12M20 30h24M20 30v14M44 30v14" fill="none" '
+        'stroke="#C1C7C0" stroke-width="6" stroke-linecap="round" '
+        'stroke-linejoin="round" />\n'
+        "</svg>\n"
+    )
+
+    root = fromstring(source)  # noqa: S314 - the exact package resource is not untrusted input.
+    namespace = "{http://www.w3.org/2000/svg}"
+    children = list(root)
+
+    assert source == expected
+    assert root.tag == f"{namespace}svg"
+    assert root.attrib == {"viewBox": "0 0 64 64"}
+    assert [child.tag for child in children] == [
+        f"{namespace}title",
+        f"{namespace}rect",
+        f"{namespace}path",
+    ]
+    assert children[0].attrib == {}
+    assert children[0].text == "NVIDIA Build LB"
+    assert children[1].attrib == {
+        "width": "64",
+        "height": "64",
+        "rx": "8",
+        "fill": "#171C20",
+    }
+    assert children[2].attrib == {
+        "d": "M32 18v12M20 30h24M20 30v14M44 30v14",
+        "fill": "none",
+        "stroke": "#C1C7C0",
+        "stroke-width": "6",
+        "stroke-linecap": "round",
+        "stroke-linejoin": "round",
+    }
 
 
 def test_resource_name_fails_closed_when_it_is_not_allowlisted() -> None:
@@ -70,4 +114,5 @@ def test_application_creation_does_not_read_resource_content(
     assert application.url_path_for("_get_showcase_document") == "/showcase"
     assert application.url_path_for("_get_showcase_stylesheet") == "/assets/showcase.css"
     assert application.url_path_for("_get_showcase_script") == "/assets/showcase.js"
+    assert application.url_path_for("_get_favicon") == "/assets/favicon.svg"
     assert application.url_path_for("_health") == "/health"

@@ -152,11 +152,13 @@ def test_overview_returns_the_exact_seeded_aggregate_contract(
     response = contract_client.request(
         "GET",
         "/admin/api/v1/overview",
-        headers=bearer(ADMIN_TOKEN),
+        headers={**bearer(ADMIN_TOKEN), "Accept-Encoding": "gzip"},
     )
 
     # Then: exact readiness and aggregate fields match the seeded state.
     assert response.status_code == 200
+    assert "content-encoding" not in response.headers
+    assert "vary" not in response.headers
     payload = AdminOverviewRead.model_validate_json(response.content)
     assert payload.status.value == "ok"
     assert payload.ready is True

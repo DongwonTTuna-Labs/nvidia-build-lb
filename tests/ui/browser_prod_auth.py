@@ -164,7 +164,7 @@ def _recover_initial_offline(
     assert focused_id(page) == "retry-dashboard"
     page.keyboard.press("Enter")
     page.locator("#global-error").wait_for(state="hidden")
-    assert focused_id(page) == "dashboard-title"
+    expect(page.locator("#dashboard-title")).to_be_focused()
     page.locator("#logout").click()
     page.locator("#admin-bearer").wait_for(state="visible")
     assert focused_id(page) == "admin-bearer"
@@ -235,7 +235,7 @@ def _exercise_auth_failures(
     page.keyboard.press("Enter")
     page.locator("#global-error").wait_for(state="hidden")
     page.locator("#upstream-body tr").first.wait_for(state="visible")
-    assert focused_id(page) == "dashboard-title"
+    expect(page.locator("#dashboard-title")).to_be_focused()
 
 
 def open_production_session(

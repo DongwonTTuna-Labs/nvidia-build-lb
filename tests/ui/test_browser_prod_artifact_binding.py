@@ -8,6 +8,7 @@ import pytest
 
 from .browser_evidence import CaptureIndex, CaptureRecord
 from .browser_prod_verify import (
+    _assert_native_capture_ids,  # pyright: ignore[reportPrivateUsage]
     _fresh_cleanup_binding,  # pyright: ignore[reportPrivateUsage]
     _immutable_review_request,  # pyright: ignore[reportPrivateUsage]
     _review_is_valid,  # pyright: ignore[reportPrivateUsage]
@@ -56,6 +57,21 @@ def _write_capture_index(run: Path, receipt: CaptureIndex) -> None:
     _ = (run / "capture-index.json").write_text(
         receipt.model_dump_json(indent=2) + "\n", encoding="utf-8"
     )
+
+
+def test_native_capture_receipt_is_bound_to_index_order(tmp_path: Path) -> None:
+    base = _capture_index(tmp_path).captures[0]
+    capture = CaptureIndex(
+        captures=(
+            base,
+            base.model_copy(update={"name": "native-downstream", "native_zoom": True}),
+            base.model_copy(update={"name": "native-upstream", "native_zoom": True}),
+        )
+    )
+
+    _assert_native_capture_ids(("native-downstream", "native-upstream"), capture)
+    with pytest.raises(AssertionError, match="native capture identity or order changed"):
+        _assert_native_capture_ids(("native-upstream", "native-downstream"), capture)
 
 
 def test_verifier_rehashes_capture_bytes_on_every_invocation(tmp_path: Path) -> None:

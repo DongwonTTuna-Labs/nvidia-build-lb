@@ -19,6 +19,7 @@ smoke-hermes: EVIDENCE_DIR ?= .omo/evidence/task-11b-nvidia-build-lb
 
 .PHONY: help contract-red test-vault-auth test-nvidia-routing test-ui-fake test-api
 .PHONY: build-candidate test-browser-prod verify-local scan-release smoke-live smoke-hermes
+.PHONY: rust-check admin-check rust-smoke rust-smoke-postgres docker-rust-build
 
 help:
 	@printf '%s\n' \
@@ -33,8 +34,14 @@ help:
 		'  test-browser-prod  Todo 6B browser gate; requires app/PG digests and source manifest' \
 		'  verify-local       Todo 7 local gate; requires app/PG digests and source manifest' \
 		'  scan-release       Todo 7 scans; requires app/PG digests and source manifest' \
-		'  smoke-live         Todo 10A/10B script; requires MODE and IMAGE_DIGEST (reserved)' \
-		'  smoke-hermes       Todo 11B script; requires IMAGE_DIGEST (reserved)' \
+		'  smoke-live         Live matrix; exactly 2 registered rows, MODE selects 1 or 2 eligible' \
+		'  smoke-hermes       Hermes cutover cycle; requires IMAGE_DIGEST' \
+		'' \
+		'  rust-check        Rust core/gateway affected-scope check' \
+		'  admin-check       Svelte type/build check' \
+		'  rust-smoke        Mock two-key, scope, streaming, and modality smoke' \
+		'  rust-smoke-postgres PostgreSQL source-of-truth and restart smoke' \
+		'  docker-rust-build Build the Rust/Svelte production image locally' \
 		'' \
 		'Build candidate.json records IMAGE_DIGEST and POSTGRES_IMAGE_DIGEST.' \
 		'Reuse those values and the same source-manifest.json for 6B and 7.' \
@@ -84,10 +91,27 @@ scan-release:
 smoke-live:
 	@case "$(MODE)" in one-key|two-key) ;; *) printf '%s\n' 'INPUT[64]: MODE must be one-key or two-key'; exit 64 ;; esac
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
-	@test -x scripts/qa/smoke-live.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 10A/10B owns scripts/qa/smoke-live.sh'; exit 78; }
+	@test -x scripts/qa/smoke-live.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: required smoke-live executable is missing'; exit 78; }
 	MODE="$(MODE)" IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-live.sh
 
 smoke-hermes:
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
-	@test -x scripts/qa/smoke-hermes.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 11B owns scripts/qa/smoke-hermes.sh'; exit 78; }
+	@test -x scripts/qa/smoke-hermes.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: required smoke-hermes executable is missing'; exit 78; }
 	IMAGE_DIGEST="$(IMAGE_DIGEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/smoke-hermes.sh
+
+rust-check:
+	cargo test -p nvidia-build-lb-core
+	cargo check -p nvidia-build-lb-gateway --bins
+
+admin-check:
+	npm run admin:check
+	npm run admin:build
+
+rust-smoke:
+	scripts/qa/smoke-rust.sh
+
+rust-smoke-postgres:
+	scripts/qa/smoke-rust-postgres.sh
+
+docker-rust-build:
+	docker build --file Dockerfile.rust --tag nvidia-build-lb:rust-local .

@@ -1,0 +1,772 @@
+#![forbid(unsafe_code)]
+
+//! Routing and encrypted credential custody for the gateway.
+
+use aes_gcm::{AeadInPlace, Aes256Gcm, KeyInit, Nonce};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Duration, Utc};
+use rand::{Rng, rng};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    fs::OpenOptions,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
+use uuid::Uuid;
+
+/// Advertised profile IDs in their stable manifest order.
+pub const PROFILES: [&str; 7] = [
+    "z-ai/glm-5.2",
+    "microsoft/phi-4-multimodal-instruct",
+    "nvidia/vila",
+    "nvidia/nvclip",
+    "black-forest-labs/flux.1-kontext-dev",
+    "stabilityai/stable-video-diffusion",
+    "nvidia/magpie-tts-multilingual",
+];
+
+/// A redacted credential summary.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeySummary {
+    /// Stable key identifier.
+    pub id: Uuid,
+    /// Operator-facing label.
+    pub label: String,
+    /// SHA-256 fingerprint rendered as lowercase hex.
+    pub fingerprint: String,
+    /// Whether routing may select this key.
+    pub enabled: bool,
+    /// Current cooldown deadline, if any.
+    pub cooldown_until: Option<DateTime<Utc>>,
+    /// Successful request count.
+    pub request_count: u64,
+    /// Failed request count.
+    pub failure_count: u64,
+}
+
+/// A downstream bearer summary. The plaintext token is never stored or
+/// returned by read operations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DownstreamSummary {
+    /// Stable credential identifier.
+    pub id: Uuid,
+    /// Operator-facing label.
+    pub label: String,
+    /// Canonical scope order.
+    pub scopes: Vec<String>,
+    /// Whether the credential can still authenticate.
+    pub active: bool,
+    /// Number of accepted requests.
+    pub request_count: u64,
+    /// Last successful authentication time.
+    pub last_used_at: Option<DateTime<Utc>>,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Revocation timestamp, if revoked.
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// One-time issuance result. The token field must be discarded by callers
+/// after presenting it to the operator.
+#[derive(Clone, Debug)]
+pub struct IssuedDownstream {
+    /// Redacted credential metadata.
+    pub summary: DownstreamSummary,
+    /// Plaintext bearer, available only in the issuance response.
+    pub token: String,
+}
+
+/// Encrypted upstream-key row representation used by the PostgreSQL adapter.
+/// The plaintext credential is intentionally absent from this type.
+#[derive(Clone, Debug)]
+pub struct VaultKeyRecord {
+    /// Stable key identifier.
+    pub id: Uuid,
+    /// Operator-facing label.
+    pub label: String,
+    /// SHA-256 fingerprint bytes.
+    pub fingerprint: Vec<u8>,
+    /// AES-GCM nonce bytes.
+    pub nonce: Vec<u8>,
+    /// AES-GCM ciphertext and authentication tag.
+    pub ciphertext: Vec<u8>,
+    /// Whether routing may select this key.
+    pub enabled: bool,
+    /// Current cooldown deadline, if any.
+    pub cooldown_until: Option<DateTime<Utc>>,
+    /// Successful request count.
+    pub request_count: u64,
+    /// Failed request count.
+    pub failure_count: u64,
+}
+
+/// Hashed downstream-token row representation used by the PostgreSQL adapter.
+/// The bearer token itself is intentionally absent from this type.
+#[derive(Clone, Debug)]
+pub struct VaultDownstreamRecord {
+    /// Stable credential identifier.
+    pub id: Uuid,
+    /// Operator-facing label.
+    pub label: String,
+    /// Canonical authorization scopes.
+    pub scopes: Vec<String>,
+    /// SHA-256 digest of the bearer token.
+    pub token_digest: Vec<u8>,
+    /// Whether authentication is still accepted.
+    pub active: bool,
+    /// Accepted request count.
+    pub request_count: u64,
+    /// Last successful authentication time.
+    pub last_used_at: Option<DateTime<Utc>>,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Revocation timestamp, if revoked.
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredKey {
+    id: Uuid,
+    label: String,
+    fingerprint: String,
+    nonce: String,
+    ciphertext: String,
+    enabled: bool,
+    cooldown_until: Option<DateTime<Utc>>,
+    request_count: u64,
+    failure_count: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredDownstream {
+    id: Uuid,
+    label: String,
+    scopes: Vec<String>,
+    token_digest: String,
+    active: bool,
+    request_count: u64,
+    last_used_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct VaultFile {
+    version: u8,
+    keys: Vec<StoredKey>,
+    #[serde(default)]
+    downstream: Vec<StoredDownstream>,
+    #[serde(default)]
+    router_cursor: usize,
+}
+
+/// AES-256-GCM encrypted file-backed vault.
+#[derive(Debug)]
+pub struct Vault {
+    path: PathBuf,
+    master_key: [u8; 32],
+    state: VaultFile,
+}
+
+impl Vault {
+    /// Opens an existing vault or creates an empty version-one vault.
+    pub fn open(path: impl AsRef<Path>, master_key: [u8; 32]) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let state = if path.exists() {
+            serde_json::from_slice(&fs::read(&path).context("read vault")?)
+                .context("decode vault")?
+        } else {
+            VaultFile {
+                version: 1,
+                keys: Vec::new(),
+                downstream: Vec::new(),
+                router_cursor: 0,
+            }
+        };
+        if state.version != 1 {
+            bail!("unsupported vault version")
+        }
+        Ok(Self {
+            path,
+            master_key,
+            state,
+        })
+    }
+
+    /// Reconstructs an in-memory vault from encrypted database rows.
+    ///
+    /// `path` remains a local durability fallback for mutations made through
+    /// the core API; the gateway's database repository treats the rows as the
+    /// authoritative source and calls `records` after each successful change.
+    pub fn from_records(
+        path: impl AsRef<Path>,
+        master_key: [u8; 32],
+        keys: Vec<VaultKeyRecord>,
+        downstream: Vec<VaultDownstreamRecord>,
+        router_cursor: usize,
+    ) -> Result<Self> {
+        let keys = keys
+            .into_iter()
+            .map(|key| {
+                if key.nonce.len() != 12
+                    || key.ciphertext.len() <= 16
+                    || key.fingerprint.len() != 32
+                {
+                    bail!("invalid encrypted upstream row")
+                }
+                Ok(StoredKey {
+                    id: key.id,
+                    label: key.label,
+                    fingerprint: hex::encode(key.fingerprint),
+                    nonce: URL_SAFE_NO_PAD.encode(key.nonce),
+                    ciphertext: URL_SAFE_NO_PAD.encode(key.ciphertext),
+                    enabled: key.enabled,
+                    cooldown_until: key.cooldown_until,
+                    request_count: key.request_count,
+                    failure_count: key.failure_count,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let downstream = downstream
+            .into_iter()
+            .map(|item| {
+                if item.token_digest.len() != 32 {
+                    bail!("invalid downstream digest")
+                }
+                Ok(StoredDownstream {
+                    id: item.id,
+                    label: item.label,
+                    scopes: item.scopes,
+                    token_digest: hex::encode(item.token_digest),
+                    active: item.active,
+                    request_count: item.request_count,
+                    last_used_at: item.last_used_at,
+                    created_at: item.created_at,
+                    revoked_at: item.revoked_at,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            path: path.as_ref().to_path_buf(),
+            master_key,
+            state: VaultFile {
+                version: 1,
+                keys,
+                downstream,
+                router_cursor,
+            },
+        })
+    }
+
+    /// Exports encrypted upstream rows without decrypting credentials.
+    pub fn key_records(&self) -> Result<Vec<VaultKeyRecord>> {
+        self.state
+            .keys
+            .iter()
+            .map(|key| {
+                Ok(VaultKeyRecord {
+                    id: key.id,
+                    label: key.label.clone(),
+                    fingerprint: hex::decode(&key.fingerprint).context("decode key fingerprint")?,
+                    nonce: URL_SAFE_NO_PAD
+                        .decode(&key.nonce)
+                        .context("decode key nonce")?,
+                    ciphertext: URL_SAFE_NO_PAD
+                        .decode(&key.ciphertext)
+                        .context("decode key ciphertext")?,
+                    enabled: key.enabled,
+                    cooldown_until: key.cooldown_until,
+                    request_count: key.request_count,
+                    failure_count: key.failure_count,
+                })
+            })
+            .collect()
+    }
+
+    /// Exports hashed downstream-token rows without exposing bearer tokens.
+    pub fn downstream_records(&self) -> Result<Vec<VaultDownstreamRecord>> {
+        self.state
+            .downstream
+            .iter()
+            .map(|item| {
+                Ok(VaultDownstreamRecord {
+                    id: item.id,
+                    label: item.label.clone(),
+                    scopes: item.scopes.clone(),
+                    token_digest: hex::decode(&item.token_digest)
+                        .context("decode downstream digest")?,
+                    active: item.active,
+                    request_count: item.request_count,
+                    last_used_at: item.last_used_at,
+                    created_at: item.created_at,
+                    revoked_at: item.revoked_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Adds a credential and returns only its redacted identity.
+    pub fn add(&mut self, label: impl Into<String>, credential: &str) -> Result<KeySummary> {
+        let label = label.into();
+        validate_label(&label)?;
+        if !valid_upstream_credential(credential) {
+            bail!("credential shape is invalid")
+        }
+        let id = Uuid::new_v4();
+        let mut nonce_bytes = [0_u8; 12];
+        rng().fill(&mut nonce_bytes);
+        let cipher = Aes256Gcm::new_from_slice(&self.master_key).context("cipher init")?;
+        let mut payload = credential.as_bytes().to_vec();
+        cipher
+            .encrypt_in_place(Nonce::from_slice(&nonce_bytes), id.as_bytes(), &mut payload)
+            .map_err(|_| anyhow!("credential encryption failed"))?;
+        let entry = StoredKey {
+            id,
+            label,
+            fingerprint: fingerprint(credential.as_bytes()),
+            nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
+            ciphertext: URL_SAFE_NO_PAD.encode(payload),
+            enabled: true,
+            cooldown_until: None,
+            request_count: 0,
+            failure_count: 0,
+        };
+        self.state.keys.push(entry.clone());
+        self.persist()?;
+        Ok(summary(&entry))
+    }
+
+    /// Lists redacted credentials.
+    pub fn list(&self) -> Vec<KeySummary> {
+        self.state.keys.iter().map(summary).collect()
+    }
+
+    /// Returns the persisted routing cursor used for restart continuity.
+    pub fn router_cursor(&self) -> usize {
+        self.state.router_cursor
+    }
+
+    /// Stores the next routing cursor atomically with vault state.
+    pub fn set_router_cursor(&mut self, cursor: usize) -> Result<()> {
+        self.state.router_cursor = cursor;
+        self.persist()
+    }
+
+    /// Issues a scoped downstream bearer and stores only its digest.
+    pub fn issue_downstream(
+        &mut self,
+        label: &str,
+        requested_scopes: &[String],
+    ) -> Result<IssuedDownstream> {
+        validate_label(label)?;
+        let scopes = canonical_scopes(requested_scopes)?;
+        if self
+            .state
+            .downstream
+            .iter()
+            .any(|item| item.active && item.label.as_bytes() == label.as_bytes())
+        {
+            bail!("downstream label already exists")
+        }
+        let id = Uuid::new_v4();
+        let mut bytes = [0_u8; 32];
+        rng().fill(&mut bytes);
+        let token = format!("nblb_ds_{}", hex::encode(bytes));
+        let now = Utc::now();
+        let entry = StoredDownstream {
+            id,
+            label: label.to_owned(),
+            scopes: scopes.clone(),
+            token_digest: fingerprint(token.as_bytes()),
+            active: true,
+            request_count: 0,
+            last_used_at: None,
+            created_at: now,
+            revoked_at: None,
+        };
+        self.state.downstream.push(entry.clone());
+        self.persist()?;
+        Ok(IssuedDownstream {
+            summary: downstream_summary(&entry),
+            token,
+        })
+    }
+
+    /// Lists downstream credentials without exposing token digests.
+    pub fn list_downstream(&self) -> Vec<DownstreamSummary> {
+        self.state
+            .downstream
+            .iter()
+            .map(downstream_summary)
+            .collect()
+    }
+
+    /// Revokes one downstream credential. Repeated revocation is idempotent.
+    pub fn revoke_downstream(&mut self, id: Uuid) -> Result<DownstreamSummary> {
+        let (summary, changed) = {
+            let item = self
+                .state
+                .downstream
+                .iter_mut()
+                .find(|item| item.id == id)
+                .ok_or_else(|| anyhow!("downstream credential not found"))?;
+            let changed = item.active;
+            if changed {
+                item.active = false;
+                item.revoked_at = Some(Utc::now());
+            }
+            (downstream_summary(item), changed)
+        };
+        if changed {
+            self.persist()?;
+        }
+        Ok(summary)
+    }
+
+    /// Authenticates a downstream bearer and checks one required scope.
+    pub fn authenticate_downstream(
+        &mut self,
+        token: &str,
+        required_scope: &str,
+    ) -> Result<DownstreamSummary> {
+        if token.is_empty() || !token.starts_with("nblb_ds_") {
+            bail!("invalid downstream credential")
+        }
+        let digest = fingerprint(token.as_bytes());
+        let item = self
+            .state
+            .downstream
+            .iter_mut()
+            .find(|item| item.active && item.token_digest == digest)
+            .ok_or_else(|| anyhow!("invalid downstream credential"))?;
+        if !item.scopes.iter().any(|scope| scope == required_scope) {
+            bail!("insufficient scope")
+        }
+        item.request_count = item.request_count.saturating_add(1);
+        item.last_used_at = Some(Utc::now());
+        let result = downstream_summary(item);
+        self.persist()?;
+        Ok(result)
+    }
+
+    /// Enables or disables a key.
+    pub fn set_enabled(&mut self, id: Uuid, enabled: bool) -> Result<KeySummary> {
+        let key = self
+            .state
+            .keys
+            .iter_mut()
+            .find(|key| key.id == id)
+            .ok_or_else(|| anyhow!("key not found"))?;
+        key.enabled = enabled;
+        let result = summary(key);
+        self.persist()?;
+        Ok(result)
+    }
+
+    /// Deletes a key.
+    pub fn delete(&mut self, id: Uuid) -> Result<()> {
+        let before = self.state.keys.len();
+        self.state.keys.retain(|key| key.id != id);
+        if before == self.state.keys.len() {
+            bail!("key not found")
+        }
+        self.persist()
+    }
+
+    /// Decrypts one key for one outbound request.
+    pub fn credential(&self, id: Uuid) -> Result<String> {
+        let key = self
+            .state
+            .keys
+            .iter()
+            .find(|key| key.id == id)
+            .ok_or_else(|| anyhow!("key not found"))?;
+        let nonce = URL_SAFE_NO_PAD.decode(&key.nonce).context("decode nonce")?;
+        if nonce.len() != 12 {
+            bail!("invalid credential nonce")
+        }
+        let mut ciphertext = URL_SAFE_NO_PAD
+            .decode(&key.ciphertext)
+            .context("decode ciphertext")?;
+        let cipher = Aes256Gcm::new_from_slice(&self.master_key).context("cipher init")?;
+        cipher
+            .decrypt_in_place(Nonce::from_slice(&nonce), id.as_bytes(), &mut ciphertext)
+            .map_err(|_| anyhow!("credential decryption failed"))?;
+        String::from_utf8(ciphertext).context("credential utf8")
+    }
+
+    /// Persists a successful request count.
+    pub fn record_request(&mut self, id: Uuid) -> Result<()> {
+        let key = self
+            .state
+            .keys
+            .iter_mut()
+            .find(|key| key.id == id)
+            .ok_or_else(|| anyhow!("key not found"))?;
+        key.request_count = key.request_count.saturating_add(1);
+        self.persist()
+    }
+
+    /// Applies an exponential, bounded cooldown.
+    pub fn record_failure(&mut self, id: Uuid, retry_after: Option<Duration>) -> Result<()> {
+        let key = self
+            .state
+            .keys
+            .iter_mut()
+            .find(|key| key.id == id)
+            .ok_or_else(|| anyhow!("key not found"))?;
+        key.failure_count = key.failure_count.saturating_add(1);
+        let delay = retry_after
+            .map(|value| value.clamp(Duration::zero(), Duration::hours(1)))
+            .unwrap_or_else(|| Duration::seconds(1_i64 << key.failure_count.min(6)));
+        let until = Utc::now() + delay;
+        key.cooldown_until = Some(key.cooldown_until.map_or(until, |old| old.max(until)));
+        self.persist()
+    }
+
+    fn persist(&self) -> Result<()> {
+        let tmp = self.path.with_extension("tmp");
+        let bytes = serde_json::to_vec(&self.state)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .context("open vault temp")?;
+        file.write_all(&bytes).context("write vault")?;
+        file.sync_all().context("sync vault")?;
+        drop(file);
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).context("protect vault")?;
+        fs::rename(&tmp, &self.path).context("commit vault")?;
+        if let Some(parent) = self.path.parent() {
+            OpenOptions::new()
+                .read(true)
+                .open(parent)
+                .context("open vault directory")?
+                .sync_all()
+                .context("sync vault directory")?;
+        }
+        Ok(())
+    }
+}
+
+/// Round-robin selector that excludes disabled and cooling keys.
+#[derive(Debug, Default)]
+pub struct Router {
+    next_slot: usize,
+}
+
+impl Router {
+    /// Creates a selector from a persisted cursor.
+    pub fn with_next_slot(next_slot: usize) -> Self {
+        Self { next_slot }
+    }
+
+    /// Returns the next cursor after the most recent selection.
+    pub fn next_slot(&self) -> usize {
+        self.next_slot
+    }
+
+    /// Selects the next key, returning `None` when all are unavailable.
+    pub fn select(&mut self, keys: &[KeySummary]) -> Option<Uuid> {
+        let now = Utc::now();
+        if keys.is_empty() {
+            return None;
+        }
+        for offset in 0..keys.len() {
+            let index = (self.next_slot + offset) % keys.len();
+            let candidate = &keys[index];
+            if candidate.enabled && candidate.cooldown_until.is_none_or(|until| until <= now) {
+                self.next_slot = (index + 1) % keys.len();
+                return Some(candidate.id);
+            }
+        }
+        None
+    }
+}
+
+fn summary(key: &StoredKey) -> KeySummary {
+    KeySummary {
+        id: key.id,
+        label: key.label.clone(),
+        fingerprint: key.fingerprint.clone(),
+        enabled: key.enabled,
+        cooldown_until: key.cooldown_until,
+        request_count: key.request_count,
+        failure_count: key.failure_count,
+    }
+}
+fn downstream_summary(item: &StoredDownstream) -> DownstreamSummary {
+    DownstreamSummary {
+        id: item.id,
+        label: item.label.clone(),
+        scopes: item.scopes.clone(),
+        active: item.active,
+        request_count: item.request_count,
+        last_used_at: item.last_used_at,
+        created_at: item.created_at,
+        revoked_at: item.revoked_at,
+    }
+}
+fn fingerprint(value: &[u8]) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn valid_upstream_credential(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (38..=198).contains(&bytes.len())
+        && value.starts_with("nvapi-")
+        && bytes[6..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn validate_label(label: &str) -> Result<()> {
+    let count = label.chars().count();
+    if !(1..=128).contains(&count) || label.trim() != label || label.chars().any(char::is_control) {
+        bail!("label is invalid")
+    }
+    Ok(())
+}
+
+fn canonical_scopes(scopes: &[String]) -> Result<Vec<String>> {
+    if scopes.is_empty()
+        || scopes.len() > 6
+        || scopes.iter().any(|scope| {
+            !matches!(
+                scope.as_str(),
+                "models:read"
+                    | "chat:write"
+                    | "embeddings:write"
+                    | "images:write"
+                    | "audio:write"
+                    | "media:write"
+            )
+        })
+    {
+        bail!("scopes are invalid")
+    }
+    let mut result = scopes.to_vec();
+    result.sort_by_key(|scope| {
+        [
+            "models:read",
+            "chat:write",
+            "embeddings:write",
+            "images:write",
+            "audio:write",
+            "media:write",
+        ]
+        .iter()
+        .position(|candidate| candidate == scope)
+        .unwrap_or(usize::MAX)
+    });
+    result.dedup();
+    if result.len() != scopes.len() {
+        bail!("scopes must be unique")
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn vault_round_trip_is_encrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.json");
+        let mut vault = Vault::open(&path, [7; 32]).expect("open");
+        let credential = "nvapi-abcdefghijklmnopqrstuvwxyz123456";
+        let key = vault.add("one", credential).expect("add");
+        assert!(!String::from_utf8_lossy(&fs::read(path).expect("read")).contains(credential));
+        assert_eq!(vault.credential(key.id).expect("decrypt"), credential);
+    }
+    #[test]
+    fn router_round_robins() {
+        let mut router = Router::default();
+        let keys = [
+            KeySummary {
+                id: Uuid::from_u128(1),
+                label: "a".into(),
+                fingerprint: "a".into(),
+                enabled: true,
+                cooldown_until: None,
+                request_count: 0,
+                failure_count: 0,
+            },
+            KeySummary {
+                id: Uuid::from_u128(2),
+                label: "b".into(),
+                fingerprint: "b".into(),
+                enabled: true,
+                cooldown_until: None,
+                request_count: 0,
+                failure_count: 0,
+            },
+        ];
+        assert_eq!(router.select(&keys), Some(keys[0].id));
+        assert_eq!(router.select(&keys), Some(keys[1].id));
+    }
+
+    #[test]
+    fn downstream_plaintext_is_one_time_and_scope_checked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut vault = Vault::open(dir.path().join("vault.json"), [3; 32]).expect("open");
+        let issued = vault
+            .issue_downstream("hermes", &["chat:write".into(), "models:read".into()])
+            .expect("issue");
+        assert_eq!(issued.summary.scopes, vec!["models:read", "chat:write"]);
+        assert!(
+            vault
+                .authenticate_downstream(&issued.token, "chat:write")
+                .is_ok()
+        );
+        assert!(
+            vault
+                .authenticate_downstream(&issued.token, "models:read")
+                .is_ok()
+        );
+        assert!(
+            vault
+                .authenticate_downstream(&issued.token, "audio:read")
+                .is_err()
+        );
+        let raw = fs::read_to_string(dir.path().join("vault.json")).expect("read");
+        assert!(!raw.contains(&issued.token));
+    }
+
+    #[test]
+    fn encrypted_records_reconstruct_without_plaintext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.json");
+        let credential = "nvapi-abcdefghijklmnopqrstuvwxyz123456";
+        let mut source = Vault::open(&path, [9; 32]).expect("open");
+        let summary = source.add("primary", credential).expect("add");
+        let records = source.key_records().expect("records");
+        assert_eq!(records.len(), 1);
+        assert!(
+            !records[0]
+                .ciphertext
+                .windows(credential.len())
+                .any(|window| window == credential.as_bytes())
+        );
+        let restored = Vault::from_records(
+            dir.path().join("restored.json"),
+            [9; 32],
+            records,
+            Vec::new(),
+            source.router_cursor(),
+        )
+        .expect("restore");
+        assert_eq!(
+            restored.credential(summary.id).expect("decrypt"),
+            credential
+        );
+    }
+}

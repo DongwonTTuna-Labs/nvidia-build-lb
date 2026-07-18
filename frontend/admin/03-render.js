@@ -62,11 +62,17 @@ function renderUpstreams(items, reference) {
     healthCell.dataset.status = item.health_state === "healthy" ? "healthy" : item.health_state === "degraded" ? "degraded" : "disabled";
     const actions = createCell("Actions", "", "actions");
     const probe = createButton("Probe", `key-${item.id}-probe`, `Probe ${handle}`, (event) => runKeyAction(item, "probe", event.currentTarget));
+    const replace = items.length === 2 && !replacementContext
+      ? createButton("Replace", `key-${item.id}-replace`, `Replace ${handle}`, (event) => {
+        pendingReplacementSourceId = item.id;
+        openUpstreamDialog(event);
+      })
+      : null;
     const toggle = createButton(item.enabled ? "Disable" : "Enable", `key-${item.id}-toggle`, `${item.enabled ? "Disable" : "Enable"} ${handle}`, (event) => item.enabled ? openConfirmation("disable", item, event.currentTarget) : runKeyAction(item, "enable", event.currentTarget));
     const remove = createButton("Delete", `key-${item.id}-delete`, `Delete ${handle}`, (event) => openConfirmation("delete", item, event.currentTarget));
     if (unconfirmedProbeKeyIds.has(item.id)) {
       const reasonId = `key-${item.id}-unconfirmed-probe-reason`;
-      for (const control of [probe, toggle, remove]) {
+      for (const control of [probe, replace, toggle, remove].filter(Boolean)) {
         control.dataset.prerequisite = "blocked";
         control.setAttribute("aria-describedby", reasonId);
       }
@@ -74,7 +80,7 @@ function renderUpstreams(items, reference) {
       reason.className = "action-reason";
       reason.id = reasonId;
       reason.textContent = "A previous operator probe has no confirmed completion. Wait for it to settle, then Refresh current state before any action on this key.";
-      actions.append(probe, toggle, remove, reason);
+      actions.append(probe, ...(replace ? [replace] : []), toggle, remove, reason);
     } else {
       let probeReason = null;
       let probeBlocked = false;
@@ -103,6 +109,7 @@ function renderUpstreams(items, reference) {
         reason.textContent = probeReason;
         actions.append(probe, reason);
       } else actions.append(probe);
+      if (replace) actions.append(replace);
       if (!item.enabled && item.health_state !== "healthy") {
         const reasonId = `key-${item.id}-enable-reason`;
         toggle.dataset.prerequisite = "blocked";
@@ -210,6 +217,7 @@ function renderSnapshot(snapshot) {
   const openEvidenceIds = captureOpenEvidenceIds();
   const reference = snapshot.referenceAt ?? snapshot.overview.generated_at;
   unconfirmedProbeKeyIds = unconfirmedProbeTargets(snapshot.events);
+  reconcileReplacementContext(snapshot.upstreams);
   renderOverview(snapshot, reference);
   renderUpstreams(snapshot.upstreams, reference);
   renderDownstreams(snapshot.downstreams);
