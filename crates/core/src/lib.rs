@@ -384,6 +384,14 @@ impl Vault {
         {
             bail!("upstream credential already exists")
         }
+        if self
+            .state
+            .keys
+            .iter()
+            .any(|key| !key.retired && key.label == label)
+        {
+            bail!("upstream label already exists")
+        }
         let active_count = self.state.keys.iter().filter(|key| !key.retired).count();
         let replacement = (active_count >= MAX_UPSTREAM_KEYS)
             .then(|| {
@@ -1119,6 +1127,11 @@ mod tests {
             .expect("first");
         vault.mark_verified(one.id).expect("probe first");
         vault.set_enabled(one.id, true).expect("enable first");
+        assert!(
+            vault
+                .add("one", "nvapi-zyxwvutsrqponmlkjihgfedcba654321")
+                .is_err()
+        );
         assert!(
             vault
                 .add("duplicate", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
