@@ -988,10 +988,18 @@ async function confirmDestructive(event: SubmitEvent) {
   }
   confirmPending = true;
   try {
+    // Polling can update the row while the dialog is open. Reconcile once
+    // immediately before the mutation and refuse a stale or partial result.
+    await refresh();
+    if (!mutationAllowed()) {
+      error = "최신 상태를 확인하지 못해 작업을 적용하지 않았습니다. 다시 확인하세요.";
+      mutationState = "reconcile";
+      return;
+    }
     if (action.kind === "revoke") await revokeClient(action.id);
     else {
       const key = keys.find((candidate) => candidate.id === action.id);
-      if (key) await deleteKey(key);
+      if (key && key.enabled) await deleteKey(key);
       else error = "이미 사라진 항목입니다. 최신 상태를 다시 확인하세요.";
     }
   } finally {
@@ -1294,12 +1302,18 @@ onMount(() => {
     announcement = "페이지를 다시 확인하려면 관리자 인증이 필요합니다.";
   };
   const onVisibility = () => {
-    if (document.visibilityState === "visible" && session.token && !loading && !mutating) {
+    if (
+      document.visibilityState === "visible" &&
+      session.token &&
+      !loading &&
+      !mutating &&
+      !confirmPending
+    ) {
       void refresh();
     }
   };
   const onOnline = () => {
-    if (session.token) void refresh();
+    if (session.token && !confirmPending) void refresh();
   };
   const onOffline = () => {
     structuralReady = false;
@@ -1320,7 +1334,13 @@ onMount(() => {
     announcement = "오프라인 상태입니다. 연결되면 다시 확인하세요.";
   };
   pollingHandle = window.setInterval(() => {
-    if (document.visibilityState === "visible" && session.token && !loading && !mutating) {
+    if (
+      document.visibilityState === "visible" &&
+      session.token &&
+      !loading &&
+      !mutating &&
+      !confirmPending
+    ) {
       void refresh();
     }
   }, 10_000);
@@ -1415,14 +1435,14 @@ onMount(() => {
         </div>
         {#if readinessReasons.length}<p class="attention" role="status">발급·운영 준비 조건: {readinessReasons.map(actionLabel).join(" · ")}</p>{/if}
         {#if keys.length < 2 || keys.some((key) => !key.enabled)}<div class="subpanel"><h3>{keys.length === 0 ? "첫 번째 키 추가" : keys.length < 2 ? "두 번째 키 추가" : "중지된 슬롯 교체"}</h3><p>서로 다른 두 키만 저장할 수 있습니다. 저장 후 원문은 즉시 지워집니다.</p><form bind:this={upstreamForm} class="form" onsubmit={addUpstream}><label for="upstream-label">라벨<input id="upstream-label" bind:this={upstreamLabelInput} bind:value={upstreamLabel} maxlength="128" required aria-describedby={upstreamError ? "upstream-error" : undefined} aria-invalid={upstreamError ? "true" : undefined} placeholder="예: nvidia-primary" /></label><label for="upstream-credential">NVIDIA API 키<input id="upstream-credential" bind:this={upstreamCredentialInput} type="password" required autocomplete="off" aria-describedby={upstreamError ? "upstream-error" : undefined} aria-invalid={upstreamError ? "true" : undefined} oninput={() => (formRevision += 1)} placeholder="nvapi-…" /></label>{#if upstreamError}<p id="upstream-error" class="alert" role="alert">{upstreamError}</p>{/if}<span class="sr-only">{formRevision}</span><button class="primary" type="submit" disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>암호화 저장</button></form></div>{/if}
-        {#if slotProjections.length}<div class="subpanel"><h3>프로필별 슬롯 준비</h3><p class="muted">두 슬롯의 공통 준비 상태입니다. 모델별 제공자 proof는 실제 호출 증거에서 별도로 확인해야 합니다.</p><div class="profile-grid">{#each profileCapabilities as capability}<article><strong>{capability.id}</strong><small>{capability.route}</small><span>{capability.available_now ? "두 슬롯 준비" : "준비 확인 필요"}</span><small>{slotProjections.filter((slot) => slot.profiles.some((profile) => profile.profile_id === capability.id && profile.eligible_now)).length}/2 슬롯 가능</small></article>{/each}</div></div>{/if}
+        {#if slotProjections.length}<div class="subpanel"><h3>프로필별 슬롯 준비</h3><p class="muted">두 슬롯의 자격 증명 상태와 모델별 제공자 proof를 분리해 표시합니다.</p><div class="profile-grid">{#each profileCapabilities as capability}<article><strong>{capability.id}</strong><small>{capability.route}</small><span>{capability.available_now ? "제공자 검증 완료" : capability.proof_status === "provider_proof_required" ? "제공자 proof 필요" : "두 슬롯 준비 확인 필요"}</span><small>{slotProjections.filter((slot) => slot.profiles.some((profile) => profile.profile_id === capability.id && profile.eligible_now)).length}/2 슬롯 가능</small></article>{/each}</div></div>{/if}
     </section>
     <section id="clients" class:panel-hidden={active !== "clients"} class="panel" aria-labelledby="clients-title" hidden={active !== "clients"}>
         <h2 id="clients-title">필요한 권한만 발급</h2><p class="muted">새 접속 키는 발급 직후 native dialog에서 한 번만 보입니다.</p>
         <form bind:this={clientForm} class="form" onsubmit={issueClient}><label for="client-label">라벨<input id="client-label" bind:this={clientLabelInput} bind:value={clientLabel} maxlength="128" required aria-describedby={clientError ? "error-message" : undefined} aria-invalid={clientError ? "true" : undefined} placeholder="예: hermes" /></label><fieldset><legend>권한 범위</legend>{#each supportedScopes as [scope, label]}<label class="check"><input type="checkbox" value={scope} bind:group={clientScopes} /> <span>{label}</span><small>{scope}</small></label>{/each}</fieldset><button class="primary" type="submit" disabled={!session.token || eligibleKeys !== 2 || !clientLabel.trim() || clientScopes.length === 0 || mutating || mutationState !== "idle" || !mutationAllowed()}>접속 키 발급</button></form>
         <div class="table-wrap"><table><caption class="sr-only">다운스트림 접속 키</caption><thead><tr><th scope="col">라벨</th><th scope="col">권한</th><th scope="col">상태</th><th scope="col"><span class="sr-only">조작</span></th></tr></thead><tbody>{#each clients as client}<tr><th scope="row" id={`client-${client.id}`}>{client.label}<small>{client.request_count}회 사용</small></th><td data-label="권한">{client.scopes.join(", ")}</td><td data-label="상태">{client.active ? "사용 중" : "폐기됨"}</td><td data-label="조작">{#if client.active}<button class="danger" type="button" aria-label={`${client.label} 접속 키 폐기`} onclick={(event) => openConfirmation("revoke", client.id, client.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>폐기</button>{/if}</td></tr>{:else}<tr><td colspan="4">발급된 접속 키가 없습니다.</td></tr>{/each}</tbody></table></div>
     </section>
-    <section id="models" class="panel" aria-labelledby="models-title" hidden={active !== "models"}><h2 id="models-title">모달리티별 모델</h2><p class="muted">각 모델의 요청 경로와 제공자 검증 상태를 표시합니다.</p>{#if state === "partial"}<p class="attention" role="status">모델별 준비 상태를 확인하지 못했습니다. 현재 요청 가능으로 해석하지 마세요.</p>{/if}<div class="model-list">{#each (profileCapabilities.length ? profileCapabilities : models.map((model) => ({ id: model, route: modelInfo(model).route, advertised: true, available_now: false, proof_status: "not_ready", modalities: modelInfo(model).modalities.split("·") }))) as capability}<article><h3>{capability.id}</h3><p>{capability.modalities.join(" · ")}</p><code>{capability.route}</code><small>{capability.available_now ? (capability.proof_status === "pair_ready_provider_proof_pending" ? "두 슬롯 준비 · 제공자 proof 미확인" : "현재 요청 가능") : "현재 준비 안 됨 · 라우팅에서 원인 확인"}</small></article>{:else}<p class="muted">관리자 인증 후 모델을 확인하세요.</p>{/each}</div></section>
+    <section id="models" class="panel" aria-labelledby="models-title" hidden={active !== "models"}><h2 id="models-title">모달리티별 모델</h2><p class="muted">각 모델의 요청 경로와 제공자 검증 상태를 표시합니다.</p>{#if state === "partial"}<p class="attention" role="status">모델별 준비 상태를 확인하지 못했습니다. 현재 요청 가능으로 해석하지 마세요.</p>{/if}<div class="model-list">{#each (profileCapabilities.length ? profileCapabilities : models.map((model) => ({ id: model, route: modelInfo(model).route, advertised: true, available_now: false, proof_status: "not_ready", modalities: modelInfo(model).modalities.split("·") }))) as capability}<article><h3>{capability.id}</h3><p>{capability.modalities.join(" · ")}</p><code>{capability.route}</code><small>{capability.available_now ? "제공자 검증 완료 · 현재 요청 가능" : capability.proof_status === "provider_proof_required" ? "현재 요청 전 제공자 proof 필요" : "현재 준비 안 됨 · 라우팅에서 원인 확인"}</small></article>{:else}<p class="muted">관리자 인증 후 모델을 확인하세요.</p>{/each}</div></section>
     <section id="evidence" class="panel" aria-labelledby="evidence-title" hidden={active !== "evidence"}><h2 id="evidence-title">지속성 확인</h2>{#if !session.token}<p class="muted">관리자 인증 후 지속성 증거를 확인할 수 있습니다.</p>{:else}<p class="muted">마지막 확인 snapshot과 저장 원본을 표시합니다.</p><div class="facts"><span>확인 시각 <strong>{updatedAt || "없음"}</strong></span><span>저장 원본 <strong>{evidence.source_of_truth === "postgresql" ? "PostgreSQL" : evidence.source_of_truth === "encrypted-file-fallback" ? "암호화 파일 fallback" : evidence.source_of_truth}</strong></span><span>DB 키 <strong>{evidence.persisted_upstream_keys}</strong></span><span>DB 접속 키 <strong>{evidence.persisted_downstream_credentials}</strong></span><span>라우팅 프로필 <strong>{evidence.persisted_routing_profiles}</strong></span><span>요청 시도 <strong>{evidence.persisted_request_attempts ?? 0}</strong></span><span>최근 이벤트 <strong>{adminEvents.length}</strong></span></div>{#if checks.length}<div class="check-list"><h3>슬롯별 확인</h3>{#each checks as check}<p><strong>{check.label}</strong><span>{checkStatusLabel(check.status)} · {check.request_count}회 요청 · {check.failure_count}회 실패</span></p>{/each}</div>{/if}{#if attentions.length}<div class="attention-list"><h3>먼저 확인할 주의</h3>{#each attentions as attention}<p class="attention"><strong>{attention.label ?? attentionLabel(attention.code)}</strong><span>{actionLabel(attention.next_action)}</span><button class="link-button" type="button" onclick={() => void handleAttention(attention)}>{attention.next_action === "probe" ? "검증 시작" : `${actionLabel(attention.next_action)} 열기`}</button></p>{/each}</div>{/if}{#if adminEvents.length}<div class="check-list"><h3>최근 작업</h3>{#each adminEvents as event}<p><strong>{eventKindLabel(event.kind ?? "request_attempt")}</strong><span>{event.profile_id ?? "프로필 미상"} · {outcomeLabel(event.outcome ?? "")}{#if event.created_at} · {formatDateTime(event.created_at)}{/if}</span><button class="link-button" type="button" onclick={() => void openEvent(event)}>상세 보기</button></p>{/each}</div>{/if}{#if evidence.source_of_truth === "unavailable"}<p class="attention">지속성 증거를 확인하지 못했습니다. 이 snapshot을 운영 증거로 사용하지 말고 저장소 상태를 다시 확인하세요.</p>{/if}{#if (state === "degraded" || state === "stale" || state === "partial") && eligibleKeys === 0}<p class="attention">현재 요청 가능한 키가 없습니다. 라우팅에서 cooldown·중지 원인을 확인하세요.</p>{/if}{/if}</section>
   </main>
   {/if}

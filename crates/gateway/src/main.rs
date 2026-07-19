@@ -2,7 +2,10 @@
 //! Actix gateway for the NVIDIA hosted API load balancer.
 
 use actix_files::Files;
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, guard, http::header, web};
+use actix_web::{
+    App, HttpRequest, HttpResponse, HttpServer, Responder, guard, http::header,
+    middleware::DefaultHeaders, web,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bytes::Bytes;
@@ -438,13 +441,21 @@ struct Health {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port = env::var("NVIDIA_BUILD_LB_PUBLIC_PORT")
+    let port = env::var("NVIDIA_BUILD_LB_BIND_PORT")
+        .or_else(|_| env::var("NVIDIA_BUILD_LB_PUBLIC_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2456);
     let state = web::Data::new(build_state().await.expect("gateway configuration"));
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                DefaultHeaders::new()
+                    .add((header::CACHE_CONTROL, "no-store"))
+                    .add((header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"))
+                    .add((header::REFERRER_POLICY, "no-referrer"))
+                    .add((header::X_CONTENT_TYPE_OPTIONS, "nosniff")),
+            )
             .app_data(state.clone())
             .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
             .configure(routes)
@@ -559,6 +570,9 @@ async fn build_state() -> Result<AppState> {
         "NVIDIA_BUILD_LB_ADMIN_TOKEN",
         "/run/nvidia-build-lb/secrets/admin_token",
     )?;
+    let upstream_url = env::var("NBLB_UPSTREAM_URL")
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1/chat/completions".to_owned());
+    validate_admin_token(&admin_token, upstream_url.starts_with("mock://"))?;
     let path = env::var("NBLB_VAULT_PATH")
         .unwrap_or_else(|_| "/var/lib/nvidia-build-lb/vault.json".to_owned());
     if let Some(parent) = std::path::Path::new(&path).parent() {
@@ -611,8 +625,7 @@ async fn build_state() -> Result<AppState> {
         selection_lock: tokio::sync::Mutex::new(()),
         client: client_builder.build().context("http client")?,
         admin_token,
-        upstream_url: env::var("NBLB_UPSTREAM_URL")
-            .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1/chat/completions".to_owned()),
+        upstream_url,
         require_downstream_token,
         public_port: env::var("NVIDIA_BUILD_LB_PUBLIC_PORT")
             .ok()
@@ -638,7 +651,7 @@ fn database_url_with_password(url: String) -> Result<String> {
             "/run/nvidia-build-lb/secrets/db_password",
         )
     {
-        url = url.replacen("@", &format!(":{password}@"), 1);
+        url = url.replacen("@", &format!(":{}@", percent_encode_userinfo(&password)), 1);
     }
     if !url
         .split_once('?')
@@ -648,6 +661,30 @@ fn database_url_with_password(url: String) -> Result<String> {
         url.push_str("sslmode=disable");
     }
     Ok(url)
+}
+
+fn percent_encode_userinfo(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn validate_admin_token(value: &str, allow_test_token: bool) -> Result<()> {
+    let valid_production = value.len() == 75
+        && value.starts_with("nblb_admin_")
+        && value[11..].bytes().all(|byte| byte.is_ascii_hexdigit());
+    if valid_production || (allow_test_token && !value.is_empty()) {
+        Ok(())
+    } else {
+        bail!("admin token must be nblb_admin_ followed by 64 hexadecimal characters")
+    }
 }
 
 fn read_master_key() -> Result<[u8; 32]> {
@@ -693,29 +730,27 @@ fn read_required_secret(env_name: &str, path: &str) -> Result<String> {
     Ok(value)
 }
 
-fn request_host(req: &HttpRequest) -> String {
-    let raw = req
+fn public_guard_response(req: &HttpRequest) -> Option<HttpResponse> {
+    let raw_host = req
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    if let Some(value) = raw.strip_prefix('[')
-        && let Some((host, _)) = value.split_once(']')
-    {
-        return host.to_ascii_lowercase();
+    if raw_host.contains(',') || raw_host.is_empty() {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
+        })));
     }
-    raw.split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-}
-
-fn public_guard_response(req: &HttpRequest) -> Option<HttpResponse> {
-    let host = request_host(req);
-    if !matches!(
-        host.as_str(),
-        "127.0.0.1" | "localhost" | "::1" | "nvidia-lb.dongwontuna.net"
-    ) {
+    let (host, port) = parse_host_authority(raw_host);
+    let local = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    let public = host == "nvidia-lb.dongwontuna.net";
+    let local_port = env::var("NVIDIA_BUILD_LB_PUBLIC_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(2456);
+    let authority_ok =
+        (local && port == Some(local_port)) || (public && port.is_none_or(|value| value == 443));
+    if !authority_ok {
         return Some(HttpResponse::Forbidden().json(json!({
             "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
         })));
@@ -744,7 +779,7 @@ async fn health(req: HttpRequest, state: web::Data<AppState>) -> impl Responder 
     let ready = database_ready && keys.len() == nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
     // One healthy upstream can still serve traffic; the second slot is the
     // failover/distribution objective, not a hard availability requirement.
-    let traffic_ready = ready && eligible_keys > 0;
+    let traffic_ready = database_ready && eligible_keys > 0;
     let mut response = if traffic_ready {
         HttpResponse::Ok()
     } else {
@@ -911,11 +946,11 @@ async fn model_capabilities(req: HttpRequest, state: web::Data<AppState>) -> imp
     if !authorized(&req, &state) {
         return admin_unauthorized();
     }
-    // Capability readiness is intentionally conservative: a profile is not
-    // advertised as currently available until both independent upstream
-    // slots are verified and eligible. A single key may serve fail-soft
-    // traffic, but it does not satisfy the pair/readiness contract.
-    let available =
+    // Credential readiness is not provider/model proof.  Until a profile has
+    // a durable successful provider receipt, advertise its route but keep
+    // `available_now` false so the admin surface cannot promise unsupported
+    // modalities merely because two encrypted credentials are eligible.
+    let pair_ready =
         eligible_key_count(&state.vault.list()) == nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
     let models = PROFILES.iter().map(|profile| {
         let route = match *profile {
@@ -931,8 +966,8 @@ async fn model_capabilities(req: HttpRequest, state: web::Data<AppState>) -> imp
             "id":profile,
             "route":route,
             "advertised":true,
-            "available_now":available,
-            "proof_status": if available { "pair_ready_provider_proof_pending" } else { "not_ready" },
+            "available_now":false,
+            "proof_status": if pair_ready { "provider_proof_required" } else { "pair_not_ready" },
             "modalities":model_modalities(profile)
         })
     }).collect::<Vec<_>>();
@@ -982,7 +1017,7 @@ async fn generation_readiness(req: HttpRequest, state: web::Data<AppState>) -> i
         reasons
     };
     HttpResponse::Ok().insert_header(("cache-control", "no-store")).json(json!({
-        "snapshot":admin_snapshot(),"ready":ready,"configured_slots":configured,"verified_slots":verified,"eligible_slots":eligible,"advertised_profiles":PROFILES.len(),"available_profiles":if ready { PROFILES.len() } else { 0 },"reasons":reasons
+        "snapshot":admin_snapshot(),"ready":ready,"configured_slots":configured,"verified_slots":verified,"eligible_slots":eligible,"advertised_profiles":PROFILES.len(),"available_profiles":0,"reasons":reasons
     }))
 }
 
@@ -2140,9 +2175,14 @@ fn validate_modality_fields(
                 return Err(invalid_request("prompt must be a string"));
             }
             if let Some(size) = object.get("size")
-                && size.as_str() != Some("1024x1024")
+                && !matches!(
+                    size.as_str(),
+                    Some("1024x1024" | "1792x1024" | "1536x864" | "1024x1792" | "864x1536")
+                )
             {
-                return Err(invalid_request("size must be 1024x1024"));
+                return Err(invalid_request(
+                    "size must be one of 1024x1024, 1792x1024, 1536x864, 1024x1792, 864x1536",
+                ));
             }
             if object.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
                 return Err(invalid_request("n must be 1"));
@@ -2879,35 +2919,6 @@ fn sse_error_frame(message: &str) -> Bytes {
     ))
 }
 
-fn canonical_sse_chunk(bytes: &[u8]) -> Bytes {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return Bytes::new();
-    };
-    let normalized = text.replace("\r\n", "\n");
-    let mut output = String::new();
-    for frame in normalized.split("\n\n") {
-        if frame.is_empty() {
-            continue;
-        }
-        let mut data = Vec::new();
-        for line in frame.lines() {
-            if let Some(value) = line.strip_prefix("data:") {
-                data.push(value.strip_prefix(' ').unwrap_or(value));
-            }
-        }
-        if !data.is_empty() {
-            output.push_str("data: ");
-            output.push_str(&data.join("\n"));
-            output.push_str("\n\n");
-        }
-    }
-    if output.is_empty() {
-        Bytes::new()
-    } else {
-        Bytes::from(output)
-    }
-}
-
 type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 async fn prime_stream(
@@ -2919,7 +2930,7 @@ async fn prime_stream(
         match upstream.next().await {
             Some(Ok(chunk)) => {
                 validator.feed(&chunk)?;
-                prefix.push_back(chunk);
+                prefix.extend(validator.take_emitted());
                 if validator.frame_count > 0 {
                     return Ok((upstream, validator, prefix));
                 }
@@ -2978,6 +2989,7 @@ async fn finish_stream_failure(state: &web::Data<AppState>, request_id: Uuid, ke
 #[derive(Default)]
 struct SseValidator {
     buffer: Vec<u8>,
+    emitted: VecDeque<Bytes>,
     done: bool,
     frame_count: usize,
     message_id: Option<String>,
@@ -2985,6 +2997,10 @@ struct SseValidator {
 }
 
 impl SseValidator {
+    fn take_emitted(&mut self) -> VecDeque<Bytes> {
+        std::mem::take(&mut self.emitted)
+    }
+
     fn feed(&mut self, bytes: &[u8]) -> Result<(), ()> {
         if self.buffer.len().saturating_add(bytes.len()) > 256 * 1024 * 1024 {
             return Err(());
@@ -3075,6 +3091,8 @@ impl SseValidator {
         self.frame_count = self.frame_count.saturating_add(1);
         if data.trim() == "[DONE]" {
             self.done = true;
+            self.emitted
+                .push_back(Bytes::from_static(b"data: [DONE]\n\n"));
             return Ok(());
         }
         let value: Value = serde_json::from_str(&data).map_err(|_| ())?;
@@ -3135,6 +3153,8 @@ impl SseValidator {
         }) {
             return Err(());
         }
+        self.emitted
+            .push_back(Bytes::from(format!("data: {data}\n\n")));
         Ok(())
     }
 }
@@ -3177,89 +3197,91 @@ fn chat_response_stream(
             if terminal {
                 return None;
             }
-            if let Some(chunk) = prefix.pop_front() {
-                return Some((
-                    Ok(canonical_sse_chunk(&chunk)),
-                    (
-                        upstream, validator, prefix, state, request_id, key_id, guard, terminal,
-                    ),
-                ));
-            }
-            match upstream.next().await {
-                Some(Ok(chunk)) => {
-                    if validator.feed(&chunk).is_err() {
+            loop {
+                if let Some(chunk) = prefix.pop_front() {
+                    return Some((
+                        Ok(chunk),
+                        (
+                            upstream, validator, prefix, state, request_id, key_id, guard, terminal,
+                        ),
+                    ));
+                }
+                match upstream.next().await {
+                    Some(Ok(chunk)) => {
+                        if validator.feed(&chunk).is_err() {
+                            finish_stream_failure(&state, request_id, key_id).await;
+                            terminal = true;
+                            guard.terminal.store(true, Ordering::Release);
+                            return Some((
+                                Ok(sse_error_frame("invalid upstream stream")),
+                                (
+                                    upstream, validator, prefix, state, request_id, key_id, guard,
+                                    terminal,
+                                ),
+                            ));
+                        }
+                        prefix.extend(validator.take_emitted());
+                        continue;
+                    }
+                    Some(Err(_)) => {
                         finish_stream_failure(&state, request_id, key_id).await;
                         terminal = true;
                         guard.terminal.store(true, Ordering::Release);
                         return Some((
-                            Ok(sse_error_frame("invalid upstream stream")),
+                            Ok(sse_error_frame("upstream stream failed")),
                             (
                                 upstream, validator, prefix, state, request_id, key_id, guard,
                                 terminal,
                             ),
                         ));
                     }
-                    Some((
-                        Ok(canonical_sse_chunk(&chunk)),
-                        (
-                            upstream, validator, prefix, state, request_id, key_id, guard, terminal,
-                        ),
-                    ))
-                }
-                Some(Err(_)) => {
-                    finish_stream_failure(&state, request_id, key_id).await;
-                    terminal = true;
-                    guard.terminal.store(true, Ordering::Release);
-                    Some((
-                        Ok(sse_error_frame("upstream stream failed")),
-                        (
-                            upstream, validator, prefix, state, request_id, key_id, guard, terminal,
-                        ),
-                    ))
-                }
-                None => {
-                    if validator.finish().is_err() {
-                        finish_stream_failure(&state, request_id, key_id).await;
-                        guard.terminal.store(true, Ordering::Release);
-                        return Some((
-                            Ok(sse_error_frame("incomplete upstream stream")),
-                            (
-                                upstream, validator, prefix, state, request_id, key_id, guard, true,
-                            ),
-                        ));
-                    }
-                    if record_request(&state, key_id).await.is_err() {
+                    None => {
+                        if validator.finish().is_err() {
+                            finish_stream_failure(&state, request_id, key_id).await;
+                            guard.terminal.store(true, Ordering::Release);
+                            return Some((
+                                Ok(sse_error_frame("incomplete upstream stream")),
+                                (
+                                    upstream, validator, prefix, state, request_id, key_id, guard,
+                                    true,
+                                ),
+                            ));
+                        }
+                        if record_request(&state, key_id).await.is_err() {
+                            if let Err(error) = state
+                                .vault
+                                .attempt_finished(request_id, key_id, "failed")
+                                .await
+                            {
+                                eprintln!("stream accounting ledger update failed: {error:#}");
+                            }
+                            guard.terminal.store(true, Ordering::Release);
+                            return Some((
+                                Ok(sse_error_frame("request accounting unavailable")),
+                                (
+                                    upstream, validator, prefix, state, request_id, key_id, guard,
+                                    true,
+                                ),
+                            ));
+                        }
                         if let Err(error) = state
                             .vault
-                            .attempt_finished(request_id, key_id, "failed")
+                            .attempt_finished(request_id, key_id, "succeeded")
                             .await
                         {
-                            eprintln!("stream accounting ledger update failed: {error:#}");
+                            eprintln!("stream success ledger update failed: {error:#}");
+                            guard.terminal.store(true, Ordering::Release);
+                            return Some((
+                                Ok(sse_error_frame("request ledger unavailable")),
+                                (
+                                    upstream, validator, prefix, state, request_id, key_id, guard,
+                                    true,
+                                ),
+                            ));
                         }
                         guard.terminal.store(true, Ordering::Release);
-                        return Some((
-                            Ok(sse_error_frame("request accounting unavailable")),
-                            (
-                                upstream, validator, prefix, state, request_id, key_id, guard, true,
-                            ),
-                        ));
+                        return None;
                     }
-                    if let Err(error) = state
-                        .vault
-                        .attempt_finished(request_id, key_id, "succeeded")
-                        .await
-                    {
-                        eprintln!("stream success ledger update failed: {error:#}");
-                        guard.terminal.store(true, Ordering::Release);
-                        return Some((
-                            Ok(sse_error_frame("request ledger unavailable")),
-                            (
-                                upstream, validator, prefix, state, request_id, key_id, guard, true,
-                            ),
-                        ));
-                    }
-                    guard.terminal.store(true, Ordering::Release);
-                    None
                 }
             }
         },
@@ -3581,7 +3603,10 @@ fn admin_surface_allowed(req: &HttpRequest, state: &AppState) -> bool {
         return false;
     }
     let (host, port) = parse_host_authority(raw_host);
-    if !admin_host_allowed(&host) || port.is_some_and(|port| port != state.public_port) {
+    if !admin_host_allowed(&host)
+        || port.is_some_and(|port| port != state.public_port)
+        || port.is_none() && state.public_port != 80 && state.public_port != 443
+    {
         return false;
     }
     let Some(origin) = req.headers().get(header::ORIGIN) else {
@@ -3765,8 +3790,9 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        eligible_key_count, parse_multimodal_request, upstream_endpoint, upstream_endpoint_for,
-        validate_chat_request, validate_chat_response,
+        SseValidator, eligible_key_count, parse_multimodal_request, percent_encode_userinfo,
+        upstream_endpoint, upstream_endpoint_for, validate_admin_token, validate_chat_request,
+        validate_chat_response,
     };
     use chrono::{Duration, Utc};
     use nvidia_build_lb_core::KeySummary;
@@ -3939,5 +3965,36 @@ mod tests {
             },
         ];
         assert_eq!(eligible_key_count(&keys), 0);
+    }
+
+    #[test]
+    fn provider_proof_and_boundary_helpers_fail_closed() {
+        assert_eq!(percent_encode_userinfo("a@b:c/%"), "a%40b%3Ac%2F%25");
+        assert!(
+            validate_admin_token(
+                "nblb_admin_0000000000000000000000000000000000000000000000000000000000000001",
+                false,
+            )
+            .is_ok()
+        );
+        assert!(validate_admin_token("short", false).is_err());
+        assert!(validate_admin_token("test-token", true).is_ok());
+    }
+
+    #[test]
+    fn sse_validation_preserves_frames_split_across_chunks() {
+        let mut validator = SseValidator::default();
+        validator
+            .feed(br#"data: {"id":"chat-1","object":"chat.completion.chunk","model":"z-ai/glm-5.2","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#)
+            .expect("partial frame is buffered");
+        assert!(validator.take_emitted().is_empty());
+        validator
+            .feed(b"\n\ndata: [DONE]\n\n")
+            .expect("complete frames");
+        let emitted: Vec<_> = validator.take_emitted().into_iter().collect();
+        assert_eq!(emitted.len(), 2);
+        assert!(std::str::from_utf8(&emitted[0]).unwrap().contains("chat-1"));
+        assert_eq!(emitted[1], bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+        validator.finish().expect("complete stream");
     }
 }

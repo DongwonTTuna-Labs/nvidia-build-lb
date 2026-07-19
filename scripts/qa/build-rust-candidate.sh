@@ -89,7 +89,8 @@ docker run -d --name "$container_name" \
   --mount "type=bind,source=$secret_dir/vault_master_key,target=/run/canonical-secrets/vault_master_key,readonly" \
   --mount "type=bind,source=$secret_dir/db_password,target=/run/canonical-secrets/db_password,readonly" \
   --tmpfs /var/lib/nvidia-build-lb:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=65532,gid=65532 \
-  -e NVIDIA_BUILD_LB_PUBLIC_PORT=2456 -e NBLB_UPSTREAM_URL=mock://local \
+  -e NVIDIA_BUILD_LB_BIND_PORT=2456 -e NVIDIA_BUILD_LB_PUBLIC_PORT="${container_port}" \
+  -e NBLB_UPSTREAM_URL=mock://local \
   "$RUN_TAG" >/dev/null
 for _ in $(seq 1 60); do
   curl -sS "http://127.0.0.1:${container_port}/health" >/dev/null 2>&1 && break
@@ -98,13 +99,13 @@ done
 test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Host: 127.0.0.1:${container_port}" "http://127.0.0.1:${container_port}/admin/")" = 200
 for pair in aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; do
   first=${pair:0:1}
-  key_id=$(curl -fsS -H 'Host: 127.0.0.1' -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' \
+  key_id=$(curl -fsS -H "Host: 127.0.0.1:${container_port}" -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' \
     -H 'Content-Type: application/json' -d "{\"label\":\"key-$first\",\"credential\":\"nvapi-$pair\"}" \
     "http://127.0.0.1:${container_port}/admin/api/v1/upstream-keys" | jq -er .id)
-  curl -fsS -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -X POST \
+  curl -fsS -H "Host: 127.0.0.1:${container_port}" -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -X POST \
     "http://127.0.0.1:${container_port}/admin/api/v1/upstream-keys/$key_id/probe" \
     | jq -e '.probe_status == "valid"' >/dev/null
-  curl -fsS -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -H 'Content-Type: application/json' \
+  curl -fsS -H "Host: 127.0.0.1:${container_port}" -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -H 'Content-Type: application/json' \
     -d '{"enabled":true}' "http://127.0.0.1:${container_port}/admin/api/v1/upstream-keys/$key_id/state" >/dev/null
 done
 curl -fsS "http://127.0.0.1:${container_port}/health" | jq -e '.traffic_ready == true' >/dev/null
@@ -146,6 +147,7 @@ export NBLB_POSTGRES_IMAGE="$POSTGRES_TAG"
 export NBLB_QA_SECRET_DIR="$secret_dir"
 export NBLB_QA_RUN_ID="$compose_project"
 export NBLB_QA_PORT=${NBLB_QA_PORT:-32568}
+export NBLB_QA_PUBLIC_PORT=${NBLB_QA_PUBLIC_PORT:-$NBLB_QA_PORT}
 docker compose -p "$compose_project" -f compose.qa.yml up -d app loopback
 for _ in $(seq 1 60); do
   health_code=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${NBLB_QA_PORT}/health" 2>/dev/null || true)
@@ -156,14 +158,14 @@ for _ in $(seq 1 60); do
 done
 for pair in aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; do
   first=${pair:0:1}
-  key_id=$(curl -fsS -H 'Host: 127.0.0.1' -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' \
+  key_id=$(curl -fsS -H "Host: 127.0.0.1:${NBLB_QA_PORT}" -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' \
     -H 'Content-Type: application/json' \
     -d "{\"label\":\"compose-$first\",\"credential\":\"nvapi-$pair\"}" \
     "http://127.0.0.1:${NBLB_QA_PORT}/admin/api/v1/upstream-keys" | jq -er .id)
-  curl -fsS -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -X POST \
+  curl -fsS -H "Host: 127.0.0.1:${NBLB_QA_PORT}" -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -X POST \
     "http://127.0.0.1:${NBLB_QA_PORT}/admin/api/v1/upstream-keys/$key_id/probe" \
     | jq -e '.probe_status == "valid"' >/dev/null
-  curl -fsS -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -H 'Content-Type: application/json' \
+  curl -fsS -H "Host: 127.0.0.1:${NBLB_QA_PORT}" -H 'Authorization: Bearer nblb_admin_0000000000000000000000000000000000000000000000000000000000000001' -H 'Content-Type: application/json' \
     -d '{"enabled":true}' "http://127.0.0.1:${NBLB_QA_PORT}/admin/api/v1/upstream-keys/$key_id/state" >/dev/null
 done
 curl -fsS "http://127.0.0.1:${NBLB_QA_PORT}/health" | jq -e '.traffic_ready == true' >/dev/null

@@ -171,6 +171,7 @@ services:
       NBLB_DATABASE_PASSWORD_FILE: /run/nvidia-build-lb/secrets/db_password
       NBLB_VAULT_MASTER_KEY_FILE: /run/nvidia-build-lb/secrets/vault_master_key
       NVIDIA_BUILD_LB_ADMIN_TOKEN_FILE: /run/nvidia-build-lb/secrets/admin_token
+      NVIDIA_BUILD_LB_BIND_PORT: 2456
       NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_QA_PUBLIC_PORT:-2456}
       NBLB_UPSTREAM_URL: https://integrate.api.nvidia.com/v1/chat/completions
       NBLB_REQUIRE_DOWNSTREAM_TOKEN: "0"

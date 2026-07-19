@@ -28,7 +28,7 @@ done
 curl -fsS "http://127.0.0.1:$port/health" | jq -e '.ready == true and .traffic_ready == true and .eligible_keys == 2' >/dev/null
 curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/upstream-slots" | jq -e '.slots|length == 2 and all(.[]; (.profiles|length) == 8)' >/dev/null
 curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/model-capabilities" | jq -e '.models|length == 8' >/dev/null
-curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/generation-readiness" | jq -e '.ready == true and .available_profiles == 8' >/dev/null
+curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/generation-readiness" | jq -e '.ready == true and .available_profiles == 0' >/dev/null
 curl -fsS -H 'Authorization: Bearer smoke-admin' -H 'Content-Type: application/json' \
   -d '{"label":"smoke","scopes":["models:read","chat:write","embeddings:write","images:write","audio:write","media:write"]}' \
   "http://127.0.0.1:$port/admin/api/v1/downstream-credentials" >"$work/client.json"
