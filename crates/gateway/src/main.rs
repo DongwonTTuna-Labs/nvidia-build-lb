@@ -29,6 +29,10 @@ use std::{
 };
 use uuid::Uuid;
 
+const UPSTREAM_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+const UPSTREAM_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const NVCF_POLL_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+
 struct AppState {
     vault: VaultStore,
     router: Mutex<HashMap<String, Router>>,
@@ -894,7 +898,10 @@ async fn build_state() -> Result<AppState> {
             )
         })
         .collect::<HashMap<_, _>>();
-    let mut client_builder = reqwest::Client::builder().timeout(StdDuration::from_secs(60));
+    // The shared client must not have a total timeout: a valid SSE completion
+    // may run longer than the ordinary request budget. Individual
+    // non-stream requests and probe/poll calls apply bounded timeouts below.
+    let mut client_builder = reqwest::Client::builder().connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
     if let Ok(ca_path) = env::var("NBLB_UPSTREAM_CA_FILE") {
         let certificate = reqwest::Certificate::from_pem(
             &std::fs::read(&ca_path).with_context(|| format!("read upstream CA: {ca_path}"))?,
@@ -1514,6 +1521,7 @@ async fn probe_key(
             "max_tokens": 1,
             "stream": false
         }))
+        .timeout(UPSTREAM_REQUEST_TIMEOUT)
         .send()
         .await;
     let response = match response {
@@ -1756,7 +1764,7 @@ async fn chat_completions(
             }
             return mock_response(&request, stream);
         }
-        let result = state
+        let mut upstream_request = state
             .client
             .post(upstream_endpoint_for(
                 &state.upstream_url,
@@ -1764,9 +1772,11 @@ async fn chat_completions(
                 profile,
             ))
             .bearer_auth(&credential)
-            .json(&request)
-            .send()
-            .await;
+            .json(&request);
+        if !stream {
+            upstream_request = upstream_request.timeout(UPSTREAM_REQUEST_TIMEOUT);
+        }
+        let result = upstream_request.send().await;
         match result {
             Ok(response)
                 if response.status().as_u16() == 202
@@ -1932,14 +1942,16 @@ async fn chat_completions(
                     || response.status().is_server_error() =>
             {
                 rate_limited |= response.status().as_u16() == 429;
-                if matches!(response.status().as_u16(), 401..=403)
-                    && let Err(response) = quarantine_key(&state, id).await
-                {
-                    return response;
-                }
-                let retry = retry_after_duration(&response);
-                if let Err(response) = record_failure(&state, id, retry).await {
-                    return response;
+                let auth_failure = matches!(response.status().as_u16(), 401..=403);
+                if auth_failure {
+                    if let Err(response) = quarantine_key(&state, id).await {
+                        return response;
+                    }
+                } else {
+                    let retry = retry_after_duration(&response);
+                    if let Err(response) = record_failure(&state, id, retry).await {
+                        return response;
+                    }
                 }
                 if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
@@ -2073,6 +2085,7 @@ async fn multimodal(
                 .bearer_auth(&credential)
                 .header(reqwest::header::CONTENT_TYPE, content_type)
                 .body(body.clone())
+                .timeout(UPSTREAM_REQUEST_TIMEOUT)
                 .send()
                 .await
         } else if req.path() == "/v1/audio/speech" {
@@ -2100,6 +2113,7 @@ async fn multimodal(
                 .post(&endpoint)
                 .bearer_auth(&credential)
                 .multipart(form)
+                .timeout(UPSTREAM_REQUEST_TIMEOUT)
                 .send()
                 .await
         } else {
@@ -2109,6 +2123,7 @@ async fn multimodal(
                 .bearer_auth(&credential)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&upstream_request)
+                .timeout(UPSTREAM_REQUEST_TIMEOUT)
                 .send()
                 .await
         };
@@ -2195,14 +2210,16 @@ async fn multimodal(
                     || response.status().is_server_error() =>
             {
                 rate_limited |= response.status().as_u16() == 429;
-                if matches!(response.status().as_u16(), 401..=403)
-                    && let Err(response) = quarantine_key(&state, id).await
-                {
-                    return response;
-                }
-                let retry = retry_after_duration(&response);
-                if let Err(response) = record_failure(&state, id, retry).await {
-                    return response;
+                let auth_failure = matches!(response.status().as_u16(), 401..=403);
+                if auth_failure {
+                    if let Err(response) = quarantine_key(&state, id).await {
+                        return response;
+                    }
+                } else {
+                    let retry = retry_after_duration(&response);
+                    if let Err(response) = record_failure(&state, id, retry).await {
+                        return response;
+                    }
                 }
                 if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
@@ -2920,6 +2937,7 @@ async fn poll_nvcf(
             .get(&poll_endpoint)
             .bearer_auth(credential)
             .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(NVCF_POLL_TIMEOUT)
             .send()
             .await
             .context("poll NVCF request")?;
@@ -3986,6 +4004,12 @@ fn parse_host_authority(raw: &str) -> (String, Option<u16>) {
 }
 
 fn admin_host_allowed(raw_host: &str) -> bool {
+    if raw_host.is_empty() || raw_host.contains(',') {
+        return false;
+    }
+    if raw_host.eq_ignore_ascii_case("::1") {
+        return true;
+    }
     let host = raw_host
         .strip_prefix('[')
         .and_then(|value| value.split_once(']').map(|(host, _)| host))
@@ -4137,9 +4161,9 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        SseValidator, eligible_key_count, parse_multimodal_request, percent_encode_userinfo,
-        upstream_endpoint, upstream_endpoint_for, validate_admin_token, validate_chat_request,
-        validate_chat_response,
+        SseValidator, admin_host_allowed, eligible_key_count, parse_multimodal_request,
+        percent_encode_userinfo, upstream_endpoint, upstream_endpoint_for, validate_admin_token,
+        validate_chat_request, validate_chat_response,
     };
     use chrono::{Duration, Utc};
     use nvidia_build_lb_core::KeySummary;
@@ -4267,6 +4291,14 @@ mod tests {
         assert!(validate_chat_response(tool_call, false).is_ok());
         let leaked = br#"{"id":"chat-1","object":"chat.completion","model":"z-ai/glm-5.2","choices":[],"provider_secret":"do-not-forward"}"#;
         assert!(validate_chat_response(leaked, false).is_err());
+    }
+
+    #[test]
+    fn admin_host_boundary_handles_ipv6_and_header_confusion() {
+        assert!(admin_host_allowed("[::1]:2456"));
+        assert!(admin_host_allowed("::1"));
+        assert!(!admin_host_allowed("127.0.0.1:2456,evil"));
+        assert!(!admin_host_allowed(""));
     }
 
     #[test]

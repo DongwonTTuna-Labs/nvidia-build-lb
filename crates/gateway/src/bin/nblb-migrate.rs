@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
             .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("database password is required"))?;
-        url = url.replacen('@', &format!(":{password}@"), 1);
+        url = url.replacen('@', &format!(":{}@", percent_encode_userinfo(&password)), 1);
     }
     if !url
         .split_once('?')
@@ -49,4 +49,27 @@ async fn main() -> Result<()> {
         .await
         .context("run SQLx migrations")?;
     Ok(())
+}
+
+fn percent_encode_userinfo(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_encode_userinfo;
+
+    #[test]
+    fn percent_encodes_database_password_delimiters() {
+        assert_eq!(percent_encode_userinfo("p@ss:/#?"), "p%40ss%3A%2F%23%3F");
+    }
 }
