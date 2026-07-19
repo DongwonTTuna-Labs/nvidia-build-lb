@@ -74,6 +74,7 @@ let confirmTitle: HTMLHeadingElement;
 let secretOpen = false;
 let secretCleanup: "idle" | "pending" | "manual" = "idle";
 let manualCleanupConfirmed = false;
+let custodyRevokeRequired = false;
 let secretReturnFocus: HTMLElement | null = null;
 let confirmReturnFocus: HTMLElement | null = null;
 let pendingAction: { kind: "revoke" | "delete"; id: string; label: string } | null = null;
@@ -282,6 +283,7 @@ async function request(
       : "관리자 토큰이 만료되었거나 올바르지 않습니다. 다시 인증하세요.";
     state = custodyOpen ? "recovery" : "error";
     secretCleanup = custodyOpen ? "manual" : secretCleanup;
+    custodyRevokeRequired = custodyOpen || custodyRevokeRequired;
     announcement = custodyOpen
       ? "접속 키 폐기 확인이 필요합니다."
       : "인증이 만료되어 로그인 화면으로 돌아왔습니다.";
@@ -516,7 +518,14 @@ async function login(event: SubmitEvent) {
   await refresh();
   if (!error) {
     authenticated = true;
-    await tick().then(() => routeHeading?.focus({ preventScroll: true }));
+    await tick();
+    if (custodyRevokeRequired && custody.credentialId) {
+      secretDialog?.showModal();
+      await tick();
+      secretTitle?.focus({ preventScroll: true });
+    } else {
+      routeHeading?.focus({ preventScroll: true });
+    }
   } else await tick().then(() => adminInput?.focus({ preventScroll: true }));
 }
 
@@ -602,11 +611,17 @@ async function issueClient(event: SubmitEvent) {
     });
     if (operation !== mutationEpoch) return;
     const payload = (await response.json().catch(() => ({}))) as { token?: string; id?: string };
-    if (!response.ok || typeof payload.token !== "string")
+    if (
+      !response.ok ||
+      typeof payload.token !== "string" ||
+      typeof payload.id !== "string" ||
+      !payload.id
+    )
       throw new Error(responseMessage(payload, "접속 키를 발급하지 못했습니다."));
     custody.token = payload.token;
     custody.credentialId = payload.id ?? "";
     custody.authToken = session.token;
+    custodyRevokeRequired = false;
     clientLabel = "";
     notice = "접속 키는 한 번만 표시됩니다. 저장한 뒤 지우고 닫으세요.";
     state = "success";
@@ -868,7 +883,7 @@ function clipboardWithTimeout<T>(operation: Promise<T>, timeoutMs = 1500): Promi
 async function clearIssuedToken(
   manual = false,
   revokeOnFailure = false,
-  authToken = session.token,
+  authToken = session.token || custody.authToken,
 ) {
   const issuedCredentialId = custody.credentialId;
   if (!custody.token && !secretOpen) return;
@@ -885,6 +900,7 @@ async function clearIssuedToken(
   secretCleanup = "pending";
   let clipboardCleared = false;
   let revokedDueToClipboard = false;
+  const revokeRequired = custodyRevokeRequired || revokeOnFailure;
   if (!manual && navigator.clipboard) {
     try {
       await clipboardWithTimeout(navigator.clipboard.writeText(""));
@@ -901,7 +917,7 @@ async function clearIssuedToken(
       clipboardCleared = false;
     }
   }
-  if (!clipboardCleared && (manual || revokeOnFailure) && issuedCredentialId) {
+  if (revokeRequired && issuedCredentialId) {
     mutating = true;
     const operation = ++mutationEpoch;
     mutationController?.abort();
@@ -922,6 +938,7 @@ async function clearIssuedToken(
       if (!response.ok) throw new Error("발급된 접속 키를 폐기하지 못했습니다.");
       clipboardCleared = true;
       revokedDueToClipboard = true;
+      custodyRevokeRequired = false;
       notice = "클립보드 정리를 확인하지 못해 접속 키를 폐기했습니다.";
     } catch (caught) {
       if (controller.signal.aborted || operation !== mutationEpoch) return;
@@ -935,9 +952,9 @@ async function clearIssuedToken(
       if (mutationState === "pending") mutationState = "idle";
     }
   }
-  if (!clipboardCleared && (manual || revokeOnFailure)) {
+  if (revokeRequired && issuedCredentialId && !revokedDueToClipboard) {
     secretCleanup = "manual";
-    error = "클립보드 정리를 확인하지 못했고 접속 키도 폐기하지 못했습니다. 다시 확인하세요.";
+    error = "인증 만료 후 접속 키 폐기를 확인하지 못했습니다. 다시 인증한 뒤 재시도하세요.";
     return;
   }
   if (!clipboardCleared && !manual) {
@@ -949,6 +966,7 @@ async function clearIssuedToken(
   custody.token = "";
   custody.credentialId = "";
   custody.authToken = "";
+  custodyRevokeRequired = false;
   secretOpen = false;
   error = "";
   manualCleanupConfirmed = false;
@@ -1278,7 +1296,7 @@ onMount(() => {
 
 <dialog bind:this={secretDialog} aria-labelledby="secret-title" aria-describedby="secret-description" oncancel={(event) => { event.preventDefault(); }}>
   <form method="dialog" class="dialog-card" onsubmit={(event) => { event.preventDefault(); clearIssuedToken(); }}>
-    <h2 id="secret-title" bind:this={secretTitle} tabindex="-1">지금만 표시되는 접속 키</h2><p id="secret-description">안전한 비밀 저장소에 복사한 뒤 아래 버튼으로 화면에서 지우고 닫으세요. 키는 다시 표시되지 않습니다.</p><textarea bind:this={secretField} readonly aria-label="일회성 접속 키"></textarea>{#if secretCleanup === "manual"}<p class="attention" role="alert">클립보드를 자동으로 비우지 못했습니다. 클립보드를 직접 비운 뒤 확인란을 선택하세요.</p><label class="check" for="manual-cleanup"><input id="manual-cleanup" type="checkbox" bind:checked={manualCleanupConfirmed} /> 클립보드를 직접 비웠습니다</label>{/if}<div class="actions"><button class="secondary" type="button" onclick={() => void copyIssuedToken()}>클립보드에 복사</button>{#if secretCleanup === "manual"}<button class="secondary" type="button" onclick={() => void clearIssuedToken(true)} disabled={!manualCleanupConfirmed}>수동 확인 후 닫기</button>{:else}<button class="primary" type="submit" disabled={secretCleanup === "pending"}>{secretCleanup === "pending" ? "클립보드 정리 중…" : "지우고 닫기"}</button>{/if}</div>
+    <h2 id="secret-title" bind:this={secretTitle} tabindex="-1">지금만 표시되는 접속 키</h2><p id="secret-description">안전한 비밀 저장소에 복사한 뒤 아래 버튼으로 화면에서 지우고 닫으세요. 키는 다시 표시되지 않습니다.</p><textarea bind:this={secretField} readonly aria-label="일회성 접속 키"></textarea>{#if secretCleanup === "manual"}<p class="attention" role="alert">{custodyRevokeRequired ? "인증이 만료되어 접속 키를 서버에서 폐기해야 합니다. 먼저 다시 인증하세요." : "클립보드를 자동으로 비우지 못했습니다. 클립보드를 직접 비운 뒤 확인란을 선택하세요."}</p><label class="check" for="manual-cleanup"><input id="manual-cleanup" type="checkbox" bind:checked={manualCleanupConfirmed} /> 클립보드를 직접 비웠습니다</label>{/if}<div class="actions"><button class="secondary" type="button" onclick={() => void copyIssuedToken()}>클립보드에 복사</button>{#if secretCleanup === "manual"}{#if custodyRevokeRequired && !session.token}<button class="secondary" type="button" onclick={() => { secretDialog?.close(); void tick().then(() => adminInput?.focus({ preventScroll: true })); }}>다시 인증</button>{:else}<button class="secondary" type="button" onclick={() => void clearIssuedToken(true)} disabled={!manualCleanupConfirmed}>수동 확인 후 닫기</button>{/if}{:else}<button class="primary" type="submit" disabled={secretCleanup === "pending"}>{secretCleanup === "pending" ? "클립보드 정리 중…" : "지우고 닫기"}</button>{/if}</div>
   </form>
 </dialog>
 

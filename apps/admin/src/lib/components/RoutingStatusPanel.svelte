@@ -28,7 +28,7 @@ function probeStatus(key: Key) {
 }
 
 function mutationBlocked() {
-  return ["offline", "stale", "partial", "error", "recovery"].includes(state);
+  return ["loading", "offline", "stale", "partial", "error", "recovery"].includes(state);
 }
 </script>
 

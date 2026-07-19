@@ -11,7 +11,7 @@ export let mutationState: string;
 export let onRevoke: (id: string, label: string, event: MouseEvent) => void;
 
 function mutationBlocked() {
-  return ["offline", "stale", "partial", "error", "recovery"].includes(state);
+  return ["loading", "offline", "stale", "partial", "error", "recovery"].includes(state);
 }
 </script>
 

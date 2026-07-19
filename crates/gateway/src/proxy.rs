@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use super::{
     AppState, PROFILES, STREAM_PRIME_TIMEOUT, StreamAttemptGuard, UPSTREAM_REQUEST_TIMEOUT,
-    attempt_finished, attempt_started, authorize_scope, chat_response_stream, mock_modality,
-    mock_response, mock_stream_response, normalize_modality_response, poll_nvcf,
+    attempt_finished, attempt_started, authorize_scope, chat_response_stream, invalid_request,
+    mock_modality, mock_response, mock_stream_response, normalize_modality_response, poll_nvcf,
     prepare_modality_request, prime_stream, public_guard_response, quarantine_key, record_failure,
     record_request, select_key, upstream_endpoint_for, valid_data_url, validate_chat_response,
 };
@@ -769,10 +769,6 @@ fn profile_supports_path(path: &str, model: &str) -> bool {
         "/v1/nvidia/inference" => model == "stabilityai/stable-video-diffusion",
         _ => false,
     }
-}
-
-pub(crate) fn invalid_request(message: &str) -> HttpResponse {
-    HttpResponse::BadRequest().json(json!({"error":{"message":message,"type":"invalid_request"}}))
 }
 
 fn retry_after_duration(response: &reqwest::Response) -> Option<Duration> {

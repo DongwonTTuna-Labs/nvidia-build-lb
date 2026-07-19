@@ -2,15 +2,16 @@
 //! Actix gateway for the NVIDIA hosted API load balancer.
 
 mod admin;
+mod errors;
 mod provider;
 mod proxy;
 mod streaming;
 #[cfg(test)]
 mod tests;
+pub(crate) use errors::invalid_request;
 pub(crate) use provider::{
     prepare_modality_request, upstream_endpoint_for, validate_chat_response,
 };
-pub(crate) use proxy::invalid_request;
 pub(crate) use streaming::{
     SseValidator, StreamAttemptGuard, UpstreamByteStream, chat_response_stream,
     normalize_modality_response, prime_stream, valid_data_url,
