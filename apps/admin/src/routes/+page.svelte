@@ -458,15 +458,22 @@ async function refresh() {
     if (epoch !== refreshEpoch || currentAuthEpoch !== authEpoch) return;
     const hadSnapshot =
       keys.length > 0 || models.length > 0 || clients.length > 0 || Boolean(updatedAt);
+    const custodyRecovery = custodyRevokeRequired && Boolean(custody.credentialId);
     const message = caught instanceof Error ? caught.message : "상태를 읽지 못했습니다.";
     error = message;
     resetReadData();
-    state = navigator.onLine === false ? "offline" : hadSnapshot ? "stale" : "error";
+    state = custodyRecovery
+      ? "recovery"
+      : navigator.onLine === false
+        ? "offline"
+        : hadSnapshot
+          ? "stale"
+          : "error";
     structuralReady = false;
     eligibleKeys = 0;
     profileCapabilities = [];
     slotProjections = [];
-    readinessReasons = ["snapshot_stale"];
+    readinessReasons = custodyRecovery ? ["auth_expired_custody"] : ["snapshot_stale"];
     publicHealth = { ...publicHealth, status: "not_verified", next_action: "verify_public_route" };
     lastOperation = "확인 필요";
     trafficReady = false;
