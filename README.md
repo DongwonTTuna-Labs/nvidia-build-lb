@@ -37,6 +37,9 @@ bun run --cwd apps/admin build
 -- -D warnings`, Svelte format/knip, 두 Docker image build와 live smoke를 함께
 실행합니다.
 
+정적 관리자 화면의 375px·200% 브라우저 smoke 절차는
+[`docs/UI_SMOKE.md`](docs/UI_SMOKE.md)에 있습니다.
+
 ## 로컬 이미지
 
 ```bash
