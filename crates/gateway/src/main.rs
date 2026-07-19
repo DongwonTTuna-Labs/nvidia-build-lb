@@ -927,7 +927,14 @@ async fn model_capabilities(req: HttpRequest, state: web::Data<AppState>) -> imp
             "nvidia/parakeet-ctc-1.1b" => "/v1/audio/transcriptions",
             _ => "/v1/nvidia/inference",
         };
-        json!({"id":profile,"route":route,"advertised":true,"available_now":available,"modalities":model_modalities(profile)})
+        json!({
+            "id":profile,
+            "route":route,
+            "advertised":true,
+            "available_now":available,
+            "proof_status": if available { "pair_ready_provider_proof_pending" } else { "not_ready" },
+            "modalities":model_modalities(profile)
+        })
     }).collect::<Vec<_>>();
     HttpResponse::Ok()
         .insert_header(("cache-control", "no-store"))
@@ -3651,7 +3658,11 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 fn eligible_key_count(keys: &[nvidia_build_lb_core::KeySummary]) -> usize {
     let now = Utc::now();
     keys.iter()
-        .filter(|key| key.enabled && key.cooldown_until.is_none_or(|until| until <= now))
+        .filter(|key| {
+            key.enabled
+                && key.verified
+                && key.cooldown_until.is_none_or(|until| until <= now)
+        })
         .count()
 }
 
@@ -3756,9 +3767,12 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_multimodal_request, upstream_endpoint, upstream_endpoint_for, validate_chat_request,
-        validate_chat_response,
+        eligible_key_count, parse_multimodal_request, upstream_endpoint, upstream_endpoint_for,
+        validate_chat_request, validate_chat_response,
     };
+    use chrono::{Duration, Utc};
+    use nvidia_build_lb_core::KeySummary;
+    use uuid::Uuid;
 
     #[test]
     fn modality_paths_replace_only_the_endpoint_suffix() {
@@ -3900,5 +3914,32 @@ mod tests {
             "messages": [{"role":"user","content":{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}}]
         });
         assert!(validate_chat_request(&glm_object).is_err());
+    }
+
+    #[test]
+    fn health_eligibility_requires_verified_upstream_keys() {
+        let keys = vec![
+            KeySummary {
+                id: Uuid::from_u128(1),
+                label: "unverified".into(),
+                fingerprint: "a".into(),
+                enabled: true,
+                verified: false,
+                cooldown_until: None,
+                request_count: 0,
+                failure_count: 0,
+            },
+            KeySummary {
+                id: Uuid::from_u128(2),
+                label: "verified".into(),
+                fingerprint: "b".into(),
+                enabled: true,
+                verified: true,
+                cooldown_until: Some(Utc::now() + Duration::minutes(1)),
+                request_count: 0,
+                failure_count: 0,
+            },
+        ];
+        assert_eq!(eligible_key_count(&keys), 0);
     }
 }
