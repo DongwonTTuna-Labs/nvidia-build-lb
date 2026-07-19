@@ -1,17 +1,8 @@
-.venv/
 node_modules/
 target/
 .svelte-kit/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.ruff_cache/
-.basedpyright/
-.coverage
-htmlcov/
 build/
 dist/
-*.egg-info/
 .env
 .env.*
 *.key

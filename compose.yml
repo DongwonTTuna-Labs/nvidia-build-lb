@@ -6,6 +6,7 @@ services:
     environment:
       POSTGRES_DB: nvidia_build_lb
       POSTGRES_USER: nvidia_build_lb
+      POSTGRES_PASSWORD_FILE: /run/canonical-secrets/db_password
       PGDATA: /var/lib/postgresql/data/pgdata
     secrets:
       - source: db_password
@@ -33,7 +34,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "/bin/setpriv", "--reuid=70", "--regid=70", "--clear-groups", "--inh-caps=-all", "--ambient-caps=-all", "--bounding-set=-all", "--no-new-privs", "/usr/local/bin/nblb-healthcheck", "70", "70", "postgres"]
+      test: ["CMD", "pg_isready", "-U", "nvidia_build_lb", "-d", "nvidia_build_lb"]
       interval: 10s
       timeout: 3s
       retries: 12

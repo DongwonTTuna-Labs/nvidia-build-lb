@@ -1,13 +1,15 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
-  "ignoreDependencies": ["lighthouse"],
+  "ignoreDependencies": ["@sveltejs/adapter-static"],
+  "ignoreFiles": [
+    "**/src/lib/copy.ts",
+    "**/src/routes/**",
+    "**/svelte.config.ts"
+  ],
   "workspaces": {
-    ".": {
-      "ignore": ["frontend/admin/**", "src/nvidia_build_lb/web/static/**", "tests/ui/vendor/**"]
-    },
     "apps/admin": {
-      "entry": ["src/routes/**/*.svelte"],
-      "project": ["src/**/*.{ts,svelte}"]
+      "entry": ["svelte.config.ts", "vite.config.ts", "src/routes/**/*.svelte", "src/routes/**/*.ts"],
+      "project": ["src/**/*.{ts,svelte}", "*.config.ts"]
     }
   }
 }

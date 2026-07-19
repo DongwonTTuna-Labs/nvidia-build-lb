@@ -1,1 +1,0 @@
-"""Packaged static stylesheets."""

@@ -1,5 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <title>NVIDIA Build LB</title>
-  <rect width="64" height="64" rx="8" fill="#171C20" />
-  <path d="M32 18v12M20 30h24M20 30v14M44 30v14" fill="none" stroke="#C1C7C0" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
-</svg>

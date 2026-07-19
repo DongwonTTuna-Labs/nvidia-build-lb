@@ -1,8 +1,0 @@
-{
-  "name": "nvidia-build-lb-qa",
-  "private": true,
-  "workspaces": ["apps/admin"],
-  "devDependencies": {
-    "lighthouse": "13.4.0"
-  }
-}

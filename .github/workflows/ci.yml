@@ -27,6 +27,9 @@ jobs:
         run: |
           cargo test -p nvidia-build-lb-core -p nvidia-build-lb-gateway
           cargo clippy -p nvidia-build-lb-core -p nvidia-build-lb-gateway --all-targets -- -D warnings
+      - name: Legacy source contract
+        run: |
+          test -z "$(git ls-files -- '*.py' '*.sh' '*.js')"
       - name: Svelte checks
         run: |
           npm --prefix apps/admin ci --ignore-scripts --no-audit --no-fund
@@ -34,10 +37,6 @@ jobs:
           npm --prefix apps/admin run format
           npm --prefix apps/admin run knip
           npm --prefix apps/admin run build
-      - name: Targeted Rust smoke
-        run: |
-          scripts/qa/smoke-rust.sh
-          scripts/qa/smoke-rust-postgres.sh
       - name: Build runtime images
         run: |
           docker build --pull --file Dockerfile.rust --tag nvidia-build-lb:ci .

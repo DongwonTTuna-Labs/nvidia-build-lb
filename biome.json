@@ -2,7 +2,6 @@
   "$schema": "https://biomejs.dev/schemas/2.5.4/schema.json",
   "files": {
     "includes": [
-      "apps/admin/**/*.js",
       "apps/admin/**/*.ts",
       "apps/admin/**/*.svelte",
       "apps/admin/**/*.json",

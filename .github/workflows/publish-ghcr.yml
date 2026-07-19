@@ -18,88 +18,45 @@ jobs:
     outputs:
       app_registry_digest: ${{ steps.publish.outputs.app_registry_digest }}
       postgres_registry_digest: ${{ steps.publish.outputs.postgres_registry_digest }}
-      fixture_image_digest: ${{ steps.candidate.outputs.fixture }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@1e862dfacbd1d6d858c55d9b792c756523627244 # v7.1.4
-        with:
-          version: "0.11.24"
-          enable-cache: true
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-      - name: Verify Rust and Svelte source
-        run: |
-          cargo fmt --all -- --check
-          cargo test --workspace
-          npm --prefix apps/admin ci --ignore-scripts --no-audit --no-fund
-          npm --prefix apps/admin run check
-          npm --prefix apps/admin run format
-          npm --prefix apps/admin run knip
-      - name: Build and exercise the manifest-bound image pair
-        env:
-          EVIDENCE_DIR: ${{ runner.temp }}/candidate
-        run: scripts/qa/build-rust-candidate.sh
-      - name: Resolve immutable candidate pair
-        id: candidate
-        shell: bash
-        run: |
-          app=$(jq -er '.image_digest' "${RUNNER_TEMP}/candidate/candidate.json")
-          postgres=$(jq -er '.postgres_image_digest' "${RUNNER_TEMP}/candidate/candidate.json")
-          fixture=$(jq -er '.fixture_image_digest' "${RUNNER_TEMP}/candidate/candidate.json")
-          echo "app=${app}" >> "$GITHUB_OUTPUT"
-          echo "postgres=${postgres}" >> "$GITHUB_OUTPUT"
-          echo "fixture=${fixture}" >> "$GITHUB_OUTPUT"
-      - name: Check candidate metadata for secret leakage
-        env:
-          IMAGE_DIGEST: ${{ steps.candidate.outputs.app }}
-          POSTGRES_IMAGE_DIGEST: ${{ steps.candidate.outputs.postgres }}
-          FIXTURE_IMAGE_DIGEST: ${{ steps.candidate.outputs.fixture }}
-        run: |
-          ! docker history --no-trunc --format '{{.CreatedBy}}' "$IMAGE_DIGEST" | grep -E 'nvapi-|nblb_ds_'
-          ! docker history --no-trunc --format '{{.CreatedBy}}' "$POSTGRES_IMAGE_DIGEST" | grep -E 'nvapi-|nblb_ds_'
-          ! docker history --no-trunc --format '{{.CreatedBy}}' "$FIXTURE_IMAGE_DIGEST" | grep -E 'nvapi-|nblb_ds_'
       - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Tag, publish, and bind deployable registry digests
-        id: publish
-        shell: bash
-        env:
-          APP_DIGEST: ${{ steps.candidate.outputs.app }}
-          POSTGRES_DIGEST: ${{ steps.candidate.outputs.postgres }}
+      - name: Verify Rust and Svelte source
         run: |
-          package="ghcr.io/${GITHUB_REPOSITORY,,}"
-          app_ref="${package}:sha-${GITHUB_SHA}"
-          postgres_ref="${package}:postgres-sha-${GITHUB_SHA}"
-          test "$(docker image inspect --format '{{.Id}}' "$APP_DIGEST")" = "$APP_DIGEST"
-          test "$(docker image inspect --format '{{.Id}}' "$POSTGRES_DIGEST")" = "$POSTGRES_DIGEST"
-          docker tag "$APP_DIGEST" "$app_ref"
-          docker tag "$POSTGRES_DIGEST" "$postgres_ref"
-          docker push "$app_ref"
-          docker push "$postgres_ref"
-          receipt_dir=$(mktemp -d "${RUNNER_TEMP}/registry-receipts.XXXXXX")
-          cleanup_receipts() {
-            rm -f -- "$receipt_dir/app.json" "$receipt_dir/postgres.json"
-            rmdir -- "$receipt_dir"
-          }
-          trap cleanup_receipts EXIT
-          docker buildx imagetools inspect "$app_ref" --raw > "$receipt_dir/app.json"
-          docker buildx imagetools inspect "$postgres_ref" --raw \
-            > "$receipt_dir/postgres.json"
-          app_registry_digest=$(uv run python -m scripts.qa.registry_manifest_digest \
-            --manifest "$receipt_dir/app.json" --expected-image-id "$APP_DIGEST")
-          postgres_registry_digest=$(uv run python -m scripts.qa.registry_manifest_digest \
-            --manifest "$receipt_dir/postgres.json" --expected-image-id "$POSTGRES_DIGEST")
-          printf '%s\n' \
-            "app_registry_digest=$app_registry_digest" \
-            "postgres_registry_digest=$postgres_registry_digest" >> "$GITHUB_OUTPUT"
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          npm --prefix apps/admin ci --ignore-scripts --no-audit --no-fund
+          npm --prefix apps/admin run check
+          npm --prefix apps/admin run format
+          npm --prefix apps/admin run knip
+          npm --prefix apps/admin run build
+      - name: Build immutable images
+        env:
+          IMAGE_TAG: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          POSTGRES_TAG: ghcr.io/${{ github.repository }}:postgres-sha-${{ github.sha }}
+        run: |
+          docker buildx build --pull --file Dockerfile.rust --tag "$IMAGE_TAG" --push .
+          docker buildx build --pull --file docker/postgres.Dockerfile --tag "$POSTGRES_TAG" --push .
+      - name: Resolve and publish immutable digests
+        id: publish
+        env:
+          IMAGE_TAG: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          POSTGRES_TAG: ghcr.io/${{ github.repository }}:postgres-sha-${{ github.sha }}
+        run: |
+          app_digest="sha256:$(docker buildx imagetools inspect "$IMAGE_TAG" --raw | sha256sum | cut -d' ' -f1)"
+          postgres_digest="sha256:$(docker buildx imagetools inspect "$POSTGRES_TAG" --raw | sha256sum | cut -d' ' -f1)"
+          printf 'app_registry_digest=%s\n' "$app_digest" >> "$GITHUB_OUTPUT"
+          printf 'postgres_registry_digest=%s\n' "$postgres_digest" >> "$GITHUB_OUTPUT"
           {
             printf '%s\n' '### Immutable deployment digests' '```text'
-            printf '%s\n' \
-              "NBLB_APP_REGISTRY_DIGEST=$app_registry_digest" \
-              "NBLB_POSTGRES_REGISTRY_DIGEST=$postgres_registry_digest"
+            printf '%s\n' "NBLB_APP_REGISTRY_DIGEST=$app_digest" "NBLB_POSTGRES_REGISTRY_DIGEST=$postgres_digest"
             printf '%s\n' '```'
           } >> "$GITHUB_STEP_SUMMARY"

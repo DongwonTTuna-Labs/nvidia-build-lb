@@ -1,68 +1,53 @@
 # NVIDIA Build LB
 
-An NVIDIA Build hosted API load balancer targeting `z-ai/glm-5.2` at
-`https://integrate.api.nvidia.com/v1`.
+Rust Actix gateway와 SvelteKit 관리자 화면으로 구성된 NVIDIA hosted API
+load balancer입니다. PostgreSQL(SQLx migration)이 운영 상태의 권위 저장소이며,
+두 개의 암호화된 NVIDIA 자격 증명을 rate-aware round-robin으로 분산하고
+401/402/429·전송 오류를 cooldown/failover로 처리합니다.
 
-It provides an OpenAI-compatible chat surface, encrypted NVIDIA key custody,
-rate-aware round-robin and bounded failover, digest-only downstream tokens, and
-a loopback-only administration UI. PostgreSQL retains routing state and
-encrypted credentials; the vault master key remains a separate root-owned host
-secret.
+## 구성
 
-The hosted gateway is implemented in Rust/Actix with SQLx/PostgreSQL and the
-owner console is Svelte. The retained Python QA harness remains available for
-the legacy contract surface.
+- `crates/core`: AES-256-GCM vault, downstream 토큰 해시, 라우터와 cooldown 상태
+- `crates/gateway`: OpenAI 호환 chat/streaming 및 embeddings·image·video·audio API,
+  관리자 API, PostgreSQL 동기화, Rust prestart/healthcheck/migration 바이너리
+- `apps/admin`: 접근성·반응형 SvelteKit 관리자 UI (`/admin`)
+- `migrations/sqlx`: SQLx 단일 migration 원본
+- `compose.yml`: PostgreSQL + migration + gateway 독립 스택
 
-Fast affected-scope checks for the hosted stack are:
+저장소의 구현 소스는 Rust와 Svelte/TypeScript만 사용합니다. 저장소에는 Python,
+셸 스크립트, 수동 JavaScript 소스를 두지 않으며, SvelteKit이 빌드 과정에서
+생성하는 브라우저 번들은 Git에 저장하지 않고 이미지에만 포함합니다.
 
-```console
-make rust-check       # core tests + gateway compile
-make admin-check      # Svelte type/build check
-make rust-smoke       # mock two-key, failover, scope, stream, modalities
-make rust-smoke-postgres
+## 빠른 검증
+
+수정 중에는 영향 범위만 실행합니다.
+
+```bash
+cargo fmt --all -- --check
+cargo test -p nvidia-build-lb-core
+cargo test -p nvidia-build-lb-gateway --bins
+test -z "$(git ls-files -- '*.py' '*.sh' '*.js')"
+npm --prefix apps/admin run check
+npm --prefix apps/admin run build
 ```
 
-The retired Python contract suite is kept only for historical comparison; it
-is not a shipping gate for the Rust/Svelte stack. Run it only when explicitly
-auditing legacy behavior:
+최종 게이트에서만 `cargo test --workspace`, `cargo clippy --workspace --all-targets
+-- -D warnings`, Svelte format/knip, 두 Docker image build와 live smoke를 함께
+실행합니다.
 
-```console
-uv sync --locked --all-groups
-uv run pytest -q
-make help
+## 로컬 이미지
+
+```bash
+docker build --file Dockerfile.rust --tag nvidia-build-lb:local .
+docker build --file docker/postgres.Dockerfile --tag nvidia-build-lb-postgres:local .
 ```
 
-`make help` lists the stable verification targets. `build-candidate` records one
-source-bound manifest and one immutable application/PostgreSQL/QA-fixture image
-triplet. The Rust candidate gate and its targeted smoke receipts are the
-shipping identity; the older `test-browser-prod`, `verify-local`, and
-`scan-release` scripts are retained only as retired compatibility tooling:
+운영 compose는 root-only secret directory에 `admin_token`, `vault_master_key`,
+`db_password`를 둔 뒤 `NBLB_APP_REGISTRY_DIGEST`와
+`NBLB_POSTGRES_REGISTRY_DIGEST`를 immutable digest로 지정합니다.
 
-```console
-make build-candidate EVIDENCE_DIR=.omo/evidence/task-6a-release
-APP_IMAGE_ID="$(jq -er .image_digest .omo/evidence/task-6a-release/candidate.json)"
-POSTGRES_IMAGE_ID="$(jq -er .postgres_image_digest .omo/evidence/task-6a-release/candidate.json)"
-FIXTURE_IMAGE_ID="$(jq -er .fixture_image_digest .omo/evidence/task-6a-release/candidate.json)"
-SOURCE_MANIFEST=.omo/evidence/task-6a-release/source-manifest.json
-IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" FIXTURE_IMAGE_DIGEST="$FIXTURE_IMAGE_ID" \
-  SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR=.omo/evidence/task-6b-release \
-  scripts/qa/test-browser-prod.sh
-make verify-local IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" FIXTURE_IMAGE_DIGEST="$FIXTURE_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR=.omo/evidence/task-7-verify
-make scan-release IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR=.omo/evidence/task-7-scan
-```
+## 관리자 UI 보안
 
-Operational documentation:
-
-- `docs/ARCHITECTURE.md`: wire, persistence, routing, and security contracts
-- `docs/RUNBOOK.md`: deploy, health, rotation, and incident operations
-- `docs/BACKUP_RESTORE.md`: split-custody backup and isolated restore drill
-- `docs/SECURITY.md`: threat model, secret handling, and release scans
-- `docs/ROLLBACK.md`: image and state rollback procedure
-
-The supplied Compose surface binds only `127.0.0.1:2456`; it intentionally
-does not create public DNS, tunnel, or reverse-proxy ingress. This project is
-invoked through `scripts/ops/production-compose.sh`, which reloads a canonical
-root-owned runtime file on every call, accepts only raw 64-hex GHCR registry
-digests, serializes that file through a stable lock, and rejects mutable image
-tags before Compose runs. This project is independent and is not affiliated
-with NVIDIA Corporation.
+Svelte static HTML의 inline bootstrap hash를 Rust가 기동 시 계산해 CSP
+`script-src`에 추가합니다. `/admin/showcase`는 명시적인 Rust route로 제공하며
+`/admin/showcase/`는 canonical URL로 redirect합니다.

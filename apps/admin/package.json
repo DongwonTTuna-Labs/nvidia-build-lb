@@ -7,7 +7,7 @@
     "build": "vite build",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "format": "biome check ../../apps/admin",
-    "knip": "knip --config ../../knip.json"
+    "knip": "knip --config ../../knip.json --no-config-hints"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.4",

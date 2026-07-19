@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Actix gateway for the NVIDIA hosted API load balancer.
 
-use actix_files::Files;
+use actix_files::{Files, NamedFile};
 use actix_web::{
     App, HttpRequest, HttpResponse, HttpServer, Responder, guard, http::header,
     middleware::DefaultHeaders, web,
@@ -42,6 +42,7 @@ struct AppState {
     upstream_url: String,
     require_downstream_token: bool,
     public_port: u16,
+    csp_hashes: Vec<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -734,13 +735,24 @@ async fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2456);
     let state = web::Data::new(build_state().await.expect("gateway configuration"));
+    let script_hashes = state
+        .csp_hashes
+        .iter()
+        .map(|hash| format!(" 'sha256-{hash}'"))
+        .collect::<String>();
+    let content_security_policy = format!(
+        "default-src 'self'; script-src 'self'{script_hashes}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
+    );
     spawn_database_watchdog(state.clone());
     HttpServer::new(move || {
         App::new()
             .wrap(
                 DefaultHeaders::new()
                     .add((header::CACHE_CONTROL, "no-store"))
-                    .add((header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"))
+                    .add((
+                        header::CONTENT_SECURITY_POLICY,
+                        content_security_policy.clone(),
+                    ))
                     .add((header::REFERRER_POLICY, "no-referrer"))
                     .add((header::X_CONTENT_TYPE_OPTIONS, "nosniff")),
             )
@@ -866,6 +878,8 @@ fn routes(cfg: &mut web::ServiceConfig) {
             "/admin/api/v1/downstream-tokens/{id}",
             web::delete().to(revoke_downstream_legacy),
         )
+        .route("/admin/showcase", web::get().to(showcase))
+        .route("/admin/showcase/", web::get().to(showcase_redirect))
         .service(
             Files::new("/admin", "/app/static")
                 .index_file("index.html")
@@ -879,6 +893,34 @@ fn routes(cfg: &mut web::ServiceConfig) {
                     admin_host_allowed(host)
                 })),
         );
+}
+
+async fn showcase(req: HttpRequest) -> actix_web::Result<NamedFile> {
+    if !admin_host_allowed(
+        req.headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    ) {
+        return Err(actix_web::error::ErrorNotFound("not found"));
+    }
+    NamedFile::open_async("/app/static/showcase.html")
+        .await
+        .map_err(actix_web::error::ErrorNotFound)
+}
+
+async fn showcase_redirect(req: HttpRequest) -> HttpResponse {
+    if !admin_host_allowed(
+        req.headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default(),
+    ) {
+        return HttpResponse::NotFound().finish();
+    }
+    HttpResponse::PermanentRedirect()
+        .insert_header((header::LOCATION, "/admin/showcase"))
+        .finish()
 }
 
 async fn build_state() -> Result<AppState> {
@@ -951,7 +993,35 @@ async fn build_state() -> Result<AppState> {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(2456),
+        csp_hashes: static_script_hashes("/app/static"),
     })
+}
+
+fn static_script_hashes(root: &str) -> Vec<String> {
+    ["index.html", "showcase.html"]
+        .into_iter()
+        .filter_map(|name| std::fs::read_to_string(std::path::Path::new(root).join(name)).ok())
+        .flat_map(|html| inline_script_bodies(&html))
+        .map(|body| {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+            use sha2::{Digest, Sha256};
+            STANDARD.encode(Sha256::digest(body.as_bytes()))
+        })
+        .collect()
+}
+
+fn inline_script_bodies(html: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    let mut cursor = html;
+    while let Some(start) = cursor.find("<script>") {
+        let body_start = start + "<script>".len();
+        let Some(end) = cursor[body_start..].find("</script>") else {
+            break;
+        };
+        bodies.push(cursor[body_start..body_start + end].to_owned());
+        cursor = &cursor[body_start + end + "</script>".len()..];
+    }
+    bodies
 }
 
 fn database_url_with_password(url: String) -> Result<String> {
@@ -1652,9 +1722,10 @@ async fn delete_key(
     match state
         .vault
         // Request attempts retain a foreign key to the encrypted key row.
-        // “Delete” is therefore a durable revocation (disabled slot), which
-        // preserves audit evidence and keeps restart state authoritative.
-        .mutate(|vault| vault.set_enabled(path.into_inner(), false).map(|_| ()))
+        // “Delete” is therefore a durable retirement, which preserves audit
+        // evidence while removing the encrypted credential from all new
+        // routing and admin read surfaces.
+        .mutate(|vault| vault.delete(path.into_inner()))
         .await
     {
         Ok(()) => HttpResponse::NoContent().finish(),
@@ -4221,9 +4292,9 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        SseValidator, admin_host_allowed, eligible_key_count, parse_multimodal_request,
-        percent_encode_userinfo, upstream_endpoint, upstream_endpoint_for, validate_admin_token,
-        validate_chat_request, validate_chat_response,
+        SseValidator, admin_host_allowed, eligible_key_count, inline_script_bodies,
+        parse_multimodal_request, percent_encode_userinfo, upstream_endpoint,
+        upstream_endpoint_for, validate_admin_token, validate_chat_request, validate_chat_response,
     };
     use chrono::{Duration, Utc};
     use nvidia_build_lb_core::KeySummary;
@@ -4406,6 +4477,12 @@ mod tests {
             },
         ];
         assert_eq!(eligible_key_count(&keys), 0);
+    }
+
+    #[test]
+    fn csp_hash_source_parser_only_accepts_inline_bootstrap() {
+        let html = r#"<script src=\"/admin/app.js\"></script><script> boot(); </script>"#;
+        assert_eq!(inline_script_bodies(html), vec![" boot(); ".to_owned()]);
     }
 
     #[test]

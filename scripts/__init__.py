@@ -1,1 +1,0 @@
-"""Repository-managed operational scripts."""
