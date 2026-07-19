@@ -28,9 +28,9 @@ context에서도 `.venv`, `node_modules`, `target`, 빌드 산출물과 과거 �
 cargo fmt --all -- --check
 cargo test -p nvidia-build-lb-core
 cargo test -p nvidia-build-lb-gateway --bins
-test -z "$(git ls-files -- '*.py' '*.sh' '*.js')"
-npm --prefix apps/admin run check
-npm --prefix apps/admin run build
+test -z "$(git ls-files | awk 'tolower($0) ~ /\\.(py|pyw|sh|bash|zsh|js|mjs|cjs|jsx)$/ {print}')"
+bun run --cwd apps/admin check
+bun run --cwd apps/admin build
 ```
 
 최종 게이트에서만 `cargo test --workspace`, `cargo clippy --workspace --all-targets
