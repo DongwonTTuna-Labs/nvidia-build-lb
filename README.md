@@ -9,7 +9,10 @@ load balancer입니다. PostgreSQL(SQLx migration)이 운영 상태의 권위 �
 
 - `crates/core`: AES-256-GCM vault, downstream 토큰 해시, 라우터와 cooldown 상태
 - `crates/gateway`: OpenAI 호환 chat/streaming 및 embeddings·image·video·audio API,
-  관리자 API, PostgreSQL 동기화, Rust prestart/healthcheck/migration 바이너리
+  관리자 API, PostgreSQL 동기화, Rust prestart/healthcheck/migration 바이너리.
+  `main.rs`는 bootstrap/공통 경계, `admin.rs`는 운영 API, `proxy.rs`는
+  OpenAI·멀티모달 orchestration, `provider.rs`는 endpoint/response contract,
+  `streaming.rs`는 SSE·바이너리 검증을 담당합니다.
 - `apps/admin`: 접근성·반응형 SvelteKit 관리자 UI (`/admin`)
 - `migrations/sqlx`: SQLx 단일 migration 원본
 - `compose.yml`: PostgreSQL + migration + gateway 독립 스택

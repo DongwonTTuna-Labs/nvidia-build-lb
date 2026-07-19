@@ -5,7 +5,7 @@ export let active: AdminRouteId;
 export let onSelect: (route: AdminRouteId) => void;
 </script>
 
-<nav aria-label="관리 메뉴" class="nav">
+<nav aria-label="관리 메뉴" aria-describedby="nav-hint" class="nav">
   {#each adminRoutes as route}
     <a
       href={route.href}

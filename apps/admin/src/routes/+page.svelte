@@ -35,7 +35,7 @@ import { type AdminRouteId, adminRoutes } from "$lib/copy";
 
 // Secrets are deliberately kept outside Svelte's reactive state.
 const session = { token: "" };
-const custody = { token: "", credentialId: "" };
+const custody = { token: "", credentialId: "", authToken: "" };
 let authenticated = false;
 let active: AdminRouteId = "overview";
 let state: SnapshotState = "empty";
@@ -275,10 +275,16 @@ async function request(
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   const response = await fetch(path, { ...init, headers, cache: "no-store" });
   if (response.status === 401 && expectedAuthEpoch === authEpoch && authToken === session.token) {
+    const custodyOpen = Boolean(custody.token && custody.credentialId);
     clearSession();
-    error = "관리자 토큰이 만료되었거나 올바르지 않습니다. 다시 인증하세요.";
-    state = "error";
-    announcement = "인증이 만료되어 로그인 화면으로 돌아왔습니다.";
+    error = custodyOpen
+      ? "인증이 만료되었지만 일회성 접속 키를 폐기하기 전까지 보안 잠금 상태로 유지합니다. 다시 인증해 정리하세요."
+      : "관리자 토큰이 만료되었거나 올바르지 않습니다. 다시 인증하세요.";
+    state = custodyOpen ? "recovery" : "error";
+    secretCleanup = custodyOpen ? "manual" : secretCleanup;
+    announcement = custodyOpen
+      ? "접속 키 폐기 확인이 필요합니다."
+      : "인증이 만료되어 로그인 화면으로 돌아왔습니다.";
     void tick().then(() => adminInput?.focus({ preventScroll: true }));
   }
   return response;
@@ -600,6 +606,7 @@ async function issueClient(event: SubmitEvent) {
       throw new Error(responseMessage(payload, "접속 키를 발급하지 못했습니다."));
     custody.token = payload.token;
     custody.credentialId = payload.id ?? "";
+    custody.authToken = session.token;
     clientLabel = "";
     notice = "접속 키는 한 번만 표시됩니다. 저장한 뒤 지우고 닫으세요.";
     state = "success";
@@ -941,6 +948,7 @@ async function clearIssuedToken(
   if (secretField) secretField.value = "";
   custody.token = "";
   custody.credentialId = "";
+  custody.authToken = "";
   secretOpen = false;
   error = "";
   manualCleanupConfirmed = false;
@@ -1047,7 +1055,7 @@ onMount(() => {
     );
   };
   const onPageHide = () => {
-    const authSnapshot = session.token;
+    const authSnapshot = session.token || custody.authToken;
     const credentialSnapshot = custody.credentialId;
     if (credentialSnapshot) {
       // pagehide is not a reliable place to await network I/O. Keep a
@@ -1076,6 +1084,7 @@ onMount(() => {
       if (secretCleanup === "idle" || !custody.credentialId) {
         custody.token = "";
         custody.credentialId = "";
+        custody.authToken = "";
         secretOpen = false;
       } else {
         state = "recovery";
@@ -1189,7 +1198,7 @@ onMount(() => {
 
   {#if authenticated}
   <RouteNavigation active={active} onSelect={(route) => void selectRoute(route)} />
-  <p class="nav-hint">모바일에서는 좌우로 메뉴를 더 볼 수 있습니다.</p>
+  <p id="nav-hint" class="nav-hint">모바일에서는 좌우로 메뉴를 더 볼 수 있습니다.</p>
 
   <main id="main-content" aria-busy={loading}>
     <div class="route-heading"><p class="eyebrow">{routeTitle[active]}</p><h1 id="route-heading" bind:this={routeHeading} tabindex="-1">{routeTitle[active]}</h1><p class="muted">{routeDescription[active]}</p></div>
@@ -1224,6 +1233,7 @@ onMount(() => {
       probeState={probeState}
       lifecycleKeyId={lifecycleKeyId}
       sessionToken={session.token}
+      state={state}
       mutating={mutating}
       mutationState={mutationState}
       readinessReasons={readinessReasons}
@@ -1241,6 +1251,7 @@ onMount(() => {
       active={active}
       clients={clients}
       sessionToken={session.token}
+      state={state}
       mutating={mutating}
       mutationState={mutationState}
       onRevoke={(id, label, event) => openConfirmation("revoke", id, label, event)}

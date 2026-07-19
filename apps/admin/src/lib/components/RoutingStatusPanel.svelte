@@ -1,6 +1,6 @@
 <script lang="ts">
 import { actionLabel, formatDateTime } from "$lib/admin-format";
-import type { Key, ProfileCapability, SlotProjection } from "$lib/admin-types";
+import type { Key, ProfileCapability, SlotProjection, SnapshotState } from "$lib/admin-types";
 import StatusBadge from "$lib/components/StatusBadge.svelte";
 import type { AdminRouteId } from "$lib/copy";
 
@@ -9,6 +9,7 @@ export let keys: Key[];
 export let probeState: Record<string, "idle" | "pending" | "valid" | "invalid">;
 export let lifecycleKeyId: string;
 export let sessionToken: string;
+export let state: SnapshotState;
 export let mutating: boolean;
 export let mutationState: string;
 export let readinessReasons: string[];
@@ -25,11 +26,16 @@ function eligible(key: Key) {
 function probeStatus(key: Key) {
   return key.verified ? "valid" : probeState[key.id];
 }
+
+function mutationBlocked() {
+  return ["offline", "stale", "partial", "error", "recovery"].includes(state);
+}
 </script>
 
 <section id="routing" class:panel-hidden={active !== "routing"} class="panel" aria-labelledby="routing-title" hidden={active !== "routing"}>
   <h2 id="routing-title">두 슬롯의 상태</h2>
   <p class="muted">활성·cooldown 키만 새 요청을 받을 수 있습니다. 원문 키는 표시하지 않습니다.</p>
+  {#if mutationBlocked()}<p id="routing-mutation-blocked" class="attention" role="status" aria-live="polite">최신 상태를 확인하지 못해 변경 조작을 잠갔습니다. 먼저 상태를 다시 확인하세요.</p>{/if}
   <div class="table-wrap">
     <table>
       <caption class="sr-only">NVIDIA upstream 슬롯</caption>
@@ -49,9 +55,9 @@ function probeStatus(key: Key) {
               </td>
               <td data-label="누적">{key.request_count}회 요청 · {key.failure_count}회 실패</td>
               <td data-label="조작" class="actions">
-                <button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.verified ? "재검증" : "제공자 검증"}`} onclick={() => onProbe(key)} disabled={!sessionToken || mutating || mutationState !== "idle"}>{probe === "pending" ? "검증 중…" : key.verified ? "재검증" : "검증"}</button>
-                <button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.enabled ? "라우팅 제외" : "라우팅 포함"}`} onclick={() => onToggle(key)} disabled={!sessionToken || mutating || mutationState !== "idle" || (!key.enabled && probe !== "valid")}>{key.enabled ? "제외" : "포함"}</button>
-                <button class="danger" type="button" aria-label={`슬롯 ${index + 1} ${key.label} 영구 폐기`} onclick={(event) => onDelete("delete", key.id, key.label, event)} disabled={!sessionToken || mutating || mutationState !== "idle"}>영구 폐기</button>
+                <button class="secondary" type="button" aria-describedby={mutationBlocked() ? "routing-mutation-blocked" : undefined} aria-label={`슬롯 ${index + 1} ${key.label} ${key.verified ? "재검증" : "제공자 검증"}`} onclick={() => onProbe(key)} disabled={!sessionToken || mutationBlocked() || mutating || mutationState !== "idle"}>{probe === "pending" ? "검증 중…" : key.verified ? "재검증" : "검증"}</button>
+                <button class="secondary" type="button" aria-describedby={mutationBlocked() ? "routing-mutation-blocked" : undefined} aria-label={`슬롯 ${index + 1} ${key.label} ${key.enabled ? "라우팅 제외" : "라우팅 포함"}`} onclick={() => onToggle(key)} disabled={!sessionToken || mutationBlocked() || mutating || mutationState !== "idle" || (!key.enabled && probe !== "valid")}>{key.enabled ? "제외" : "포함"}</button>
+                <button class="danger" type="button" aria-describedby={mutationBlocked() ? "routing-mutation-blocked" : undefined} aria-label={`슬롯 ${index + 1} ${key.label} 영구 폐기`} onclick={(event) => onDelete("delete", key.id, key.label, event)} disabled={!sessionToken || mutationBlocked() || mutating || mutationState !== "idle"}>영구 폐기</button>
               </td>
             </tr>
           {:else}
@@ -96,6 +102,6 @@ function probeStatus(key: Key) {
   button { min-height: 44px; border: 0; border-radius: 6px; padding: 10px 14px; cursor: pointer; font: inherit; font-weight: 800; }
   button:disabled { opacity: .5; cursor: not-allowed; }
   .secondary { color: #f5f7f6; background: #30363a; }
-  .danger { color: #1b0909; background: #ff8a8a; }
+  .danger { color: #ff8a8a; background: transparent; border: 1px solid #ff8a8a; }
   @media (max-width: 767px) { .panel, .subpanel { padding: 16px; } .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; } .actions button { flex: 1 1 120px; } }
 </style>
