@@ -45,6 +45,7 @@ export let onSelect: (route: AdminRouteId) => void;
     .nav {
       gap: 4px;
       overflow-x: auto;
+      flex-wrap: nowrap;
       scrollbar-width: thin;
       padding-right: 52px;
       background: linear-gradient(90deg, transparent 0 calc(100% - 44px), #171a1d 100%);
