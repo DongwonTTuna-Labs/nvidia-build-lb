@@ -86,7 +86,6 @@ impl VaultStore {
         database: Option<PgPool>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file_vault = Vault::open(&path, master_key)?;
         let vault = if let Some(pool) = &database {
             sqlx::query("UPDATE nblb.request_attempts SET outcome='abandoned_after_restart', finished_at=now() WHERE finished_at IS NULL")
                 .execute(pool)
@@ -116,6 +115,11 @@ impl VaultStore {
                 .map(|(profile, slot)| (profile, slot.saturating_sub(1) as usize))
                 .collect::<BTreeMap<_, _>>();
             if keys.is_empty() && downstream.is_empty() && routing_state_empty {
+                // PostgreSQL is authoritative as soon as it contains any
+                // durable state.  Only consult the encrypted file fallback
+                // for a genuinely empty database; a corrupt rollback copy
+                // must not prevent a valid database-backed restart.
+                let file_vault = Vault::open(&path, master_key)?;
                 sync_database(pool, &file_vault).await?;
                 file_vault
             } else {
@@ -131,7 +135,7 @@ impl VaultStore {
                 )?
             }
         } else {
-            file_vault
+            Vault::open(&path, master_key)?
         };
         Ok(Self {
             vault: Mutex::new(vault),
@@ -172,7 +176,7 @@ impl VaultStore {
             }
             previous
         };
-        if let Err(error) = self.sync_unlocked().await {
+        if let Err(error) = self.sync_unlocked(Some(&previous)).await {
             let mut vault = self.vault.lock().map_err(|_| anyhow!("vault lock"))?;
             *vault = previous;
             vault.persist_for_rollback()?;
@@ -200,7 +204,7 @@ impl VaultStore {
                 return Err(error);
             }
         };
-        if let Err(error) = self.sync_unlocked().await {
+        if let Err(error) = self.sync_unlocked(Some(&previous)).await {
             let mut vault = self.vault.lock().map_err(|_| anyhow!("vault lock"))?;
             *vault = previous;
             vault.persist_for_rollback()?;
@@ -214,7 +218,7 @@ impl VaultStore {
             .await
     }
 
-    async fn sync_unlocked(&self) -> Result<()> {
+    async fn sync_unlocked(&self, previous: Option<&Vault>) -> Result<()> {
         let Some(pool) = &self.database else {
             return Ok(());
         };
@@ -226,7 +230,24 @@ impl VaultStore {
                 .collect::<BTreeMap<_, _>>();
             (vault.key_records()?, vault.downstream_records()?, cursors)
         };
-        sync_database_rows(pool, &keys, &downstream, &cursors).await
+        if let Some(previous) = previous {
+            let previous_cursors = PROFILES
+                .iter()
+                .map(|profile| ((*profile).to_owned(), previous.router_cursor_for(profile)))
+                .collect::<BTreeMap<_, _>>();
+            sync_database_delta(
+                pool,
+                &previous.key_records()?,
+                &previous.downstream_records()?,
+                &previous_cursors,
+                &keys,
+                &downstream,
+                &cursors,
+            )
+            .await
+        } else {
+            sync_database_rows(pool, &keys, &downstream, &cursors).await
+        }
     }
 
     async fn evidence(&self) -> Result<Value> {
@@ -411,6 +432,268 @@ async fn sync_database_rows(
         .context("persist routing cursor")?;
     }
     tx.commit().await.context("commit vault sync")?;
+    Ok(())
+}
+
+/// Applies only the fields changed by one local mutation.  A full in-memory
+/// snapshot is unsafe when two gateway processes share PostgreSQL: the later
+/// writer could restore an older enabled/verified/cooldown value or counter.
+/// Each changed field is guarded by its previous value while the transaction
+/// holds the advisory lock.  A concurrent change therefore fails closed and
+/// lets the caller roll the local mutation back instead of overwriting the
+/// fresher database state.
+async fn sync_database_delta(
+    pool: &PgPool,
+    previous_keys: &[VaultKeyRecord],
+    previous_downstream: &[VaultDownstreamRecord],
+    previous_cursors: &BTreeMap<String, usize>,
+    current_keys: &[VaultKeyRecord],
+    current_downstream: &[VaultDownstreamRecord],
+    current_cursors: &BTreeMap<String, usize>,
+) -> Result<()> {
+    let mut tx = pool.begin().await.context("begin incremental vault sync")?;
+    sqlx::query("SELECT pg_advisory_xact_lock(2147483647, 45291)")
+        .execute(&mut *tx)
+        .await
+        .context("lock incremental vault sync")?;
+
+    let previous_keys = previous_keys
+        .iter()
+        .map(|key| (key.id, key))
+        .collect::<HashMap<_, _>>();
+    for current in current_keys {
+        let Some(previous) = previous_keys.get(&current.id) else {
+            let result = sqlx::query(
+                "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(current.id)
+            .bind(&current.label)
+            .bind(&current.fingerprint)
+            .bind(&current.ciphertext)
+            .bind(&current.nonce)
+            .bind(current.enabled)
+            .bind(current.verified)
+            .bind(current.retired)
+            .bind(current.cooldown_until)
+            .bind(i64::try_from(current.request_count).context("key request count overflow")?)
+            .bind(i64::try_from(current.failure_count).context("key failure count overflow")?)
+            .execute(&mut *tx)
+            .await
+            .context("insert changed upstream key")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent upstream key insertion")
+            }
+            continue;
+        };
+        if current.enabled != previous.enabled {
+            let result =
+                sqlx::query("UPDATE nblb.upstream_keys SET enabled=$2 WHERE id=$1 AND enabled=$3")
+                    .bind(current.id)
+                    .bind(current.enabled)
+                    .bind(previous.enabled)
+                    .execute(&mut *tx)
+                    .await
+                    .context("update upstream enabled state")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent upstream enabled state")
+            }
+        }
+        if current.verified != previous.verified {
+            let result = sqlx::query(
+                "UPDATE nblb.upstream_keys SET verified=$2 WHERE id=$1 AND verified=$3",
+            )
+            .bind(current.id)
+            .bind(current.verified)
+            .bind(previous.verified)
+            .execute(&mut *tx)
+            .await
+            .context("update upstream verification state")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent upstream verification state")
+            }
+        }
+        if current.retired != previous.retired {
+            let result =
+                sqlx::query("UPDATE nblb.upstream_keys SET retired=$2 WHERE id=$1 AND retired=$3")
+                    .bind(current.id)
+                    .bind(current.retired)
+                    .bind(previous.retired)
+                    .execute(&mut *tx)
+                    .await
+                    .context("update upstream retirement state")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent upstream retirement state")
+            }
+        }
+        if current.cooldown_until != previous.cooldown_until {
+            let result = sqlx::query(
+                "UPDATE nblb.upstream_keys SET cooldown_until=$2 WHERE id=$1 AND cooldown_until IS NOT DISTINCT FROM $3",
+            )
+            .bind(current.id)
+            .bind(current.cooldown_until)
+            .bind(previous.cooldown_until)
+            .execute(&mut *tx)
+            .await
+            .context("update upstream cooldown")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent upstream cooldown")
+            }
+        }
+        if current.request_count != previous.request_count {
+            let current_count =
+                i64::try_from(current.request_count).context("key request count overflow")?;
+            let previous_count =
+                i64::try_from(previous.request_count).context("key request count overflow")?;
+            let delta = current_count
+                .checked_sub(previous_count)
+                .context("key request count delta overflow")?;
+            let result = sqlx::query(
+                "UPDATE nblb.upstream_keys SET request_count=GREATEST(0, request_count + $2) WHERE id=$1 AND request_count=$3",
+            )
+            .bind(current.id)
+            .bind(delta)
+            .bind(previous_count)
+            .execute(&mut *tx)
+            .await
+            .context("update upstream request count")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent upstream request count")
+            }
+        }
+        if current.failure_count != previous.failure_count {
+            let current_count =
+                i64::try_from(current.failure_count).context("key failure count overflow")?;
+            let previous_count =
+                i64::try_from(previous.failure_count).context("key failure count overflow")?;
+            let delta = current_count
+                .checked_sub(previous_count)
+                .context("key failure count delta overflow")?;
+            let result = sqlx::query(
+                "UPDATE nblb.upstream_keys SET failure_count=GREATEST(0, failure_count + $2) WHERE id=$1 AND failure_count=$3",
+            )
+            .bind(current.id)
+            .bind(delta)
+            .bind(previous_count)
+            .execute(&mut *tx)
+            .await
+            .context("update upstream failure count")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent upstream failure count")
+            }
+        }
+    }
+
+    let previous_downstream = previous_downstream
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<HashMap<_, _>>();
+    for current in current_downstream {
+        let Some(previous) = previous_downstream.get(&current.id) else {
+            let result = sqlx::query(
+                "INSERT INTO nblb.downstream_credentials (id, label, digest, scopes, active, request_count, last_used_at, created_at, revoked_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(current.id)
+            .bind(&current.label)
+            .bind(&current.token_digest)
+            .bind(&current.scopes)
+            .bind(current.active)
+            .bind(i64::try_from(current.request_count).context("downstream request count overflow")?)
+            .bind(current.last_used_at)
+            .bind(current.created_at)
+            .bind(current.revoked_at)
+            .execute(&mut *tx)
+            .await
+            .context("insert changed downstream credential")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent downstream credential insertion")
+            }
+            continue;
+        };
+        if current.active != previous.active {
+            let result = sqlx::query(
+                "UPDATE nblb.downstream_credentials SET active=$2 WHERE id=$1 AND active=$3",
+            )
+            .bind(current.id)
+            .bind(current.active)
+            .bind(previous.active)
+            .execute(&mut *tx)
+            .await
+            .context("update downstream active state")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent downstream active state")
+            }
+        }
+        if current.revoked_at != previous.revoked_at {
+            let result = sqlx::query(
+                "UPDATE nblb.downstream_credentials SET revoked_at=$2 WHERE id=$1 AND revoked_at IS NOT DISTINCT FROM $3",
+            )
+            .bind(current.id)
+            .bind(current.revoked_at)
+            .bind(previous.revoked_at)
+            .execute(&mut *tx)
+            .await
+            .context("update downstream revocation")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent downstream revocation")
+            }
+        }
+        if current.request_count != previous.request_count {
+            let current_count = i64::try_from(current.request_count)
+                .context("downstream request count overflow")?;
+            let previous_count = i64::try_from(previous.request_count)
+                .context("downstream request count overflow")?;
+            let delta = current_count
+                .checked_sub(previous_count)
+                .context("downstream request count delta overflow")?;
+            let result = sqlx::query(
+                "UPDATE nblb.downstream_credentials SET request_count=GREATEST(0, request_count + $2) WHERE id=$1 AND request_count=$3",
+            )
+            .bind(current.id)
+            .bind(delta)
+            .bind(previous_count)
+            .execute(&mut *tx)
+            .await
+            .context("update downstream request count")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent downstream request count")
+            }
+        }
+        if current.last_used_at != previous.last_used_at {
+            let result = sqlx::query(
+                "UPDATE nblb.downstream_credentials SET last_used_at=$2 WHERE id=$1 AND last_used_at IS NOT DISTINCT FROM $3",
+            )
+            .bind(current.id)
+            .bind(current.last_used_at)
+            .bind(previous.last_used_at)
+            .execute(&mut *tx)
+            .await
+            .context("update downstream last-used timestamp")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent downstream last-used timestamp")
+            }
+        }
+    }
+
+    for profile in PROFILES {
+        let previous = previous_cursors.get(profile).copied().unwrap_or_default();
+        let current = current_cursors.get(profile).copied().unwrap_or_default();
+        if previous.wrapping_sub(current) % 2 == 0 {
+            continue;
+        }
+        let previous_slot = i16::try_from(previous % 2 + 1).context("previous cursor overflow")?;
+        let result = sqlx::query(
+            "UPDATE nblb.routing_state SET next_slot=CASE WHEN next_slot=1 THEN 2 ELSE 1 END, generation=generation+1 WHERE profile_id=$1 AND next_slot=$2",
+        )
+        .bind(profile)
+        .bind(previous_slot)
+        .execute(&mut *tx)
+        .await
+        .context("update routing cursor")?;
+        if result.rows_affected() != 1 {
+            bail!("concurrent routing cursor")
+        }
+    }
+    tx.commit().await.context("commit incremental vault sync")?;
     Ok(())
 }
 
@@ -1244,6 +1527,9 @@ async fn probe_key(
     };
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if let Err(response) = quarantine_key(&state, id).await {
+            return response;
+        }
         return HttpResponse::UnprocessableEntity().json(json!({
             "probe_status": "invalid_credential",
             "status": status.as_u16(),
@@ -2842,7 +3128,16 @@ fn validate_chat_response(body: &[u8], stream: bool) -> Result<(), ()> {
     if object.keys().any(|key| {
         !matches!(
             key.as_str(),
-            "id" | "object" | "created" | "model" | "choices" | "usage"
+            "id" | "object"
+                | "created"
+                | "model"
+                | "choices"
+                | "usage"
+                | "system_fingerprint"
+                | "service_tier"
+                | "prompt_filter_results"
+                | "reasoning"
+                | "reasoning_content"
         )
     }) || object.get("object").and_then(Value::as_str) != Some("chat.completion")
         || object
@@ -2870,7 +3165,7 @@ fn validate_chat_response(body: &[u8], stream: bool) -> Result<(), ()> {
         if choice.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "index" | "message" | "finish_reason" | "logprobs"
+                "index" | "message" | "finish_reason" | "logprobs" | "content_filter_results"
             )
         }) || choice.get("index").and_then(Value::as_u64).is_none()
             || choice
@@ -2880,16 +3175,33 @@ fn validate_chat_response(body: &[u8], stream: bool) -> Result<(), ()> {
             return Err(());
         }
         let message = choice.get("message").and_then(Value::as_object).ok_or(())?;
-        if message
-            .keys()
-            .any(|key| !matches!(key.as_str(), "role" | "content"))
-            || message
-                .get("role")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
+        if message.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "role"
+                    | "content"
+                    | "tool_calls"
+                    | "function_call"
+                    | "refusal"
+                    | "audio"
+                    | "annotations"
+            )
+        }) || message
+            .get("role")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
             || message
                 .get("content")
                 .is_some_and(|value| !value.is_string() && !value.is_null())
+            || message
+                .get("refusal")
+                .is_some_and(|value| !value.is_string() && !value.is_null())
+            || message
+                .get("tool_calls")
+                .is_some_and(|value| !value.is_array())
+            || message
+                .get("annotations")
+                .is_some_and(|value| !value.is_array())
         {
             return Err(());
         }
@@ -2899,10 +3211,22 @@ fn validate_chat_response(body: &[u8], stream: bool) -> Result<(), ()> {
         if usage.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "prompt_tokens" | "completion_tokens" | "total_tokens"
+                "prompt_tokens"
+                    | "completion_tokens"
+                    | "total_tokens"
+                    | "prompt_tokens_details"
+                    | "completion_tokens_details"
             )
-        }) || usage.values().any(|value| value.as_u64().is_none())
-        {
+        }) || usage.iter().any(|(key, value)| {
+            if matches!(
+                key.as_str(),
+                "prompt_tokens" | "completion_tokens" | "total_tokens"
+            ) {
+                value.as_u64().is_none()
+            } else {
+                !value.is_object() && !value.is_null()
+            }
+        }) {
             return Err(());
         }
     }
@@ -3100,7 +3424,15 @@ impl SseValidator {
         if object.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "id" | "object" | "model" | "choices" | "created"
+                "id" | "object"
+                    | "model"
+                    | "choices"
+                    | "created"
+                    | "system_fingerprint"
+                    | "service_tier"
+                    | "usage"
+                    | "reasoning"
+                    | "reasoning_content"
             )
         }) {
             return Err(());
@@ -3134,18 +3466,33 @@ impl SseValidator {
         if choices.iter().any(|choice| {
             !choice.is_object()
                 || choice.as_object().is_some_and(|choice| {
-                    choice
-                        .keys()
-                        .any(|key| !matches!(key.as_str(), "index" | "delta" | "finish_reason"))
+                    choice.keys().any(|key| {
+                        !matches!(
+                            key.as_str(),
+                            "index"
+                                | "delta"
+                                | "finish_reason"
+                                | "logprobs"
+                                | "content_filter_results"
+                        )
+                    })
                 })
                 || choice.get("index").and_then(Value::as_u64).is_none()
                 || choice
                     .get("delta")
                     .and_then(Value::as_object)
                     .is_none_or(|delta| {
-                        delta
-                            .keys()
-                            .any(|key| !matches!(key.as_str(), "role" | "content"))
+                        delta.keys().any(|key| {
+                            !matches!(
+                                key.as_str(),
+                                "role"
+                                    | "content"
+                                    | "tool_calls"
+                                    | "function_call"
+                                    | "refusal"
+                                    | "audio"
+                            )
+                        })
                     })
                 || !choice
                     .get("finish_reason")
@@ -3916,6 +4263,8 @@ mod tests {
     fn chat_response_contract_rejects_provider_extras() {
         let valid = br#"{"id":"chat-1","object":"chat.completion","model":"z-ai/glm-5.2","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
         assert!(validate_chat_response(valid, false).is_ok());
+        let tool_call = br#"{"id":"chat-1","object":"chat.completion","model":"z-ai/glm-5.2","system_fingerprint":"fp","service_tier":"default","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}],"refusal":null},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"completion_tokens_details":{"reasoning_tokens":0}}}"#;
+        assert!(validate_chat_response(tool_call, false).is_ok());
         let leaked = br#"{"id":"chat-1","object":"chat.completion","model":"z-ai/glm-5.2","choices":[],"provider_secret":"do-not-forward"}"#;
         assert!(validate_chat_response(leaked, false).is_err());
     }
