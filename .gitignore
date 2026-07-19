@@ -1,6 +1,10 @@
 node_modules/
 target/
 .svelte-kit/
+__pycache__/
+*.py[cod]
+.coverage
+.ruff_cache/
 build/
 dist/
 .env

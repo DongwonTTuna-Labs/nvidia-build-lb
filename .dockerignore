@@ -1,5 +1,7 @@
 .git
 .omo
+**/__pycache__
+*.py[cod]
 tests
 docs
 DESIGN.md
