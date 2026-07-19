@@ -16,7 +16,9 @@ load balancer입니다. PostgreSQL(SQLx migration)이 운영 상태의 권위 �
 
 저장소의 구현 소스는 Rust와 Svelte/TypeScript만 사용합니다. 저장소에는 Python,
 셸 스크립트, 수동 JavaScript 소스를 두지 않으며, SvelteKit이 빌드 과정에서
-생성하는 브라우저 번들은 Git에 저장하지 않고 이미지에만 포함합니다.
+생성하는 브라우저 번들은 Git에 저장하지 않고 이미지에만 포함합니다. Docker
+context에서도 `.venv`, `node_modules`, `target`, 빌드 산출물과 과거 증거 디렉터리를
+제외해 레거시 파일이 이미지 빌드 경계에 들어오지 않도록 합니다.
 
 ## 빠른 검증
 

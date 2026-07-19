@@ -29,7 +29,8 @@ jobs:
           cargo clippy -p nvidia-build-lb-core -p nvidia-build-lb-gateway --all-targets -- -D warnings
       - name: Legacy source contract
         run: |
-          test -z "$(git ls-files -- '*.py' '*.sh' '*.js')"
+          legacy_files="$(git ls-files | grep -Ei '\.(py|pyw|sh|bash|zsh|js|jsx|mjs|cjs)$' || true)"
+          test -z "$legacy_files"
       - name: Svelte checks
         run: |
           npm --prefix apps/admin ci --ignore-scripts --no-audit --no-fund
