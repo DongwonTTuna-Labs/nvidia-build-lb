@@ -446,6 +446,17 @@ impl Vault {
             .collect()
     }
 
+    /// Reports whether a persisted key is retired without exposing its
+    /// encrypted material. Retired rows remain addressable only for
+    /// in-flight accounting and audit history.
+    pub fn is_retired(&self, id: Uuid) -> bool {
+        self.state
+            .keys
+            .iter()
+            .find(|key| key.id == id)
+            .is_none_or(|key| key.retired)
+    }
+
     /// Returns the persisted routing cursor used for restart continuity.
     pub fn router_cursor(&self) -> usize {
         self.state

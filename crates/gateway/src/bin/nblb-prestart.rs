@@ -91,15 +91,30 @@ fn validate_secret(name: &str, bytes: &[u8]) -> Result<()> {
                 bail!("admin token has an invalid shape")
             }
         }
-        "db_password" if bytes.is_empty() || bytes.len() > 1024 => {
+        "db_password"
+            if trim_secret_line_endings(bytes).is_empty()
+                || trim_secret_line_endings(bytes).len() > 1024 =>
+        {
             bail!("database password has an invalid size")
         }
-        "db_password" if bytes.iter().any(u8::is_ascii_control) => {
+        "db_password"
+            if trim_secret_line_endings(bytes)
+                .iter()
+                .any(u8::is_ascii_control) =>
+        {
             bail!("database password contains control characters")
         }
         _ => {}
     }
     Ok(())
+}
+
+fn trim_secret_line_endings(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && matches!(bytes[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
+    &bytes[..end]
 }
 
 fn write_runtime_secret(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -144,5 +159,12 @@ mod tests {
     fn validates_vault_key_size() {
         assert!(validate_secret("vault_master_key", &[0; 32]).is_ok());
         assert!(validate_secret("vault_master_key", &[0; 31]).is_err());
+    }
+
+    #[test]
+    fn accepts_database_password_line_endings_but_not_controls() {
+        assert!(validate_secret("db_password", b"password\n").is_ok());
+        assert!(validate_secret("db_password", b"password\r\n").is_ok());
+        assert!(validate_secret("db_password", b"pass\0word").is_err());
     }
 }

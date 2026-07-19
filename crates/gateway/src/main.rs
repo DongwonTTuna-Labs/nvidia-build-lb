@@ -32,6 +32,7 @@ use uuid::Uuid;
 const UPSTREAM_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
 const UPSTREAM_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const NVCF_POLL_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const STREAM_PRIME_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
 struct AppState {
     vault: VaultStore,
@@ -194,6 +195,13 @@ impl VaultStore {
             .lock()
             .map(|vault| vault.list())
             .unwrap_or_default()
+    }
+
+    fn is_retired(&self, id: Uuid) -> bool {
+        self.vault
+            .lock()
+            .map(|vault| vault.is_retired(id))
+            .unwrap_or(true)
     }
 
     fn list_downstream(&self) -> Vec<DownstreamSummary> {
@@ -1684,6 +1692,9 @@ async fn probe_key(
         return admin_unauthorized();
     }
     let id = path.into_inner();
+    if state.vault.is_retired(id) {
+        return HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}}));
+    }
     let credential = match state.vault.credential(id) {
         Ok(value) => value,
         Err(_) => {
@@ -2015,6 +2026,9 @@ async fn chat_completions(
                 {
                     Ok(response) => response,
                     Err(_) => {
+                        if let Err(response) = record_failure(&state, id, None).await {
+                            return response;
+                        }
                         if let Err(response) =
                             attempt_finished(&state, request_id, id, "failed").await
                         {
@@ -2092,20 +2106,28 @@ async fn chat_completions(
                         continue;
                     }
                     let upstream = Box::pin(response.bytes_stream());
-                    let (upstream, validator, prefix) = match prime_stream(upstream).await {
-                        Ok(value) => value,
-                        Err(_) => {
-                            if let Err(response) = record_failure(&state, id, None).await {
-                                return response;
+                    // Own the started attempt before awaiting the first SSE
+                    // frame. If the client disconnects while the provider is
+                    // silent, dropping this guard still closes the ledger row.
+                    let stream_guard = StreamAttemptGuard::new(state.clone(), request_id, id);
+                    let (upstream, validator, prefix) =
+                        match tokio::time::timeout(STREAM_PRIME_TIMEOUT, prime_stream(upstream))
+                            .await
+                        {
+                            Ok(Ok(value)) => value,
+                            _ => {
+                                stream_guard.terminal.store(true, Ordering::Release);
+                                if let Err(response) = record_failure(&state, id, None).await {
+                                    return response;
+                                }
+                                if let Err(response) =
+                                    attempt_finished(&state, request_id, id, "failed").await
+                                {
+                                    return response;
+                                }
+                                continue;
                             }
-                            if let Err(response) =
-                                attempt_finished(&state, request_id, id, "failed").await
-                            {
-                                return response;
-                            }
-                            continue;
-                        }
-                    };
+                        };
                     let downstream = chat_response_stream(
                         upstream,
                         validator,
@@ -2113,6 +2135,7 @@ async fn chat_completions(
                         state.clone(),
                         request_id,
                         id,
+                        stream_guard,
                     );
                     return HttpResponse::build(status)
                         .insert_header(("content-type", content_type))
@@ -2374,6 +2397,9 @@ async fn multimodal(
                     match poll_nvcf(&state.client, response, &endpoint, &credential).await {
                         Ok(response) => response,
                         Err(_) => {
+                            if let Err(response) = record_failure(&state, id, None).await {
+                                return response;
+                            }
                             if let Err(response) =
                                 attempt_finished(&state, request_id, id, "failed").await
                             {
@@ -3406,9 +3432,10 @@ fn mock_stream_response(
         upstream,
         SseValidator::default(),
         VecDeque::new(),
-        state,
+        state.clone(),
         request_id,
         key_id,
+        StreamAttemptGuard::new(state, request_id, key_id),
     );
     HttpResponse::Ok()
         .insert_header(("content-type", "text/event-stream"))
@@ -3573,6 +3600,17 @@ struct StreamAttemptGuard {
     terminal: Arc<AtomicBool>,
 }
 
+impl StreamAttemptGuard {
+    fn new(state: web::Data<AppState>, request_id: Uuid, key_id: Uuid) -> Self {
+        Self {
+            state,
+            request_id,
+            key_id,
+            terminal: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 impl Drop for StreamAttemptGuard {
     fn drop(&mut self) {
         if self.terminal.swap(true, Ordering::AcqRel) {
@@ -3615,6 +3653,7 @@ struct SseValidator {
     emitted: VecDeque<Bytes>,
     done: bool,
     frame_count: usize,
+    data_frame_count: usize,
     message_id: Option<String>,
     model: Option<String>,
 }
@@ -3651,7 +3690,7 @@ impl SseValidator {
         if !self.buffer.iter().all(u8::is_ascii_whitespace) {
             return Err(());
         }
-        if self.done && self.frame_count >= 2 {
+        if self.done && self.data_frame_count >= 1 {
             Ok(())
         } else {
             Err(())
@@ -3716,6 +3755,7 @@ impl SseValidator {
             self.done = true;
             return Ok(());
         }
+        self.data_frame_count = self.data_frame_count.saturating_add(1);
         let value: Value = serde_json::from_str(&data).map_err(|_| ())?;
         let object = value.as_object().ok_or(())?;
         if object.keys().any(|key| {
@@ -3810,23 +3850,11 @@ fn chat_response_stream(
     state: web::Data<AppState>,
     request_id: Uuid,
     key_id: Uuid,
+    guard: StreamAttemptGuard,
 ) -> impl Stream<Item = Result<Bytes, actix_web::Error>> {
-    let guard_state = state.clone();
     stream::unfold(
         (
-            upstream,
-            validator,
-            prefix,
-            state,
-            request_id,
-            key_id,
-            StreamAttemptGuard {
-                state: guard_state,
-                request_id,
-                key_id,
-                terminal: Arc::new(AtomicBool::new(false)),
-            },
-            false,
+            upstream, validator, prefix, state, request_id, key_id, guard, false,
         ),
         |(
             mut upstream,
