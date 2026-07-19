@@ -173,6 +173,7 @@ services:
       NVIDIA_BUILD_LB_ADMIN_TOKEN_FILE: /run/nvidia-build-lb/secrets/admin_token
       NVIDIA_BUILD_LB_BIND_PORT: 2456
       NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_QA_PUBLIC_PORT:-2456}
+      NBLB_QA_ALLOW_HOST_SECRET_OWNER: "1"
       NBLB_UPSTREAM_URL: https://integrate.api.nvidia.com/v1/chat/completions
       NBLB_REQUIRE_DOWNSTREAM_TOKEN: "0"
       SSL_CERT_FILE: /run/qa-ca/ca_cert

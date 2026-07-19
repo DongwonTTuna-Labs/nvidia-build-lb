@@ -90,6 +90,7 @@ docker run -d --name "$container_name" \
   --mount "type=bind,source=$secret_dir/db_password,target=/run/canonical-secrets/db_password,readonly" \
   --tmpfs /var/lib/nvidia-build-lb:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=65532,gid=65532 \
   -e NVIDIA_BUILD_LB_BIND_PORT=2456 -e NVIDIA_BUILD_LB_PUBLIC_PORT="${container_port}" \
+  -e NBLB_QA_ALLOW_HOST_SECRET_OWNER=1 \
   -e NBLB_UPSTREAM_URL=mock://local \
   "$RUN_TAG" >/dev/null
 for _ in $(seq 1 60); do

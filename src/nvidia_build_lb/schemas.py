@@ -2,16 +2,26 @@
 
 from typing import Annotated, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, JsonValue
 
 from nvidia_build_lb.config import NVIDIA_MODEL
 
 type StrictBoolean = Annotated[bool, Field(strict=True)]
 type StrictInteger = Annotated[int, Field(strict=True)]
 type PositiveTokenCount = Annotated[int, Field(ge=1, strict=True)]
-type SamplingTemperature = Annotated[float, Field(ge=0.0, le=2.0, strict=True)]
-type UnitInterval = Annotated[float, Field(ge=0.0, le=1.0, strict=True)]
-type Penalty = Annotated[float, Field(ge=-2.0, le=2.0, strict=True)]
+
+
+def _accept_json_integer(value: object) -> object:
+    """Accept JSON integer numbers without opening string/bool coercion."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return float(value)
+    return value
+
+
+type JsonNumber = Annotated[float, BeforeValidator(_accept_json_integer)]
+type SamplingTemperature = Annotated[JsonNumber, Field(ge=0.0, le=2.0, strict=True)]
+type UnitInterval = Annotated[JsonNumber, Field(ge=0.0, le=1.0, strict=True)]
+type Penalty = Annotated[JsonNumber, Field(ge=-2.0, le=2.0, strict=True)]
 
 
 class ChatMessage(BaseModel):
