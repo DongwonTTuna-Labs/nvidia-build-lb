@@ -25,6 +25,17 @@ secret scans are clean, `codex-lb` is unchanged and healthy, both application
 and infrastructure PRs have received current-head Codex LGTM, and the user has
 merged both PRs. Codex never merges a PR.
 
+### 1.0 Current repository baseline (2026-07-19)
+
+The shipping tree for this PR is the Rust workspace in `crates/core` and
+`crates/gateway`, SQLx migrations under `migrations/sqlx`, and the SvelteKit
+admin under `apps/admin`. The admin is installed with the committed npm
+lockfiles; there is no Bun lockfile or Node production server. The eight
+advertised profiles are the `PROFILES` registry in `crates/core/src/lib.rs`.
+All route and evidence requirements below are interpreted against this current
+tree; any older framework or seven-profile wording is retired prose, not an
+implementation requirement.
+
 ### 1.1 Exposed credential rule
 
 The two NVIDIA credentials exposed in conversation are compromised. They are
@@ -589,7 +600,7 @@ contracts/
   oracle/                     framework-neutral request/state/response fixtures
 migrations/                   forward-only SQLx PostgreSQL migrations
 scripts/
-  build/ qa/ ops/ release/    named Bun/Rust/shell entry points
+  build/ qa/ ops/ release/    named npm/Rust/shell entry points
 ```
 
 `nblb-domain` depends only on the standard library and narrowly justified pure
@@ -602,11 +613,11 @@ Store and NVIDIA do not depend on each other, Actix Web, or Svelte. Service depe
 HTTP depends on service/contracts. Only `apps/gateway` knows concrete adapters.
 The graph is checked in CI and cycles are forbidden.
 
-The root is a Cargo and Bun workspace. `Cargo.lock`, `rust-toolchain.toml`,
-`bun.lock`, root `package.json`, `biome.json`, `knip.json`, and strict shared
-`tsconfig.json` are committed. Rust is pinned to `1.96.0` and Bun to `1.3.14`.
-Svelte 5 and SvelteKit 2 exact versions are lockfile-owned. Bun is never a
-production server. Every local Rust crate uses `#![forbid(unsafe_code)]`; local
+The root is a Cargo workspace with an npm-managed Svelte admin. `Cargo.lock`,
+root and admin `package-lock.json` files, `package.json`, `biome.json`,
+`knip.json`, and strict TypeScript configuration are committed. Rust and
+Svelte/SvelteKit versions are lockfile-owned. Node is never a production
+server. Every local Rust crate uses `#![forbid(unsafe_code)]`; local
 unsafe has zero exceptions. Workspace lints deny warnings, panic/unwrap/expect
 outside tests, unchecked wire/storage arithmetic, and undocumented public API.
 
@@ -1149,7 +1160,7 @@ not secrets but are compacted only for L1 display.
 
 | Method and route | Visibility | Required scope | Success media/result |
 | --- | --- | --- | --- |
-| `GET /health` | loopback + public | none | minimal JSON ready/degraded |
+| `GET /health` | loopback + public | none | JSON `{status,ready,traffic_ready,eligible_keys}`; no secret or provider body |
 | `GET /v1/models` | loopback + public | `models:read` | OpenAI model list JSON |
 | `POST /v1/chat/completions` | loopback + public | `chat:write` | OpenAI/NVIDIA JSON or SSE |
 | `POST /v1/embeddings` | loopback + public | `embeddings:write` | OpenAI embedding JSON |
@@ -1565,7 +1576,7 @@ UUIDs/decimals/timestamps, wrong order, or wrong nullability are server defects
 and generated Rust/TypeScript validators reject them. UUID text is canonical
 lowercase hyphenated; `Decimal` is `0|[1-9][0-9]*`; timestamps are UTC RFC 3339
 with exactly six fractional digits and `Z`. Every array below has the stated
-order. The seven paginated/list common-snapshot endpoints are exactly `/overview`,
+order. The paginated/list common-snapshot endpoints are exactly `/overview`,
 `/upstream-slots`, `/downstream-credentials`, `/model-capabilities`,
 `/attentions`, `/events`, and the paginated `/operations`; each runs one
 `REPEATABLE READ READ ONLY` transaction and returns
@@ -1695,7 +1706,7 @@ one cleanup-only key. The two additional closed projections are:
 `currently_available_profiles` is the count 0..8 of profile rows with at least
 one such eligible slot. Both use the same repeatable-read snapshot and exact
 cooldown/capacity/manual/proof predicates as Models, so they cannot disagree
-with its seven rows.
+with its eight rows.
 
 `public_health` is external reachability, not a second spelling of structural
 `traffic_ready`. After the tunnel rollout reaches `dns_created`, one singleton
@@ -3028,7 +3039,7 @@ row to retirement-pending with null slot, and verifies both constraints before
 commit. The deferred slot constraint makes the intentional intermediate
 duplicate legal; the staged row leaves its unique index before commit. A
 retired fingerprint cannot be registered again. All
-seven v3 profiles are permanently enabled; there is no profile-enable column or
+eight v3 profiles are permanently enabled; there is no profile-enable column or
 mutation. `configured_pair` means
 both slots reference distinct decryptable assigned keys. A key can be
 configured while temporarily disabled or cooling. `eligible_now(key,profile)`
@@ -3429,7 +3440,7 @@ default-ACL/trigger contract.
 allocates one strictly increasing key-global sequence and one profile sequence,
 and stores both on the attempt. Terminal application locks the same key then
 profile and applies each projection only when its sequence is greater than the
-corresponding last-applied value. A full seven-profile probe terminal allocates
+corresponding last-applied value. A full eight-profile probe terminal allocates
 a new global sequence after all case attempts; a selected-profile probe terminal
 allocates a new profile sequence after its cases. Thus a later-started 401 can
 override a probe clear while an older 401 cannot.
@@ -3447,7 +3458,7 @@ The complete health transition table is:
 | ordinary 400/404/409/422, content policy, asset preparation/cleanup, tracked downstream consumer drop, cancellation | none | none |
 | ordinary valid upstream success | none | resets both cooldowns/streaks only; persistent states remain |
 | successful selected-profile probe | none | sets entitlement `ok`, protocol `clear`, resets cooldowns/streaks |
-| successful full seven-profile probe | sets global `clear` | applies the selected-profile probe transition to all seven rows |
+| successful full eight-profile probe | sets global `clear` | applies the selected-profile probe transition to all eight rows |
 
 No body text changes this table. A profile is ineligible when global state is
 invalid, entitlement is not-entitled/credits-exhausted, protocol is quarantined,
@@ -3935,7 +3946,7 @@ secret-free audit rows.
 First and second assignment set the new slot `enabled=true`. Replacement copies
 the occupied slot's enabled Boolean to the candidate in the same transaction;
 a disabled slot therefore remains disabled until the explicit enable mutation.
-The slot operation result, all seven eligibility rows, and cursor reset reflect
+The slot operation result, all eight eligibility rows, and cursor reset reflect
 that committed value—no lifecycle default may decide it.
 
 Reset is a long operation. Acceptance requires no other active operation, the
@@ -4195,7 +4206,7 @@ operation result exposes the credential ID and `secret_available:false`; a lost
 201 is reconciled as issued-but-unrecoverable and the UI offers only revoke then
 new issue. Lost mutation responses are otherwise reconciled by operation ID and
 a fresh overview. The UI never guesses whether a swap occurred. New downstream
-issuance and Hermes cutover require two assigned keys and all seven profiles
+issuance and Hermes cutover require two assigned keys and all eight profiles
 advertised; existing clients may continue in an explicitly degraded
 one-eligible-key state.
 
@@ -8946,7 +8957,7 @@ run UUID; a later row cannot compensate for an earlier failure:
 1. Revalidate hold/revocation, generation/image/schema/profile/evaluator/suite
    digests, two fresh distinct fingerprinted keys, no active QA permit, and
    `codex-lb` health. With Key A forced and alternates forbidden, execute all
-   seven profile case groups in manifest order, including every quality
+   eight profile case groups in manifest order, including every quality
    sub-attempt; then repeat independently with Key B. Every attempt receipt
    names only run/attempt/key/profile/case IDs, fingerprint, status class,
    latency, contract/suite/evaluator/shape/quality/predicate/cleanup digests,

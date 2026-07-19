@@ -26,11 +26,26 @@ for pair in aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; d
     -d '{"enabled":true}' "http://127.0.0.1:$port/admin/api/v1/upstream-keys/$key_id/state" >/dev/null
 done
 curl -fsS "http://127.0.0.1:$port/health" | jq -e '.ready == true and .traffic_ready == true and .eligible_keys == 2' >/dev/null
+curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/upstream-slots" | jq -e '.slots|length == 2 and all(.[]; (.profiles|length) == 8)' >/dev/null
+curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/model-capabilities" | jq -e '.models|length == 8' >/dev/null
+curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/generation-readiness" | jq -e '.ready == true and .available_profiles == 8' >/dev/null
 curl -fsS -H 'Authorization: Bearer smoke-admin' -H 'Content-Type: application/json' \
   -d '{"label":"smoke","scopes":["models:read","chat:write","embeddings:write","images:write","audio:write","media:write"]}' \
   "http://127.0.0.1:$port/admin/api/v1/downstream-credentials" >"$work/client.json"
 token=$(jq -er .token "$work/client.json")
 curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/models" | jq -e '.data|length == 8' >/dev/null
+for _ in 1 2 3 4; do
+  curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+    -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"distribution"}]}' \
+    "http://127.0.0.1:$port/v1/chat/completions" | jq -e '.object == "chat.completion"' >/dev/null
+done
+curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/upstream-keys" \
+  | jq -e '[.items[].request_count] | length == 2 and min >= 2' >/dev/null
+curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+  -d '{"model":"z-ai/glm-5.2","metadata":{"force_first_upstream_failure":true},"messages":[{"role":"user","content":"failover"}]}' \
+  "http://127.0.0.1:$port/v1/chat/completions" | jq -e '.object == "chat.completion"' >/dev/null
+curl -fsS -H 'Authorization: Bearer smoke-admin' "http://127.0.0.1:$port/admin/api/v1/upstream-keys" \
+  | jq -e '[.items[].failure_count] | max >= 1' >/dev/null
 curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
   -d '{"model":"z-ai/glm-5.2","stream":true,"messages":[{"role":"user","content":"smoke"}]}' \
   "http://127.0.0.1:$port/v1/chat/completions" | grep -Fx 'data: [DONE]' >/dev/null
@@ -64,4 +79,4 @@ transcription=$(curl -fsS -H "Authorization: Bearer $token" \
   -F 'model=nvidia/parakeet-ctc-1.1b' -F "file=@$work/audio.wav;type=audio/wav" \
   "http://127.0.0.1:$port/v1/audio/transcriptions")
 jq -e '.text == "NVIDIA Build LB"' <<<"$transcription" >/dev/null
-printf '%s\n' '{"status":"PASS","scope":"rust-gateway-mock","checks":["health","two-key-custody","scoped-token","models","streaming","multimodal"]}'
+printf '%s\n' '{"status":"PASS","scope":"rust-gateway-mock","checks":["health","authority","two-key-custody","scoped-token","read-surfaces","distribution","failover","models","streaming","multimodal"]}'

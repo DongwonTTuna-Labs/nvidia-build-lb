@@ -105,6 +105,8 @@ pub struct VaultKeyRecord {
     pub enabled: bool,
     /// Whether a provider probe has verified this credential after custody.
     pub verified: bool,
+    /// Whether this credential is retired but retained for request history.
+    pub retired: bool,
     /// Current cooldown deadline, if any.
     pub cooldown_until: Option<DateTime<Utc>>,
     /// Successful request count.
@@ -147,6 +149,8 @@ struct StoredKey {
     enabled: bool,
     #[serde(default)]
     verified: bool,
+    #[serde(default)]
+    retired: bool,
     cooldown_until: Option<DateTime<Utc>>,
     request_count: u64,
     failure_count: u64,
@@ -204,7 +208,7 @@ impl Vault {
         if state.version != 1 {
             bail!("unsupported vault version")
         }
-        if state.keys.len() > MAX_UPSTREAM_KEYS {
+        if state.keys.iter().filter(|key| !key.retired).count() > MAX_UPSTREAM_KEYS {
             bail!("at most two upstream credentials are supported")
         }
         let mut fingerprints = HashSet::with_capacity(state.keys.len());
@@ -247,7 +251,7 @@ impl Vault {
         downstream: Vec<VaultDownstreamRecord>,
         router_cursors: BTreeMap<String, usize>,
     ) -> Result<Self> {
-        if keys.len() > MAX_UPSTREAM_KEYS {
+        if keys.iter().filter(|key| !key.retired).count() > MAX_UPSTREAM_KEYS {
             bail!("at most two upstream credentials are supported")
         }
         let mut fingerprints = HashSet::with_capacity(keys.len());
@@ -273,6 +277,7 @@ impl Vault {
                     ciphertext: URL_SAFE_NO_PAD.encode(key.ciphertext),
                     enabled: key.enabled,
                     verified: key.verified,
+                    retired: key.retired,
                     cooldown_until: key.cooldown_until,
                     request_count: key.request_count,
                     failure_count: key.failure_count,
@@ -332,6 +337,7 @@ impl Vault {
                         .context("decode key ciphertext")?,
                     enabled: key.enabled,
                     verified: key.verified,
+                    retired: key.retired,
                     cooldown_until: key.cooldown_until,
                     request_count: key.request_count,
                     failure_count: key.failure_count,
@@ -378,17 +384,23 @@ impl Vault {
         {
             bail!("upstream credential already exists")
         }
-        // Reuse a disabled slot for rotation so request-attempt foreign keys
-        // remain valid while an operator replaces a failed credential.
-        let replacement = (self.state.keys.len() >= MAX_UPSTREAM_KEYS)
-            .then(|| self.state.keys.iter().position(|key| !key.enabled))
+        let active_count = self.state.keys.iter().filter(|key| !key.retired).count();
+        let replacement = (active_count >= MAX_UPSTREAM_KEYS)
+            .then(|| {
+                self.state
+                    .keys
+                    .iter()
+                    .position(|key| !key.retired && !key.enabled)
+            })
             .flatten();
-        if self.state.keys.len() >= MAX_UPSTREAM_KEYS && replacement.is_none() {
+        if active_count >= MAX_UPSTREAM_KEYS && replacement.is_none() {
             bail!("at most two upstream credentials are supported")
         }
-        let id = replacement
-            .map(|index| self.state.keys[index].id)
-            .unwrap_or_else(Uuid::new_v4);
+        if let Some(index) = replacement {
+            self.state.keys[index].retired = true;
+            self.state.keys[index].enabled = false;
+        }
+        let id = Uuid::new_v4();
         let mut nonce_bytes = [0_u8; 12];
         rng().fill(&mut nonce_bytes);
         let cipher = Aes256Gcm::new_from_slice(&self.master_key).context("cipher init")?;
@@ -406,22 +418,24 @@ impl Vault {
             // explicitly probes it against the configured provider.
             enabled: false,
             verified: false,
+            retired: false,
             cooldown_until: None,
             request_count: 0,
             failure_count: 0,
         };
-        if let Some(index) = replacement {
-            self.state.keys[index] = entry.clone();
-        } else {
-            self.state.keys.push(entry.clone());
-        }
+        self.state.keys.push(entry.clone());
         self.persist()?;
         Ok(summary(&entry))
     }
 
     /// Lists redacted credentials.
     pub fn list(&self) -> Vec<KeySummary> {
-        self.state.keys.iter().map(summary).collect()
+        self.state
+            .keys
+            .iter()
+            .filter(|key| !key.retired)
+            .map(summary)
+            .collect()
     }
 
     /// Returns the persisted routing cursor used for restart continuity.
@@ -562,7 +576,7 @@ impl Vault {
             .state
             .keys
             .iter_mut()
-            .find(|key| key.id == id)
+            .find(|key| key.id == id && !key.retired)
             .ok_or_else(|| anyhow!("key not found"))?;
         if enabled && !key.verified {
             bail!("provider probe is required before enabling key")
@@ -583,7 +597,7 @@ impl Vault {
             .state
             .keys
             .iter_mut()
-            .find(|key| key.id == id)
+            .find(|key| key.id == id && !key.retired)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.verified = true;
         key.cooldown_until = None;
@@ -595,11 +609,19 @@ impl Vault {
 
     /// Deletes a key.
     pub fn delete(&mut self, id: Uuid) -> Result<()> {
-        let before = self.state.keys.len();
-        self.state.keys.retain(|key| key.id != id);
-        if before == self.state.keys.len() {
-            bail!("key not found")
-        }
+        let key = self
+            .state
+            .keys
+            .iter_mut()
+            .find(|key| key.id == id && !key.retired)
+            .ok_or_else(|| anyhow!("key not found"))?;
+        // Keep the encrypted row so request_attempts foreign keys and audit
+        // history remain valid, but make the credential permanently absent
+        // from routing and admin read surfaces.
+        key.retired = true;
+        key.enabled = false;
+        key.verified = false;
+        key.cooldown_until = None;
         self.persist()
     }
 
@@ -611,7 +633,7 @@ impl Vault {
             .state
             .keys
             .iter_mut()
-            .find(|key| key.id == id)
+            .find(|key| key.id == id && !key.retired)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.enabled = false;
         key.verified = false;
@@ -628,6 +650,9 @@ impl Vault {
             .state
             .keys
             .iter()
+            // Retired ciphertext remains decryptable for an in-flight retry
+            // or audit recovery, but it is never returned by `list()` and is
+            // therefore never selected for new traffic.
             .find(|key| key.id == id)
             .ok_or_else(|| anyhow!("key not found"))?;
         let nonce = URL_SAFE_NO_PAD.decode(&key.nonce).context("decode nonce")?;
@@ -650,7 +675,7 @@ impl Vault {
             .state
             .keys
             .iter_mut()
-            .find(|key| key.id == id)
+            .find(|key| key.id == id && !key.retired)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.request_count = key.request_count.saturating_add(1);
         key.failure_count = 0;
@@ -664,7 +689,7 @@ impl Vault {
             .state
             .keys
             .iter_mut()
-            .find(|key| key.id == id)
+            .find(|key| key.id == id && !key.retired)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.failure_count = key.failure_count.saturating_add(1);
         let delay = retry_after
@@ -738,7 +763,10 @@ impl Router {
         for offset in 0..keys.len() {
             let index = (self.next_slot + offset) % keys.len();
             let candidate = &keys[index];
-            if candidate.enabled && candidate.cooldown_until.is_none_or(|until| until <= now) {
+            if candidate.enabled
+                && candidate.verified
+                && candidate.cooldown_until.is_none_or(|until| until <= now)
+            {
                 self.next_slot = (index + 1) % keys.len();
                 return Some(candidate.id);
             }
@@ -924,6 +952,35 @@ mod tests {
     }
 
     #[test]
+    fn router_skips_enabled_keys_without_probe_receipt() {
+        let mut router = Router::default();
+        let keys = [
+            KeySummary {
+                id: Uuid::from_u128(1),
+                label: "unverified".into(),
+                fingerprint: "a".into(),
+                enabled: true,
+                verified: false,
+                cooldown_until: None,
+                request_count: 0,
+                failure_count: 0,
+            },
+            KeySummary {
+                id: Uuid::from_u128(2),
+                label: "verified".into(),
+                fingerprint: "b".into(),
+                enabled: true,
+                verified: true,
+                cooldown_until: None,
+                request_count: 0,
+                failure_count: 0,
+            },
+        ];
+        assert_eq!(router.select(&keys), Some(keys[1].id));
+        assert_eq!(router.select(&keys[..1]), None);
+    }
+
+    #[test]
     fn failure_cooldown_and_profile_cursor_survive_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault.json");
@@ -1098,12 +1155,49 @@ mod tests {
         let replacement = vault
             .add("replacement", "nvapi-0123456789abcdefghijklmnopqrstuvwxyz")
             .expect("replace disabled slot");
-        assert_eq!(replacement.id, first.id);
+        assert_ne!(replacement.id, first.id);
         assert!(!replacement.enabled);
-        assert!(!vault.key_records().expect("records")[0].verified);
+        let records = vault.key_records().expect("records");
+        assert_eq!(records.len(), 3);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.id == first.id && record.retired)
+        );
         assert_eq!(
-            vault.credential(first.id).expect("decrypt replacement"),
+            vault
+                .credential(replacement.id)
+                .expect("decrypt replacement"),
             "nvapi-0123456789abcdefghijklmnopqrstuvwxyz"
         );
+        assert_eq!(
+            vault.credential(first.id).expect("decrypt retired key"),
+            "nvapi-abcdefghijklmnopqrstuvwxyz123456"
+        );
+    }
+
+    #[test]
+    fn deleting_key_retires_row_without_breaking_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut vault = Vault::open(dir.path().join("vault.json"), [7; 32]).expect("open");
+        let key = vault
+            .add("history", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .expect("add");
+        vault.mark_verified(key.id).expect("probe");
+        vault.set_enabled(key.id, true).expect("enable");
+        vault.delete(key.id).expect("retire");
+
+        assert!(vault.list().is_empty());
+        assert_eq!(vault.key_records().expect("records").len(), 1);
+        assert!(
+            vault
+                .key_records()
+                .expect("records")
+                .into_iter()
+                .next()
+                .expect("retired row")
+                .retired
+        );
+        assert!(vault.set_enabled(key.id, false).is_err());
     }
 }

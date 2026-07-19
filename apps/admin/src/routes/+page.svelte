@@ -40,6 +40,41 @@ type Evidence = {
   persisted_routing_profiles: number;
   persisted_request_attempts?: number;
 };
+type Attention = {
+  id?: string;
+  resource?: { kind?: string; id?: string };
+  code: string;
+  label?: string;
+  next_action: string;
+  expires_at?: string | null;
+};
+type Check = {
+  id: string;
+  label: string;
+  status: string;
+  request_count: number;
+  failure_count: number;
+};
+type Recommendation = { action: string; label: string; route: AdminRouteId; reason: string };
+type PublicHealth = { hostname: string; status: string; next_action: string };
+type ProfileCapability = {
+  id: string;
+  route: string;
+  advertised: boolean;
+  available_now: boolean;
+  modalities: string[];
+};
+type SlotProfile = { profile_id: string; eligible_now: boolean; reason: string | null };
+type SlotProjection = { slot_no: number; key_id: string; profiles: SlotProfile[] };
+type AdminEvent = {
+  id: string;
+  kind?: string;
+  outcome?: string;
+  created_at?: string;
+  profile_id?: string;
+  request_id?: string;
+  key_id?: string;
+};
 
 const supportedScopes = [
   ["models:read", "모델 조회"],
@@ -100,6 +135,7 @@ let loading = false;
 let mutating = false;
 let mutationState: MutationState = "idle";
 let error = "";
+let clientError = "";
 let notice = "";
 let updatedAt = "";
 let upstreamLabel = "";
@@ -145,6 +181,26 @@ let pollingHandle: number | null = null;
 type ClipboardWriteOwner = { canceled: boolean; shouldClear: boolean };
 let clipboardWriteOwner: ClipboardWriteOwner | null = null;
 let lifecycleKeyId = "";
+let recommendation: Recommendation = {
+  action: "add_upstream_key",
+  label: "라우팅에서 키 구성",
+  route: "routing",
+  reason: "현재 서버 추천을 확인하지 못했습니다.",
+};
+let attentions: Attention[] = [];
+let checks: Check[] = [];
+let publicHealth: PublicHealth = {
+  hostname: "nvidia-lb.dongwontuna.net",
+  status: "not_verified",
+  next_action: "verify_public_route",
+};
+let lastOperation = "확인 전";
+let profileCapabilities: ProfileCapability[] = [];
+let slotProjections: SlotProjection[] = [];
+let adminEvents: AdminEvent[] = [];
+let readinessReasons: string[] = [];
+let selectedEvent: AdminEvent | null = null;
+let eventDialog: HTMLDialogElement;
 
 function routeFromHash() {
   const raw = location.hash.slice(1);
@@ -207,6 +263,24 @@ function clearSession() {
   clients = [];
   models = [];
   lifecycleKeyId = "";
+  recommendation = {
+    action: "add_upstream_key",
+    label: "라우팅에서 키 구성",
+    route: "routing",
+    reason: "현재 서버 추천을 확인하지 못했습니다.",
+  };
+  attentions = [];
+  checks = [];
+  publicHealth = {
+    hostname: "nvidia-lb.dongwontuna.net",
+    status: "not_verified",
+    next_action: "verify_public_route",
+  };
+  lastOperation = "확인 전";
+  profileCapabilities = [];
+  slotProjections = [];
+  adminEvents = [];
+  readinessReasons = [];
   updatedAt = "";
   evidence = {
     source_of_truth: "확인 전",
@@ -225,6 +299,7 @@ function logout() {
   clearSession();
   state = "empty";
   error = "";
+  clientError = "";
   notice = "로그아웃했습니다.";
   announcement = "관리자 인증이 필요합니다.";
 }
@@ -245,11 +320,11 @@ function responseMessage(body: unknown, fallback: string) {
 }
 
 function requestAvailable() {
-  return !loading && eligibleKeys > 0 && !["offline", "stale", "error", "recovery"].includes(state);
+  return !loading && trafficReady && eligibleKeys > 0 && ["ready", "success"].includes(state);
 }
 
 function mutationAllowed() {
-  return !loading && !["offline", "stale", "error", "recovery"].includes(state);
+  return !loading && !["offline", "stale", "partial", "error", "recovery"].includes(state);
 }
 
 function validKey(value: unknown): value is Key {
@@ -288,6 +363,88 @@ function formatDateTime(value: string) {
     : parsed.toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
 }
 
+function actionLabel(action: string) {
+  return (
+    {
+      probe: "제공자 검증",
+      inspect_routing: "라우팅 원인 확인",
+      verify_public_route: "공개 경로 확인",
+      add_upstream_key: "NVIDIA 키 추가",
+      probe_upstream_key: "NVIDIA 키 검증",
+      routing: "라우팅 상태 확인",
+      evidence: "증거 상세 확인",
+    }[action] ?? "상태 확인"
+  );
+}
+
+function attentionLabel(code: string) {
+  return (
+    {
+      upstream_cooldown: "제공자 대기 중",
+      probe_required: "제공자 검증 필요",
+      upstream_disabled: "라우팅에서 중지됨",
+    }[code] ?? "확인 필요한 상태"
+  );
+}
+
+function attentionTarget(attention: Attention): AdminRouteId {
+  if (attention.next_action === "evidence") return "evidence";
+  return "routing";
+}
+
+async function handleAttention(attention: Attention) {
+  const keyId = attention.resource?.id ?? attention.id;
+  if (attention.next_action === "probe" && keyId) {
+    const key = keys.find((candidate) => candidate.id === keyId);
+    if (key) {
+      await probeKey(key);
+      return;
+    }
+  }
+  await selectRoute(attentionTarget(attention));
+}
+
+async function openEvent(event: AdminEvent) {
+  selectedEvent = event;
+  if (session.token && event.id) {
+    try {
+      const response = await request(`/admin/api/v1/events/${event.id}`);
+      const payload = (await response.json().catch(() => ({}))) as { operation?: AdminEvent };
+      if (response.ok && payload.operation) selectedEvent = { ...event, ...payload.operation };
+    } catch {
+      // The list row is still useful when the optional detail request fails.
+    }
+  }
+  eventDialog?.showModal();
+}
+
+function checkStatusLabel(status: string) {
+  return (
+    {
+      eligible: "사용 가능",
+      cooldown: "일시 대기",
+      disabled: "중지됨",
+      probe_required: "검증 필요",
+    }[status] ?? "확인 필요"
+  );
+}
+
+function eventKindLabel(kind: string) {
+  return kind === "request_attempt" ? "요청 시도" : "운영 이벤트";
+}
+
+function outcomeLabel(outcome: string) {
+  return (
+    {
+      succeeded: "성공",
+      failed: "실패",
+      started: "진행 중",
+      cancelled: "취소됨",
+      abandoned_after_restart: "재시작 후 종료",
+    }[outcome] ?? "확인 필요"
+  );
+}
+
 async function request(
   path: string,
   init: RequestInit = {},
@@ -317,6 +474,7 @@ async function refresh() {
   loading = true;
   state = "loading";
   error = "";
+  clientError = "";
   notice = "";
   const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -332,9 +490,6 @@ async function refresh() {
       ? Number(health.eligible_keys)
       : 0;
     if (epoch !== refreshEpoch || currentAuthEpoch !== authEpoch) return;
-    structuralReady = healthReady;
-    trafficReady = healthTrafficReady;
-    eligibleKeys = healthEligibleKeys;
     const response = await request(
       "/admin/api/v1/overview",
       { signal: controller.signal },
@@ -350,8 +505,16 @@ async function refresh() {
       downstream_credentials?: { items?: Client[] };
       models?: string[];
       evidence?: Evidence;
+      server_recommendation?: Recommendation;
+      attentions?: Attention[];
+      checks?: Check[];
+      public_health?: PublicHealth;
+      last_operation?: { observed_at?: string };
     };
     if (epoch !== refreshEpoch || currentAuthEpoch !== authEpoch) return;
+    structuralReady = healthReady;
+    trafficReady = healthTrafficReady;
+    eligibleKeys = healthEligibleKeys;
     keys = Array.isArray(snapshot.upstream_keys?.items)
       ? snapshot.upstream_keys.items.filter(validKey)
       : [];
@@ -363,6 +526,13 @@ async function refresh() {
       ? snapshot.models.filter((model): model is string => typeof model === "string")
       : [];
     evidence = snapshot.evidence ?? evidence;
+    if (snapshot.server_recommendation?.route) recommendation = snapshot.server_recommendation;
+    attentions = Array.isArray(snapshot.attentions) ? snapshot.attentions : [];
+    checks = Array.isArray(snapshot.checks) ? snapshot.checks : [];
+    if (snapshot.public_health) publicHealth = snapshot.public_health;
+    lastOperation = snapshot.last_operation?.observed_at
+      ? formatDateTime(snapshot.last_operation.observed_at)
+      : updatedAt;
     structuralReady = healthReady && snapshot.runtime?.ready === true;
     trafficReady = healthTrafficReady && snapshot.runtime?.traffic_ready === true;
     eligibleKeys = Math.min(
@@ -371,14 +541,86 @@ async function refresh() {
         ? Number(snapshot.runtime?.eligible_keys)
         : 0,
     );
-    state = keys.length === 0 ? "empty" : trafficReady ? "ready" : "degraded";
+    const [capabilitiesResponse, slotsResponse, readinessResponse, eventsResponse] =
+      await Promise.all([
+        request(
+          "/admin/api/v1/model-capabilities",
+          { signal: controller.signal },
+          session.token,
+          currentAuthEpoch,
+        ),
+        request(
+          "/admin/api/v1/upstream-slots",
+          { signal: controller.signal },
+          session.token,
+          currentAuthEpoch,
+        ),
+        request(
+          "/admin/api/v1/generation-readiness",
+          { signal: controller.signal },
+          session.token,
+          currentAuthEpoch,
+        ),
+        request(
+          "/admin/api/v1/events?limit=8",
+          { signal: controller.signal },
+          session.token,
+          currentAuthEpoch,
+        ),
+      ]);
+    if (epoch !== refreshEpoch || currentAuthEpoch !== authEpoch) return;
+    let partial = false;
+    if (capabilitiesResponse.ok) {
+      const payload = (await capabilitiesResponse.json()) as { models?: ProfileCapability[] };
+      profileCapabilities = Array.isArray(payload.models) ? payload.models : [];
+    } else {
+      profileCapabilities = [];
+      partial = true;
+    }
+    if (slotsResponse.ok) {
+      const payload = (await slotsResponse.json()) as { slots?: SlotProjection[] };
+      slotProjections = Array.isArray(payload.slots) ? payload.slots : [];
+    } else {
+      slotProjections = [];
+      partial = true;
+    }
+    if (readinessResponse.ok) {
+      const payload = (await readinessResponse.json()) as { reasons?: string[] };
+      readinessReasons = Array.isArray(payload.reasons) ? payload.reasons : [];
+    } else {
+      readinessReasons = ["readiness_snapshot_unavailable"];
+      partial = true;
+    }
+    if (eventsResponse.ok) {
+      const payload = (await eventsResponse.json()) as { events?: AdminEvent[] };
+      adminEvents = Array.isArray(payload.events) ? payload.events : [];
+    } else {
+      adminEvents = [];
+      partial = true;
+    }
+    mutationState = "idle";
+    state = partial ? "partial" : keys.length === 0 ? "empty" : trafficReady ? "ready" : "degraded";
     updatedAt = formatDateTime(new Date().toISOString());
-    announcement = "상태를 새로 확인했습니다.";
+    announcement = partial
+      ? "일부 운영 정보를 확인하지 못했습니다. 표시된 정보만 현재 값으로 취급하세요."
+      : "상태를 새로 확인했습니다.";
   } catch (caught) {
     if (caught instanceof DOMException && caught.name === "AbortError") {
       if (epoch !== refreshEpoch) return;
       error = "상태 확인 시간이 초과되었습니다. 다시 확인하세요.";
-      state = navigator.onLine === false ? "offline" : keys.length > 0 ? "stale" : "error";
+      resetReadData();
+      state = navigator.onLine === false ? "offline" : "error";
+      structuralReady = false;
+      eligibleKeys = 0;
+      profileCapabilities = [];
+      slotProjections = [];
+      readinessReasons = ["snapshot_stale"];
+      publicHealth = {
+        ...publicHealth,
+        status: "not_verified",
+        next_action: "verify_public_route",
+      };
+      lastOperation = "확인 필요";
       trafficReady = false;
       announcement = "상태 확인이 시간 초과되어 다시 확인이 필요합니다.";
       return;
@@ -386,12 +628,44 @@ async function refresh() {
     if (epoch !== refreshEpoch || currentAuthEpoch !== authEpoch) return;
     const message = caught instanceof Error ? caught.message : "상태를 읽지 못했습니다.";
     error = message;
-    state = navigator.onLine === false ? "offline" : keys.length > 0 ? "stale" : "error";
+    resetReadData();
+    state = navigator.onLine === false ? "offline" : "error";
+    structuralReady = false;
+    eligibleKeys = 0;
+    profileCapabilities = [];
+    slotProjections = [];
+    readinessReasons = ["snapshot_stale"];
+    publicHealth = { ...publicHealth, status: "not_verified", next_action: "verify_public_route" };
+    lastOperation = "확인 필요";
     trafficReady = false;
   } finally {
     clearTimeout(timeout);
     if (epoch === refreshEpoch) loading = false;
   }
+}
+
+function resetReadData() {
+  structuralReady = false;
+  trafficReady = false;
+  eligibleKeys = 0;
+  keys = [];
+  models = [];
+  clients = [];
+  evidence = {
+    source_of_truth: "확인 필요",
+    persisted_upstream_keys: 0,
+    persisted_downstream_credentials: 0,
+    persisted_routing_profiles: 0,
+    persisted_request_attempts: 0,
+  };
+  attentions = [];
+  checks = [];
+  profileCapabilities = [];
+  slotProjections = [];
+  adminEvents = [];
+  readinessReasons = ["snapshot_stale"];
+  publicHealth = { ...publicHealth, status: "not_verified", next_action: "verify_public_route" };
+  lastOperation = "확인 필요";
 }
 
 async function login(event: SubmitEvent) {
@@ -460,10 +734,11 @@ async function addUpstream(event: SubmitEvent) {
 
 async function issueClient(event: SubmitEvent) {
   event.preventDefault();
-  if (mutating || clientScopes.length === 0 || !mutationAllowed()) return;
+  if (mutating || clientScopes.length === 0 || eligibleKeys !== 2 || !mutationAllowed()) return;
   const label = clientLabel.trim();
   if (!label) {
     error = "접속 키 라벨을 입력하세요.";
+    clientError = error;
     return;
   }
   mutating = true;
@@ -473,6 +748,7 @@ async function issueClient(event: SubmitEvent) {
   mutationController = controller;
   mutationState = "pending";
   error = "";
+  clientError = "";
   let body = JSON.stringify({ label, scopes: clientScopes });
   try {
     const response = await request("/admin/api/v1/downstream-credentials", {
@@ -506,6 +782,7 @@ async function issueClient(event: SubmitEvent) {
   } catch (caught) {
     if (controller.signal.aborted || operation !== mutationEpoch) return;
     error = caught instanceof Error ? caught.message : "접속 키 발급 결과를 확인하지 못했습니다.";
+    clientError = error;
     state = caught instanceof TypeError ? "recovery" : "error";
     mutationState = caught instanceof TypeError ? "unknown" : "reconcile";
   } finally {
@@ -879,6 +1156,24 @@ onMount(() => {
         if (!historyCompensationPending) {
           historyCompensationPending = true;
           history.go(routeHistoryIndex - targetIndex);
+        } else {
+          // A second Back/Forward can arrive while the first compensation is
+          // still travelling. Continue until the browser is back at the
+          // custody-protected entry instead of silently accepting the latest
+          // route.
+          history.go(routeHistoryIndex - targetIndex);
+        }
+      } else if (historyCompensationPending) {
+        historyCompensationPending = false;
+        const compensatedTarget = pendingHistoryTarget;
+        pendingHistoryTarget = null;
+        history.replaceState(
+          { nvidiaRouteIndex: routeHistoryIndex, nvidiaScroll: window.scrollY },
+          "",
+          `#${active}`,
+        );
+        if (compensatedTarget !== null) {
+          announcement = "일회성 접속 키가 열려 있어 이동을 되돌렸습니다.";
         }
       } else {
         const compensatedTarget = pendingHistoryTarget;
@@ -901,9 +1196,24 @@ onMount(() => {
     pendingHistoryTarget = null;
     void selectRoute(normalizedRoute(location.hash.slice(1)), true);
   };
+  const onScroll = () => {
+    history.replaceState(
+      { ...(history.state ?? {}), nvidiaScroll: window.scrollY },
+      "",
+      location.href,
+    );
+  };
   const onPageHide = () => {
     const authSnapshot = session.token;
     const credentialSnapshot = custody.credentialId;
+    if (credentialSnapshot) {
+      // pagehide is not a reliable place to await network I/O. Keep a
+      // recovery-visible custody marker synchronously so a bfcache restore
+      // cannot present an apparently clean session when revoke was unproved.
+      state = "recovery";
+      error = "페이지를 떠나는 동안 접속 키 폐기를 확인 중입니다. 복귀 후 상태를 다시 확인하세요.";
+      announcement = "접속 키 폐기 확인이 필요합니다.";
+    }
     refreshController?.abort();
     mutationController?.abort();
     mutationEpoch += 1;
@@ -959,6 +1269,13 @@ onMount(() => {
     if (session.token) void refresh();
   };
   const onOffline = () => {
+    structuralReady = false;
+    eligibleKeys = 0;
+    profileCapabilities = [];
+    slotProjections = [];
+    readinessReasons = ["offline"];
+    publicHealth = { ...publicHealth, status: "not_verified", next_action: "verify_public_route" };
+    lastOperation = "확인 필요";
     trafficReady = false;
     state = "offline";
     announcement = "오프라인 상태입니다. 연결되면 다시 확인하세요.";
@@ -969,6 +1286,7 @@ onMount(() => {
     }
   }, 10_000);
   addEventListener("hashchange", onHash);
+  addEventListener("scroll", onScroll, { passive: true });
   addEventListener("popstate", onHash);
   addEventListener("pagehide", onPageHide);
   addEventListener("pageshow", onPageShow);
@@ -978,6 +1296,7 @@ onMount(() => {
   return () => {
     refreshController?.abort();
     removeEventListener("hashchange", onHash);
+    removeEventListener("scroll", onScroll);
     removeEventListener("popstate", onHash);
     removeEventListener("pagehide", onPageHide);
     removeEventListener("pageshow", onPageShow);
@@ -995,8 +1314,8 @@ onMount(() => {
 <div class="shell">
   <a class="skip" href={authenticated ? "#route-heading" : "#admin-token"}>본문으로 건너뛰기</a>
   <header class="topbar">
-    <div><p class="eyebrow">NVIDIA BUILD LB</p><p class="brand">관리 콘솔</p></div>
-    <div class="top-actions"><span class:good={requestAvailable()} class="status"><span aria-hidden="true">{requestAvailable() ? "●" : "○"}</span> {stateCopy()}</span><button class="secondary" type="button" onclick={() => void refresh()} disabled={!session.token || loading || mutating}>상태 새로고침</button><button class="secondary" type="button" onclick={logout} disabled={!session.token || secretOpen}>로그아웃</button></div>
+    <div><p class="eyebrow">NVIDIA BUILD LB</p>{#if authenticated}<p class="brand">관리 콘솔</p>{:else}<h1 class="brand">관리자 로그인</h1>{/if}</div>
+    {#if authenticated}<div class="top-actions"><span class:good={requestAvailable()} class="status"><span aria-hidden="true">{requestAvailable() ? "●" : "○"}</span> {stateCopy()}</span><button class="secondary" type="button" onclick={() => void refresh()} disabled={!session.token || loading || mutating}>상태 새로고침</button><button class="secondary" type="button" onclick={logout} disabled={!session.token || secretOpen}>로그아웃</button></div>{/if}
   </header>
 
   {#if !authenticated}
@@ -1021,6 +1340,7 @@ onMount(() => {
     {#if mutationState === "unknown"}<p class="attention" role="alert">이전 작업의 결과를 확인하지 못했습니다. 현재 화면은 오래된 상태일 수 있어 다시 확인한 뒤 재시도하세요.<button class="link-button" type="button" onclick={() => void refresh()}>상태 다시 확인</button></p>{/if}
     {#if mutationState === "reconcile"}<p class="attention" role="alert">작업은 전송됐지만 최신 상태 확인에 실패했습니다. 재시도하지 말고 먼저 상태를 다시 확인하세요.<button class="link-button" type="button" onclick={() => void refresh()}>상태 다시 확인</button></p>{/if}
     {#if error}<p id="error-message" class="alert" role="alert">{error}<button class="link-button" type="button" onclick={() => void refresh()}>다시 확인</button></p>{/if}
+    {#if ["stale", "offline", "partial"].includes(state)}<p class="attention" role="status">이 화면의 일부 정보는 마지막 성공 확인보다 오래됐습니다. 상태를 다시 확인하기 전에는 변경할 수 없습니다.</p>{/if}
     {#if notice}<p class="notice" role="status">{notice}</p>{/if}
 
     <section id="overview" class:panel-hidden={active !== "overview"} class="panel" aria-labelledby="overview-title" hidden={active !== "overview"}>
@@ -1030,8 +1350,11 @@ onMount(() => {
           <article><span>현재 모델 라우팅</span><strong>{profileReadiness()}</strong><small>{requestAvailable() ? "공통 슬롯을 선택할 수 있습니다. 모델별 제공자 검증 결과는 모델 화면에서 따로 확인하세요." : "모든 슬롯이 중지·cooldown이거나 아직 구성되지 않았습니다."}</small></article>
           <article><span>구성된 슬롯</span><strong>{keys.length}/2 슬롯</strong><small>두 개의 서로 다른 키를 암호화해 저장합니다.</small></article>
           <article><span>사용 가능한 키</span><strong>{eligibleKeys}/2 키</strong><small>{requestAvailable() ? "rate-aware round-robin으로 분산합니다." : "라우팅에서 중지·cooldown 원인을 확인하세요."}</small></article>
-          <article><span>다음 조치</span><strong>{recommendedAction()}</strong><small>{notice || error || (updatedAt ? `마지막 확인 ${updatedAt}` : "아직 확인하지 않았습니다.")}</small></article>
+          <article class="recommendation"><span>다음 조치</span><strong>{recommendation.label}</strong><small>{recommendation.reason}</small><button class="primary" type="button" onclick={() => void selectRoute(recommendation.route)} disabled={loading || mutating}>{recommendation.route === "evidence" ? "증거 확인" : "조치 화면 열기"}</button></article>
         </div>
+        {#if attentions.length}<div class="attention-list" aria-labelledby="attention-title"><h3 id="attention-title">지금 확인할 주의</h3>{#each attentions as attention}<p class="attention"><span><strong>{attention.label ?? attention.code}</strong> · 다음 조치: {actionLabel(attention.next_action)}{#if attention.expires_at} · {formatDateTime(attention.expires_at)}까지{/if}</span><button class="link-button" type="button" onclick={() => void selectRoute("routing")}>{actionLabel(attention.next_action)} 열기</button></p>{/each}</div>{/if}
+        {#if checks.length}<div class="check-list" aria-labelledby="check-title"><h3 id="check-title">슬롯별 상태 점검</h3>{#each checks as check}<p><strong>{check.label}</strong><span>{checkStatusLabel(check.status)} · {check.request_count}회 요청 · {check.failure_count}회 실패</span></p>{/each}</div>{/if}
+        <div class="facts"><span>공개 경로 <strong>{publicHealth.status === "verified" ? "검증 완료" : "검증 필요"}</strong><small>{publicHealth.hostname}</small></span><span>마지막 작업 <strong>{lastOperation}</strong></span></div>
     </section>
     <section id="routing" class:panel-hidden={active !== "routing"} class="panel" aria-labelledby="routing-title" hidden={active !== "routing"}>
         <h2 id="routing-title">두 슬롯의 상태</h2>
@@ -1042,22 +1365,24 @@ onMount(() => {
               {@const key = keys[index]}
               {#if key}
                 {@const probe = key.verified ? "valid" : probeState[key.id]}
-                <tr><th scope="row"><span id={`key-${key.id}`}>슬롯 {index + 1} · {key.label}</span><small>{key.fingerprint.slice(0, 15)}…</small></th><td data-label="상태"><span class:good={key.enabled && !key.cooldown_until} class="status"><span aria-hidden="true">{key.enabled && !key.cooldown_until ? "●" : "○"}</span> {key.enabled ? (key.cooldown_until ? "일시 대기" : "활성") : (probe === "invalid" ? "검증 실패" : probe === "valid" ? "검증 완료" : "검증 필요")}</span>{#if key.cooldown_until}<small>{formatDateTime(key.cooldown_until)}까지</small>{/if}{#if key.id === lifecycleKeyId && !key.enabled && probe !== "valid"}<small class="next-step">다음 단계: 제공자 검증을 통과하면 라우팅에 포함할 수 있습니다.</small>{/if}{#if !key.enabled && probe === "invalid"}<small>키를 교체하거나 다시 검증하세요.</small>{/if}</td><td data-label="누적">{key.request_count}회 요청 · {key.failure_count}회 실패</td><td data-label="조작" class="actions">{#if !key.enabled}<button class="secondary" type="button" aria-label={`${key.label} 제공자 검증`} onclick={() => void probeKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>{probe === "pending" ? "검증 중…" : "검증"}</button>{/if}<button class="secondary" type="button" aria-label={`${key.label} ${key.enabled ? "라우팅 제외" : "라우팅 포함"}`} onclick={() => void toggleKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed() || (!key.enabled && probe !== "valid")}>{key.enabled ? "제외" : "포함"}</button><button class="danger" type="button" aria-label={`${key.label} 라우팅에서 사용 중지`} onclick={(event) => openConfirmation("delete", key.id, key.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>사용 중지</button></td></tr>
+                <tr><th scope="row"><span id={`key-${key.id}`}>슬롯 {index + 1} · {key.label}</span><small>{key.fingerprint.slice(0, 15)}…</small></th><td data-label="상태"><span class:good={key.enabled && !key.cooldown_until} class="status"><span aria-hidden="true">{key.enabled && !key.cooldown_until ? "●" : "○"}</span> {key.enabled ? (key.cooldown_until ? "일시 대기" : "활성") : (probe === "invalid" ? "검증 실패" : probe === "valid" ? "검증 완료" : "검증 필요")}</span>{#if key.cooldown_until}<small>{formatDateTime(key.cooldown_until)}까지</small>{/if}{#if key.id === lifecycleKeyId && !key.enabled && probe !== "valid"}<small class="next-step">다음 단계: 제공자 검증을 통과하면 라우팅에 포함할 수 있습니다.</small>{/if}{#if !key.enabled && probe === "invalid"}<small>키를 교체하거나 다시 검증하세요.</small>{/if}</td><td data-label="누적">{key.request_count}회 요청 · {key.failure_count}회 실패</td><td data-label="조작" class="actions">{#if !key.enabled}<button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} 제공자 검증`} onclick={() => void probeKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>{probe === "pending" ? "검증 중…" : "검증"}</button>{/if}<button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.enabled ? "라우팅 제외" : "라우팅 포함"}`} onclick={() => void toggleKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed() || (!key.enabled && probe !== "valid")}>{key.enabled ? "제외" : "포함"}</button><button class="danger" type="button" aria-label={`슬롯 ${index + 1} ${key.label} 라우팅에서 사용 중지`} onclick={(event) => openConfirmation("delete", key.id, key.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>사용 중지</button></td></tr>
               {:else}
                 <tr><th scope="row">슬롯 {index + 1}</th><td data-label="상태">구성 필요</td><td data-label="누적">아직 등록된 키가 없습니다.</td><td data-label="조작"></td></tr>
               {/if}
             {/each}
           </tbody></table>
         </div>
+        {#if readinessReasons.length}<p class="attention" role="status">발급·운영 준비 조건: {readinessReasons.map(actionLabel).join(" · ")}</p>{/if}
         {#if keys.length < 2 || keys.some((key) => !key.enabled)}<div class="subpanel"><h3>{keys.length === 0 ? "첫 번째 키 추가" : keys.length < 2 ? "두 번째 키 추가" : "중지된 슬롯 교체"}</h3><p>서로 다른 두 키만 저장할 수 있습니다. 저장 후 원문은 즉시 지워집니다.</p><form bind:this={upstreamForm} class="form" onsubmit={addUpstream}><label for="upstream-label">라벨<input id="upstream-label" bind:value={upstreamLabel} maxlength="128" required placeholder="예: nvidia-primary" /></label><label for="upstream-credential">NVIDIA API 키<input id="upstream-credential" bind:this={upstreamCredentialInput} type="password" required autocomplete="off" oninput={() => (formRevision += 1)} placeholder="nvapi-…" /></label><span class="sr-only">{formRevision}</span><button class="primary" type="submit" disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>암호화 저장</button></form></div>{/if}
+        {#if slotProjections.length}<div class="subpanel"><h3>프로필별 슬롯 준비</h3><p class="muted">두 슬롯의 공통 준비 상태입니다. 모델별 제공자 proof는 실제 호출 증거에서 별도로 확인해야 합니다.</p><div class="profile-grid">{#each profileCapabilities as capability}<article><strong>{capability.id}</strong><small>{capability.route}</small><span>{capability.available_now ? "두 슬롯 준비" : "준비 확인 필요"}</span><small>{slotProjections.filter((slot) => slot.profiles.some((profile) => profile.profile_id === capability.id && profile.eligible_now)).length}/2 슬롯 가능</small></article>{/each}</div></div>{/if}
     </section>
     <section id="clients" class:panel-hidden={active !== "clients"} class="panel" aria-labelledby="clients-title" hidden={active !== "clients"}>
         <h2 id="clients-title">필요한 권한만 발급</h2><p class="muted">새 접속 키는 발급 직후 native dialog에서 한 번만 보입니다.</p>
-        <form bind:this={clientForm} class="form" onsubmit={issueClient}><label for="client-label">라벨<input id="client-label" bind:this={clientLabelInput} bind:value={clientLabel} maxlength="128" required placeholder="예: hermes" /></label><fieldset><legend>권한 범위</legend>{#each supportedScopes as [scope, label]}<label class="check"><input type="checkbox" value={scope} bind:group={clientScopes} /> <span>{label}</span><small>{scope}</small></label>{/each}</fieldset><button class="primary" type="submit" disabled={!session.token || !clientLabel.trim() || clientScopes.length === 0 || mutating || mutationState !== "idle" || !mutationAllowed()}>접속 키 발급</button></form>
+        <form bind:this={clientForm} class="form" onsubmit={issueClient}><label for="client-label">라벨<input id="client-label" bind:this={clientLabelInput} bind:value={clientLabel} maxlength="128" required aria-describedby={clientError ? "error-message" : undefined} aria-invalid={clientError ? "true" : undefined} placeholder="예: hermes" /></label><fieldset><legend>권한 범위</legend>{#each supportedScopes as [scope, label]}<label class="check"><input type="checkbox" value={scope} bind:group={clientScopes} /> <span>{label}</span><small>{scope}</small></label>{/each}</fieldset><button class="primary" type="submit" disabled={!session.token || eligibleKeys !== 2 || !clientLabel.trim() || clientScopes.length === 0 || mutating || mutationState !== "idle" || !mutationAllowed()}>접속 키 발급</button></form>
         <div class="table-wrap"><table><caption class="sr-only">다운스트림 접속 키</caption><thead><tr><th scope="col">라벨</th><th scope="col">권한</th><th scope="col">상태</th><th scope="col"><span class="sr-only">조작</span></th></tr></thead><tbody>{#each clients as client}<tr><th scope="row" id={`client-${client.id}`}>{client.label}<small>{client.request_count}회 사용</small></th><td data-label="권한">{client.scopes.join(", ")}</td><td data-label="상태">{client.active ? "사용 중" : "폐기됨"}</td><td data-label="조작">{#if client.active}<button class="danger" type="button" aria-label={`${client.label} 접속 키 폐기`} onclick={(event) => openConfirmation("revoke", client.id, client.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>폐기</button>{/if}</td></tr>{:else}<tr><td colspan="4">발급된 접속 키가 없습니다.</td></tr>{/each}</tbody></table></div>
     </section>
-    <section id="models" class="panel" aria-labelledby="models-title" hidden={active !== "models"}><h2 id="models-title">모달리티별 모델</h2><p class="muted">공통 슬롯 선택 가능 여부와 모델별 제공자 검증은 별개입니다. 실제 모델 호출 전 각 제공자 probe 결과를 확인하세요.</p><div class="model-list">{#each models as model}<article><h3>{model}</h3><p>{modelInfo(model).modalities}</p><code>{modelInfo(model).route}</code><small>{requestAvailable() ? "공통 키 선택 가능 · 모델별 제공자 검증 필요" : "현재 공통 슬롯 없음"}</small></article>{:else}<p class="muted">관리자 인증 후 모델을 확인하세요.</p>{/each}</div></section>
-    <section id="evidence" class="panel" aria-labelledby="evidence-title" hidden={active !== "evidence"}><h2 id="evidence-title">지속성 확인</h2>{#if !session.token}<p class="muted">관리자 인증 후 지속성 증거를 확인할 수 있습니다.</p>{:else}<p class="muted">마지막 성공 snapshot과 PostgreSQL source-of-truth를 표시합니다.</p><div class="facts"><span>확인 시각 <strong>{updatedAt || "없음"}</strong></span><span>저장 원본 <strong>{evidence.source_of_truth}</strong></span><span>DB 키 <strong>{evidence.persisted_upstream_keys}</strong></span><span>DB 접속 키 <strong>{evidence.persisted_downstream_credentials}</strong></span><span>라우팅 프로필 <strong>{evidence.persisted_routing_profiles}</strong></span><span>요청 시도 <strong>{evidence.persisted_request_attempts ?? 0}</strong></span></div>{#if evidence.source_of_truth === "unavailable"}<p class="attention">지속성 증거를 확인하지 못했습니다. 이 snapshot을 운영 증거로 사용하지 말고 저장소 상태를 다시 확인하세요.</p>{/if}{#if (state === "degraded" || state === "stale") && eligibleKeys === 0}<p class="attention">현재 요청 가능한 키가 없습니다. 라우팅에서 cooldown·중지 원인을 확인하세요.</p>{/if}{/if}</section>
+    <section id="models" class="panel" aria-labelledby="models-title" hidden={active !== "models"}><h2 id="models-title">모달리티별 모델</h2><p class="muted">각 모델의 실제 요청 경로와 현재 사용 가능 여부를 표시합니다.</p>{#if state === "partial"}<p class="attention" role="status">모델별 준비 상태를 확인하지 못했습니다. 현재 요청 가능으로 해석하지 마세요.</p>{/if}<div class="model-list">{#each (profileCapabilities.length ? profileCapabilities : models.map((model) => ({ id: model, route: modelInfo(model).route, advertised: true, available_now: false, modalities: modelInfo(model).modalities.split("·") }))) as capability}<article><h3>{capability.id}</h3><p>{capability.modalities.join(" · ")}</p><code>{capability.route}</code><small>{capability.available_now ? "현재 요청 가능" : "현재 사용 불가 · 라우팅에서 원인 확인"}</small></article>{:else}<p class="muted">관리자 인증 후 모델을 확인하세요.</p>{/each}</div></section>
+    <section id="evidence" class="panel" aria-labelledby="evidence-title" hidden={active !== "evidence"}><h2 id="evidence-title">지속성 확인</h2>{#if !session.token}<p class="muted">관리자 인증 후 지속성 증거를 확인할 수 있습니다.</p>{:else}<p class="muted">마지막 확인 snapshot과 저장 원본을 표시합니다.</p><div class="facts"><span>확인 시각 <strong>{updatedAt || "없음"}</strong></span><span>저장 원본 <strong>{evidence.source_of_truth === "postgresql" ? "PostgreSQL" : evidence.source_of_truth === "encrypted-file-fallback" ? "암호화 파일 fallback" : evidence.source_of_truth}</strong></span><span>DB 키 <strong>{evidence.persisted_upstream_keys}</strong></span><span>DB 접속 키 <strong>{evidence.persisted_downstream_credentials}</strong></span><span>라우팅 프로필 <strong>{evidence.persisted_routing_profiles}</strong></span><span>요청 시도 <strong>{evidence.persisted_request_attempts ?? 0}</strong></span><span>최근 이벤트 <strong>{adminEvents.length}</strong></span></div>{#if checks.length}<div class="check-list"><h3>슬롯별 확인</h3>{#each checks as check}<p><strong>{check.label}</strong><span>{checkStatusLabel(check.status)} · {check.request_count}회 요청 · {check.failure_count}회 실패</span></p>{/each}</div>{/if}{#if attentions.length}<div class="attention-list"><h3>먼저 확인할 주의</h3>{#each attentions as attention}<p class="attention"><strong>{attention.label ?? attentionLabel(attention.code)}</strong><span>{actionLabel(attention.next_action)}</span><button class="link-button" type="button" onclick={() => void handleAttention(attention)}>{attention.next_action === "probe" ? "검증 시작" : `${actionLabel(attention.next_action)} 열기`}</button></p>{/each}</div>{/if}{#if adminEvents.length}<div class="check-list"><h3>최근 작업</h3>{#each adminEvents as event}<p><strong>{eventKindLabel(event.kind ?? "request_attempt")}</strong><span>{event.profile_id ?? "프로필 미상"} · {outcomeLabel(event.outcome ?? "")}{#if event.created_at} · {formatDateTime(event.created_at)}{/if}</span><button class="link-button" type="button" onclick={() => void openEvent(event)}>상세 보기</button></p>{/each}</div>{/if}{#if evidence.source_of_truth === "unavailable"}<p class="attention">지속성 증거를 확인하지 못했습니다. 이 snapshot을 운영 증거로 사용하지 말고 저장소 상태를 다시 확인하세요.</p>{/if}{#if (state === "degraded" || state === "stale" || state === "partial") && eligibleKeys === 0}<p class="attention">현재 요청 가능한 키가 없습니다. 라우팅에서 cooldown·중지 원인을 확인하세요.</p>{/if}{/if}</section>
   </main>
   {/if}
 </div>
@@ -1076,6 +1401,22 @@ onMount(() => {
   </form>
 </dialog>
 
+<dialog bind:this={eventDialog} aria-labelledby="event-title" onclose={() => { selectedEvent = null; }}>
+  <form method="dialog" class="dialog-card">
+    <h2 id="event-title">작업 상세</h2>
+    {#if selectedEvent}
+      <dl class="event-detail">
+        <div><dt>결과</dt><dd>{outcomeLabel(selectedEvent.outcome ?? "")}</dd></div>
+        <div><dt>프로필</dt><dd>{selectedEvent.profile_id ?? "확인할 수 없음"}</dd></div>
+        <div><dt>요청 ID</dt><dd>{selectedEvent.request_id ?? "확인할 수 없음"}</dd></div>
+        <div><dt>슬롯 ID</dt><dd>{selectedEvent.key_id ?? "확인할 수 없음"}</dd></div>
+        {#if selectedEvent.created_at}<div><dt>시각</dt><dd>{formatDateTime(selectedEvent.created_at)}</dd></div>{/if}
+      </dl>
+    {/if}
+    <button class="secondary" type="submit">닫기</button>
+  </form>
+</dialog>
+
 <style>
   :global(*) { box-sizing: border-box; }
   :global([hidden]) { display: none !important; }
@@ -1089,16 +1430,16 @@ onMount(() => {
   .auth { align-items: end; margin: 16px 0; } .auth label { flex: 1; } label { display: grid; gap: 6px; color: #d0d5d2; font-size: .9rem; font-weight: 700; } input, textarea { width: 100%; min-height: 44px; border: 1px solid #6b746f; border-radius: 6px; padding: 10px 12px; color: #f5f7f6; background: #171a1d; font: inherit; } textarea { min-height: 76px; resize: vertical; }
   .nav { display: flex; flex-wrap: wrap; overflow: visible; border-bottom: 1px solid #6b746f; } .nav a { min-height: 44px; padding: 10px 12px; color: #d0d5d2; text-decoration: none; white-space: nowrap; } .nav a[aria-current="page"] { color: #76b900; border-bottom: 3px solid #76b900; font-weight: 800; }
   main { padding-top: 32px; } .route-heading { align-items: baseline; flex-wrap: wrap; margin-bottom: 24px; } .route-heading .eyebrow { flex-basis: 100%; } h1, h2, h3, p { margin: 0; } h1 { font-size: clamp(1.6rem, 3vw, 2rem); } h2 { font-size: 1.35rem; } h3 { font-size: 1rem; } .muted, small { color: #aab2ae; } .live { min-height: 24px; color: #d0d5d2; }
-  .panel, article, .subpanel { display: grid; gap: 12px; padding: 24px; background: #171a1d; border: 1px solid #6b746f; border-radius: 8px; } .judgments { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; } article { background: #1d2124; } article span { color: #aab2ae; font-size: .85rem; } article strong { font-size: 1.25rem; }
-  .alert, .notice, .attention { display: flex; gap: 12px; align-items: center; margin: 12px 0; padding: 12px 14px; border-radius: 6px; } .alert { color: #ff8a8a; border: 1px solid #ff8a8a; } .auth-error { max-width: 760px; } .notice { color: #76b900; border: 1px solid #76b900; } .attention { color: #ffd166; border: 1px solid #ffd166; } .next-step { color: #ffd166; }
+  .panel, article, .subpanel { display: grid; gap: 12px; padding: 24px; background: #171a1d; border: 1px solid #6b746f; border-radius: 8px; } .judgments { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; } article { background: #1d2124; min-width: 0; } article span { color: #aab2ae; font-size: .85rem; } article strong { font-size: 1.25rem; overflow-wrap: anywhere; } .recommendation { border-color: #76b900; } .attention-list, .check-list { display: grid; gap: 8px; } .check-list p { display: flex; justify-content: space-between; gap: 12px; margin: 0; padding: 10px 0; border-bottom: 1px solid #6b746f; } .check-list p > * { min-width: 0; overflow-wrap: anywhere; } .profile-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; } .profile-grid article { padding: 12px; }
+  .alert, .notice, .attention { display: flex; gap: 12px; align-items: center; margin: 12px 0; padding: 12px 14px; border-radius: 6px; } .alert { color: #ff8a8a; border: 1px solid #ff8a8a; } .auth-error { max-width: 760px; } .notice { color: #76b900; border: 1px solid #76b900; } .attention { color: #ffd166; border: 1px solid #ffd166; } .attention > * { min-width: 0; overflow-wrap: anywhere; } .next-step { color: #ffd166; }
   .link-button { margin-left: auto; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 6px; padding: 8px 10px; min-height: 44px; cursor: pointer; }
   button { min-height: 44px; border: 0; border-radius: 6px; padding: 10px 14px; cursor: pointer; font: inherit; font-weight: 800; } button:disabled { opacity: .5; cursor: not-allowed; } .primary { background: #76b900; color: #091006; } .secondary { background: #262b2e; color: #f5f7f6; border: 1px solid #6b746f; } .danger { background: transparent; color: #ff8a8a; border: 1px solid #ff8a8a; }
   .table-wrap { overflow-x: auto; } table { width: 100%; border-collapse: collapse; min-width: 680px; } th, td { padding: 12px 10px; border-bottom: 1px solid #6b746f; text-align: left; vertical-align: middle; } th { color: #f5f7f6; } td, th small { display: table-cell; } tbody th { display: table-cell; } tbody th small { display: block; margin-top: 3px; } .actions { display: flex; gap: 8px; justify-content: flex-end; }
   .form { display: grid; gap: 12px; max-width: 560px; } fieldset { display: grid; gap: 8px; border: 1px solid #6b746f; border-radius: 6px; padding: 14px; } legend { padding: 0 5px; color: #d0d5d2; font-weight: 800; } .check { display: flex; align-items: center; gap: 8px; min-height: 44px; } .check input { width: 20px; min-height: 20px; } .check small { margin-left: auto; }
-  .subpanel { margin-top: 20px; } .facts, .model-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; } .facts span { padding: 12px; background: #1d2124; border-radius: 6px; } .facts strong { display: block; margin-top: 4px; } .model-list { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); } code { color: #b8a1ff; overflow-wrap: anywhere; }
+  .subpanel { margin-top: 20px; } .facts, .model-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; } .facts span { padding: 12px; background: #1d2124; border-radius: 6px; } .facts strong { display: block; margin-top: 4px; } .model-list { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); } .model-list h3 { overflow-wrap: anywhere; word-break: break-word; } code { color: #b8a1ff; overflow-wrap: anywhere; word-break: break-word; } .event-detail { display: grid; gap: 10px; margin: 0; } .event-detail div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; } .event-detail dt { color: #aab2ae; } .event-detail dd { margin: 0; overflow-wrap: anywhere; }
   dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid #6b746f; border-radius: 8px; background: #171a1d; color: #f5f7f6; box-shadow: 0 8px 24px rgb(0 0 0 / .28); } dialog::backdrop { background: rgb(0 0 0 / .7); } .dialog-card { display: grid; gap: 16px; padding: 24px; } .dialog-card textarea { color: #76b900; font-family: ui-monospace, monospace; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button, .top-actions .status { flex: 1; } .auth button, .form button { width: 100%; } .judgments { grid-template-columns: 1fr; } .panel { padding: 16px; } .nav { gap: 4px; } .nav a { flex: 1 1 calc(50% - 4px); text-align: center; } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; } .actions button { flex: 1; } }
+  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button, .top-actions .status { flex: 1; } .auth button, .form button { width: 100%; } .judgments { grid-template-columns: 1fr; } .panel { padding: 16px; } .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .nav { gap: 4px; overflow-x: auto; scrollbar-width: thin; padding-right: 52px; background: linear-gradient(90deg, transparent 0 calc(100% - 44px), #171a1d 100%); } .nav::after { content: "좌우로 더 보기"; position: sticky; right: 0; align-self: center; flex: 0 0 auto; color: #aab2ae; font-size: .72rem; background: #171a1d; padding: 4px 6px; pointer-events: none; } .nav a { flex: 0 0 auto; text-align: center; } .status { white-space: normal; overflow-wrap: anywhere; } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; flex-wrap: wrap; } .actions button { flex: 1 1 120px; } }
   @media (forced-colors: active) { .status, .panel, article, input, textarea, button, fieldset, dialog { border: 1px solid ButtonText; } .primary, .secondary, .danger { background: Canvas; color: ButtonText; } }
   @media (prefers-reduced-motion: reduce) { :global(*) { scroll-behavior: auto !important; transition: none !important; } }
 </style>

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     env,
     pin::Pin,
     sync::{
@@ -34,6 +34,7 @@ struct AppState {
     admin_token: String,
     upstream_url: String,
     require_downstream_token: bool,
+    public_port: u16,
 }
 
 #[derive(Debug, FromRow)]
@@ -45,6 +46,7 @@ struct DbKeyRow {
     nonce: Vec<u8>,
     enabled: bool,
     verified: bool,
+    retired: bool,
     cooldown_until: Option<chrono::DateTime<chrono::Utc>>,
     request_count: i64,
     failure_count: i64,
@@ -88,7 +90,7 @@ impl VaultStore {
                 .await
                 .context("close attempts left by previous process")?;
             let keys = sqlx::query_as::<_, DbKeyRow>(
-                "SELECT id, label, fingerprint, ciphertext, nonce, enabled, verified, cooldown_until, request_count, failure_count FROM nblb.upstream_keys ORDER BY created_at, id",
+                "SELECT id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count FROM nblb.upstream_keys ORDER BY created_at, id",
             )
             .fetch_all(pool)
             .await
@@ -226,10 +228,11 @@ impl VaultStore {
 
     async fn evidence(&self) -> Result<Value> {
         if let Some(pool) = &self.database {
-            let persisted_keys =
-                sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.upstream_keys")
-                    .fetch_one(pool)
-                    .await?;
+            let persisted_keys = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.upstream_keys WHERE retired = false",
+            )
+            .fetch_one(pool)
+            .await?;
             let persisted_downstream =
                 sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.downstream_credentials")
                     .fetch_one(pool)
@@ -304,6 +307,7 @@ fn db_key_record(row: DbKeyRow) -> Result<VaultKeyRecord> {
         ciphertext: row.ciphertext,
         enabled: row.enabled,
         verified: row.verified,
+        retired: row.retired,
         cooldown_until: row.cooldown_until,
         request_count: u64::try_from(row.request_count).context("invalid key request count")?,
         failure_count: u64::try_from(row.failure_count).context("invalid key failure count")?,
@@ -353,21 +357,13 @@ async fn sync_database_rows(
         .execute(&mut *tx)
         .await
         .context("lock vault sync")?;
-    let key_ids: Vec<Uuid> = keys.iter().map(|key| key.id).collect();
-    sqlx::query("DELETE FROM nblb.upstream_keys WHERE id <> ALL($1::uuid[])")
-        .bind(&key_ids)
-        .execute(&mut *tx)
-        .await
-        .context("remove deleted upstream keys")?;
-    let downstream_ids: Vec<Uuid> = downstream.iter().map(|item| item.id).collect();
-    sqlx::query("DELETE FROM nblb.downstream_credentials WHERE id <> ALL($1::uuid[])")
-        .bind(&downstream_ids)
-        .execute(&mut *tx)
-        .await
-        .context("remove deleted downstream credentials")?;
+    // Upstream deletion and downstream revocation are durable state changes,
+    // not row removal. Never delete rows from a possibly stale in-memory
+    // snapshot: another gateway process may have created a credential while
+    // this transaction waited for the advisory lock.
     for key in keys {
         sqlx::query(
-            "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, cooldown_until, request_count, failure_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, fingerprint=EXCLUDED.fingerprint, ciphertext=EXCLUDED.ciphertext, nonce=EXCLUDED.nonce, enabled=EXCLUDED.enabled, verified=EXCLUDED.verified, cooldown_until=EXCLUDED.cooldown_until, request_count=EXCLUDED.request_count, failure_count=EXCLUDED.failure_count",
+            "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, fingerprint=EXCLUDED.fingerprint, ciphertext=EXCLUDED.ciphertext, nonce=EXCLUDED.nonce, enabled=EXCLUDED.enabled, verified=EXCLUDED.verified, retired=EXCLUDED.retired, cooldown_until=EXCLUDED.cooldown_until, request_count=EXCLUDED.request_count, failure_count=EXCLUDED.failure_count",
         )
         .bind(key.id)
         .bind(&key.label)
@@ -376,6 +372,7 @@ async fn sync_database_rows(
         .bind(&key.nonce)
         .bind(key.enabled)
         .bind(key.verified)
+        .bind(key.retired)
         .bind(key.cooldown_until)
         .bind(i64::try_from(key.request_count).context("key request count overflow")?)
         .bind(i64::try_from(key.failure_count).context("key failure count overflow")?)
@@ -470,6 +467,30 @@ fn routes(cfg: &mut web::ServiceConfig) {
         .route("/admin/api/v1/upstream-keys", web::get().to(list_keys))
         .route("/admin/api/v1/overview", web::get().to(overview))
         .route("/admin/api/v1/evidence", web::get().to(evidence))
+        .route(
+            "/admin/api/v1/upstream-slots",
+            web::get().to(upstream_slots),
+        )
+        .route(
+            "/admin/api/v1/model-capabilities",
+            web::get().to(model_capabilities),
+        )
+        .route(
+            "/admin/api/v1/generation-readiness",
+            web::get().to(generation_readiness),
+        )
+        .route("/admin/api/v1/operations", web::get().to(operations))
+        .route(
+            "/admin/api/v1/operations/{id}",
+            web::get().to(operation_detail),
+        )
+        .route("/admin/api/v1/attentions", web::get().to(attentions))
+        .route("/admin/api/v1/events", web::get().to(events))
+        .route("/admin/api/v1/events/{id}", web::get().to(event_detail))
+        .route(
+            "/admin/api/v1/evidence/{id}",
+            web::get().to(evidence_detail),
+        )
         .route("/admin/api/v1/upstream-keys", web::post().to(add_key))
         .route(
             "/admin/api/v1/upstream-keys/{id}",
@@ -515,7 +536,7 @@ fn routes(cfg: &mut web::ServiceConfig) {
         )
         .route(
             "/admin/api/v1/downstream-tokens/{id}",
-            web::delete().to(revoke_downstream),
+            web::delete().to(revoke_downstream_legacy),
         )
         .service(
             Files::new("/admin", "/app/static")
@@ -593,6 +614,10 @@ async fn build_state() -> Result<AppState> {
         upstream_url: env::var("NBLB_UPSTREAM_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1/chat/completions".to_owned()),
         require_downstream_token,
+        public_port: env::var("NVIDIA_BUILD_LB_PUBLIC_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2456),
     })
 }
 
@@ -668,7 +693,45 @@ fn read_required_secret(env_name: &str, path: &str) -> Result<String> {
     Ok(value)
 }
 
-async fn health(state: web::Data<AppState>) -> impl Responder {
+fn request_host(req: &HttpRequest) -> String {
+    let raw = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if let Some(value) = raw.strip_prefix('[')
+        && let Some((host, _)) = value.split_once(']')
+    {
+        return host.to_ascii_lowercase();
+    }
+    raw.split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn public_guard_response(req: &HttpRequest) -> Option<HttpResponse> {
+    let host = request_host(req);
+    if !matches!(
+        host.as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "nvidia-lb.dongwontuna.net"
+    ) {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
+        })));
+    }
+    if req.headers().contains_key(header::ORIGIN) {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": {"message": "Cross-origin requests are not allowed.", "type": "permission_error", "code": "origin_forbidden"}
+        })));
+    }
+    None
+}
+
+async fn health(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if let Some(response) = public_guard_response(&req) {
+        return response;
+    }
     let database_ready = match &state.vault.database {
         Some(pool) => sqlx::query_scalar::<_, i32>("SELECT 1")
             .fetch_one(pool)
@@ -682,7 +745,7 @@ async fn health(state: web::Data<AppState>) -> impl Responder {
     // One healthy upstream can still serve traffic; the second slot is the
     // failover/distribution objective, not a hard availability requirement.
     let traffic_ready = ready && eligible_keys > 0;
-    let mut response = if ready {
+    let mut response = if traffic_ready {
         HttpResponse::Ok()
     } else {
         HttpResponse::ServiceUnavailable()
@@ -698,6 +761,9 @@ async fn health(state: web::Data<AppState>) -> impl Responder {
 }
 
 async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if let Some(response) = public_guard_response(&req) {
+        return response;
+    }
     if let Err(response) = authorize_scope(&req, &state, "models:read").await {
         return response;
     }
@@ -735,12 +801,54 @@ async fn overview(req: HttpRequest, state: web::Data<AppState>) -> impl Responde
         .evidence()
         .await
         .unwrap_or_else(|_| json!({"source_of_truth": "unavailable"}));
+    let recommendation = if keys.is_empty() {
+        json!({"action":"add_upstream_key","label":"첫 번째 키 구성","route":"routing","reason":"두 개의 NVIDIA 키를 저장해야 요청을 받을 수 있습니다."})
+    } else if keys.iter().any(|key| !key.verified) {
+        json!({"action":"probe_upstream_key","label":"제공자 검증","route":"routing","reason":"저장된 키는 제공자 검증을 통과해야 라우팅에 포함할 수 있습니다."})
+    } else if eligible_keys == 0 {
+        json!({"action":"inspect_routing","label":"라우팅 상태 확인","route":"routing","reason":"현재 요청 가능한 키가 없어 cooldown·중지 원인을 확인해야 합니다."})
+    } else if keys.len() < nvidia_build_lb_core::MAX_UPSTREAM_KEYS {
+        json!({"action":"add_upstream_key","label":"두 번째 키 구성","route":"routing","reason":"두 번째 키를 추가하면 rate-aware 분산과 장애 전환을 확인할 수 있습니다."})
+    } else {
+        json!({"action":"monitor","label":"현재 상태 확인","route":"evidence","reason":"두 슬롯이 구성되어 요청을 받을 수 있습니다."})
+    };
+    let attentions = keys
+        .iter()
+        .filter(|key| !key.enabled || !key.verified || key.cooldown_until.is_some())
+        .map(|key| {
+            json!({
+                "code": if key.cooldown_until.is_some() { "upstream_cooldown" } else if !key.verified { "probe_required" } else { "upstream_disabled" },
+                "resource": {"kind":"upstream_key","id":key.id},
+                "label": key.label,
+                "next_action": if !key.verified { "probe" } else { "inspect_routing" },
+                "expires_at": key.cooldown_until,
+            })
+        })
+        .collect::<Vec<_>>();
+    let checks = keys
+        .iter()
+        .map(|key| {
+            json!({
+                "kind":"upstream_key",
+                "id":key.id,
+                "label":key.label,
+                "status": if key.enabled && key.verified && key.cooldown_until.is_none() { "eligible" } else if key.cooldown_until.is_some() { "cooldown" } else if key.verified { "disabled" } else { "probe_required" },
+                "failure_count":key.failure_count,
+                "request_count":key.request_count,
+            })
+        })
+        .collect::<Vec<_>>();
     HttpResponse::Ok().insert_header(("cache-control", "no-store")).json(json!({
         "runtime": {"status": if database_ready && eligible_keys > 0 { "ok" } else { "degraded" }, "ready": database_ready && keys.len() == nvidia_build_lb_core::MAX_UPSTREAM_KEYS, "traffic_ready": database_ready && eligible_keys > 0, "eligible_keys": if database_ready { eligible_keys } else { 0 }},
         "upstream_keys": {"items": keys},
         "downstream_credentials": {"items": downstream},
         "models": PROFILES,
         "evidence": evidence,
+        "server_recommendation": recommendation,
+        "attentions": attentions,
+        "checks": checks,
+        "public_health": {"hostname":"nvidia-lb.dongwontuna.net","status":"not_verified","next_action":"verify_public_route"},
+        "last_operation": {"kind":"overview_snapshot","status":"succeeded","observed_at":Utc::now()},
     }))
 }
 
@@ -754,6 +862,228 @@ async fn evidence(req: HttpRequest, state: web::Data<AppState>) -> impl Responde
             .json(value),
         Err(_) => HttpResponse::ServiceUnavailable()
             .json(json!({"error":{"code":"evidence_unavailable"}})),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PageQuery {
+    before: Option<String>,
+    limit: Option<u16>,
+}
+
+fn admin_snapshot() -> Value {
+    json!({"observed_at": Utc::now(), "generation": "0"})
+}
+
+async fn upstream_slots(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let keys = state.vault.list();
+    let slots = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let eligible = key.enabled && key.verified && key.cooldown_until.is_none_or(|until| until <= Utc::now());
+            json!({
+                "slot_no": index + 1,
+                "key_id": key.id,
+                "label": key.label,
+                "status": if eligible { "eligible" } else if key.cooldown_until.is_some() { "cooldown" } else if !key.verified { "probe_required" } else { "disabled" },
+                "request_count": key.request_count,
+                "failure_count": key.failure_count,
+                "cooldown_until": key.cooldown_until,
+                "profiles": PROFILES.iter().map(|profile| json!({
+                    "profile_id": profile,
+                    "proof_revision": "0",
+                    "eligible_now": eligible,
+                    "reason": if eligible { Value::Null } else if !key.verified { json!("missing_proof") } else if key.cooldown_until.is_some() { json!("cooldown") } else { json!("manual_disabled") }
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    HttpResponse::Ok()
+        .insert_header(("cache-control", "no-store"))
+        .json(json!({"snapshot":admin_snapshot(),"slots":slots}))
+}
+
+async fn model_capabilities(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    // Capability readiness is intentionally conservative: a profile is not
+    // advertised as currently available until both independent upstream
+    // slots are verified and eligible. A single key may serve fail-soft
+    // traffic, but it does not satisfy the pair/readiness contract.
+    let available =
+        eligible_key_count(&state.vault.list()) == nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
+    let models = PROFILES.iter().map(|profile| {
+        let route = match *profile {
+            "z-ai/glm-5.2" | "microsoft/phi-4-multimodal-instruct" | "nvidia/vila" => "/v1/chat/completions",
+            "nvidia/nvclip" => "/v1/embeddings",
+            "black-forest-labs/flux.1-kontext-dev" => "/v1/images/generations",
+            "stabilityai/stable-video-diffusion" => "/v1/videos/generations",
+            "nvidia/magpie-tts-multilingual" => "/v1/audio/speech",
+            "nvidia/parakeet-ctc-1.1b" => "/v1/audio/transcriptions",
+            _ => "/v1/nvidia/inference",
+        };
+        json!({"id":profile,"route":route,"advertised":true,"available_now":available,"modalities":model_modalities(profile)})
+    }).collect::<Vec<_>>();
+    HttpResponse::Ok()
+        .insert_header(("cache-control", "no-store"))
+        .json(json!({"snapshot":admin_snapshot(),"models":models}))
+}
+
+fn model_modalities(profile: &str) -> &'static [&'static str] {
+    match profile {
+        "z-ai/glm-5.2" => &["text"],
+        "microsoft/phi-4-multimodal-instruct" => &["text", "image", "audio"],
+        "nvidia/vila" => &["text", "image", "video"],
+        "nvidia/nvclip" => &["image", "embedding"],
+        "black-forest-labs/flux.1-kontext-dev" => &["image_generation"],
+        "stabilityai/stable-video-diffusion" => &["video_generation"],
+        "nvidia/magpie-tts-multilingual" => &["audio_generation"],
+        "nvidia/parakeet-ctc-1.1b" => &["audio_transcription"],
+        _ => &[],
+    }
+}
+
+async fn generation_readiness(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let keys = state.vault.list();
+    let configured = keys.len();
+    let verified = keys.iter().filter(|key| key.verified).count();
+    let eligible = eligible_key_count(&keys);
+    let ready = configured == nvidia_build_lb_core::MAX_UPSTREAM_KEYS
+        && verified == nvidia_build_lb_core::MAX_UPSTREAM_KEYS
+        && eligible == nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
+    let reasons = if ready {
+        Vec::new()
+    } else {
+        let mut reasons = Vec::new();
+        if configured < nvidia_build_lb_core::MAX_UPSTREAM_KEYS {
+            reasons.push("missing_upstream_slot");
+        }
+        if verified < nvidia_build_lb_core::MAX_UPSTREAM_KEYS {
+            reasons.push("probe_required");
+        }
+        if eligible < nvidia_build_lb_core::MAX_UPSTREAM_KEYS {
+            reasons.push("slot_unavailable");
+        }
+        reasons
+    };
+    HttpResponse::Ok().insert_header(("cache-control", "no-store")).json(json!({
+        "snapshot":admin_snapshot(),"ready":ready,"configured_slots":configured,"verified_slots":verified,"eligible_slots":eligible,"advertised_profiles":PROFILES.len(),"available_profiles":if ready { PROFILES.len() } else { 0 },"reasons":reasons
+    }))
+}
+
+async fn operations(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<PageQuery>,
+) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let _before = query.before.as_deref();
+    let limit = query.limit.unwrap_or(50).clamp(1, 100) as i64;
+    let mut rows = Vec::new();
+    if let Some(pool) = &state.vault.database
+        && let Ok(attempts) = sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, Option<chrono::DateTime<Utc>>)>(
+            "SELECT id, request_id, profile_id, key_id, outcome, finished_at FROM nblb.request_attempts ORDER BY created_at DESC LIMIT $1"
+        ).bind(limit).fetch_all(pool).await {
+            rows = attempts.into_iter().map(|(id, request_id, profile_id, key_id, outcome, finished_at)| json!({"id":id,"request_id":request_id,"profile_id":profile_id,"key_id":key_id,"status":outcome,"finished_at":finished_at})).collect();
+        }
+    HttpResponse::Ok()
+        .insert_header(("cache-control", "no-store"))
+        .json(json!({"snapshot":admin_snapshot(),"operations":rows,"next_before":Value::Null}))
+}
+
+async fn operation_detail(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<Uuid>,
+) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let id = path.into_inner();
+    let Some(pool) = &state.vault.database else {
+        return HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}}));
+    };
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, Option<chrono::DateTime<Utc>>)>("SELECT id, request_id, profile_id, key_id, outcome, finished_at FROM nblb.request_attempts WHERE id=$1").bind(id).fetch_optional(pool).await;
+    match row {
+        Ok(Some((id, request_id, profile_id, key_id, outcome, finished_at))) => HttpResponse::Ok().json(json!({"snapshot":admin_snapshot(),"operation":{"id":id,"request_id":request_id,"profile_id":profile_id,"key_id":key_id,"status":outcome,"finished_at":finished_at}})),
+        _ => HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}})),
+    }
+}
+
+async fn attentions(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    _query: web::Query<PageQuery>,
+) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let _before = _query.before.as_deref();
+    let items = state.vault.list().into_iter().filter(|key| !key.enabled || !key.verified || key.cooldown_until.is_some()).map(|key| json!({"id":key.id,"code":if key.cooldown_until.is_some(){"upstream_cooldown"}else if !key.verified{"probe_required"}else{"upstream_disabled"},"resource":{"kind":"upstream_key","id":key.id},"label":key.label,"next_action":if !key.verified{"probe"}else{"inspect_routing"},"expires_at":key.cooldown_until})).collect::<Vec<_>>();
+    HttpResponse::Ok()
+        .insert_header(("cache-control", "no-store"))
+        .json(json!({"snapshot":admin_snapshot(),"attentions":items,"next_before":Value::Null}))
+}
+
+async fn events(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    query: web::Query<PageQuery>,
+) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let _before = query.before.as_deref();
+    let limit = query.limit.unwrap_or(50).clamp(1, 100) as i64;
+    let mut rows = Vec::new();
+    if let Some(pool) = &state.vault.database
+        && let Ok(attempts) = sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>)>("SELECT id, request_id, profile_id, key_id, outcome, created_at FROM nblb.request_attempts ORDER BY created_at DESC LIMIT $1").bind(limit).fetch_all(pool).await {
+            rows = attempts.into_iter().map(|(id, request_id, profile_id, key_id, outcome, created_at)| json!({"id":id,"kind":"request_attempt","request_id":request_id,"profile_id":profile_id,"key_id":key_id,"outcome":outcome,"created_at":created_at})).collect();
+        }
+    HttpResponse::Ok()
+        .insert_header(("cache-control", "no-store"))
+        .json(json!({"snapshot":admin_snapshot(),"events":rows,"next_before":Value::Null}))
+}
+
+async fn event_detail(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<Uuid>,
+) -> impl Responder {
+    operation_detail(req, state, path).await
+}
+
+async fn evidence_detail(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<Uuid>,
+) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let id = path.into_inner();
+    let Some(pool) = &state.vault.database else {
+        return HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}}));
+    };
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, String)>(
+        "SELECT id, request_id, profile_id, outcome FROM nblb.request_attempts WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await;
+    match row {
+        Ok(Some((id, request_id, profile_id, outcome))) => HttpResponse::Ok().json(json!({"snapshot":admin_snapshot(),"evidence":{"id":id,"request_id":request_id,"profile_id":profile_id,"outcome":outcome}})),
+        _ => HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}})),
     }
 }
 
@@ -952,6 +1282,22 @@ async fn add_downstream(
     if !authorized(&req, &state) {
         return admin_unauthorized();
     }
+    let keys = state.vault.list();
+    let ready = keys.len() == nvidia_build_lb_core::MAX_UPSTREAM_KEYS
+        && keys.iter().all(|key| {
+            key.enabled
+                && key.verified
+                && key.cooldown_until.is_none_or(|until| until <= Utc::now())
+        });
+    if !ready {
+        return HttpResponse::Conflict().json(json!({
+            "error": {
+                "code": "generation_not_ready",
+                "message": "Both NVIDIA upstream slots must be probed and available before issuing a downstream credential.",
+                "next_action": "probe_and_enable_all_upstream_slots"
+            }
+        }));
+    }
     match state
         .vault
         .mutate(|vault| vault.issue_downstream(&payload.label, &payload.scopes))
@@ -989,11 +1335,32 @@ async fn revoke_downstream(
     }
 }
 
+async fn revoke_downstream_legacy(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<Uuid>,
+) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    match state
+        .vault
+        .mutate(|vault| vault.revoke_downstream(path.into_inner()))
+        .await
+    {
+        Ok(_) => HttpResponse::NoContent().finish(),
+        Err(_) => HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}})),
+    }
+}
+
 async fn chat_completions(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<Value>,
 ) -> impl Responder {
+    if let Some(response) = public_guard_response(&req) {
+        return response;
+    }
     if let Err(response) = authorize_scope(&req, &state, "chat:write").await {
         return response;
     }
@@ -1012,6 +1379,7 @@ async fn chat_completions(
         .unwrap_or(false);
     let key_attempts = state.vault.list().len().max(1);
     let mut attempted = Vec::new();
+    let mut rate_limited = false;
     for _ in 0..key_attempts {
         let id = select_key(&state, profile).await;
         let Some(id) = id else { break };
@@ -1032,7 +1400,14 @@ async fn chat_completions(
             }
         };
         if state.upstream_url.starts_with("mock://") {
-            if credential.contains("fail") {
+            let force_first_failure = request
+                .get("metadata")
+                .and_then(Value::as_object)
+                .and_then(|metadata| metadata.get("force_first_upstream_failure"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && attempted.len() == 1;
+            if credential.contains("fail") || force_first_failure {
                 if let Err(response) = record_failure(&state, id, Some(Duration::seconds(2))).await
                 {
                     return response;
@@ -1041,6 +1416,9 @@ async fn chat_completions(
                     return response;
                 }
                 continue;
+            }
+            if stream {
+                return mock_stream_response(&request, state.clone(), request_id, id);
             }
             if let Err(response) = record_request(&state, id).await {
                 return response;
@@ -1072,18 +1450,21 @@ async fn chat_completions(
             {
                 let chat_endpoint =
                     upstream_endpoint_for(&state.upstream_url, "/v1/chat/completions", profile);
-                let response =
-                    match poll_nvcf(&state.client, response, &chat_endpoint, &credential).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            if let Err(response) =
-                                attempt_finished(&state, request_id, id, "failed").await
-                            {
-                                return response;
-                            }
-                            continue;
+                let response = match poll_nvcf(&state.client, response, &chat_endpoint, &credential)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        if let Err(response) =
+                            attempt_finished(&state, request_id, id, "failed").await
+                        {
+                            return response;
                         }
-                    };
+                        return HttpResponse::BadGateway().json(json!({
+                                "error": {"message": "NVIDIA accepted the request but polling did not complete", "type": "upstream_poll_error"}
+                            }));
+                    }
+                };
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
                 let bytes = match response.bytes().await {
@@ -1151,7 +1532,28 @@ async fn chat_completions(
                         continue;
                     }
                     let upstream = Box::pin(response.bytes_stream());
-                    let downstream = chat_response_stream(upstream, state.clone(), request_id, id);
+                    let (upstream, validator, prefix) = match prime_stream(upstream).await {
+                        Ok(value) => value,
+                        Err(_) => {
+                            if let Err(response) = record_failure(&state, id, None).await {
+                                return response;
+                            }
+                            if let Err(response) =
+                                attempt_finished(&state, request_id, id, "failed").await
+                            {
+                                return response;
+                            }
+                            continue;
+                        }
+                    };
+                    let downstream = chat_response_stream(
+                        upstream,
+                        validator,
+                        prefix,
+                        state.clone(),
+                        request_id,
+                        id,
+                    );
                     return HttpResponse::build(status)
                         .insert_header(("content-type", content_type))
                         .insert_header(("cache-control", "no-cache"))
@@ -1196,11 +1598,13 @@ async fn chat_completions(
             Ok(response)
                 if response.status().as_u16() == 408
                     || response.status().as_u16() == 401
+                    || response.status().as_u16() == 402
                     || response.status().as_u16() == 403
                     || response.status().as_u16() == 429
                     || response.status().is_server_error() =>
             {
-                if matches!(response.status().as_u16(), 401 | 403)
+                rate_limited |= response.status().as_u16() == 429;
+                if matches!(response.status().as_u16(), 401..=403)
                     && let Err(response) = quarantine_key(&state, id).await
                 {
                     return response;
@@ -1231,6 +1635,11 @@ async fn chat_completions(
             }
         }
     }
+    if rate_limited && let Some(seconds) = retry_after_for_keys(&state.vault.list()) {
+        return HttpResponse::TooManyRequests()
+            .insert_header(("retry-after", seconds.to_string()))
+            .json(json!({"error":{"message":"All NVIDIA upstream keys are rate limited","type":"upstream_rate_limited"}}));
+    }
     HttpResponse::ServiceUnavailable().json(json!({"error":{"message":"No eligible NVIDIA upstream key","type":"upstream_unavailable"}}))
 }
 
@@ -1243,6 +1652,9 @@ async fn multimodal(
     state: web::Data<AppState>,
     body: web::Bytes,
 ) -> impl Responder {
+    if let Some(response) = public_guard_response(&req) {
+        return response;
+    }
     let scope = match req.path() {
         "/v1/embeddings" => "embeddings:write",
         "/v1/images/generations" => "images:write",
@@ -1277,6 +1689,7 @@ async fn multimodal(
         .unwrap_or(PROFILES[0]);
     let key_attempts = state.vault.list().len().max(1);
     let mut attempted = Vec::new();
+    let mut rate_limited = false;
     for _ in 0..key_attempts {
         let Some(id) = select_key(&state, profile).await else {
             break;
@@ -1373,19 +1786,26 @@ async fn multimodal(
         };
         match request_result {
             Ok(response) if response.status().is_success() => {
-                if response.status().as_u16() == 202 {
-                    if let Err(response) = record_failure(&state, id, None).await {
-                        return response;
+                // A 202 means NVIDIA accepted an asynchronous job. It is
+                // already an upstream side effect, so poll the same request
+                // id and never retry the POST on another key.
+                let response = if response.status().as_u16() == 202 {
+                    match poll_nvcf(&state.client, response, &endpoint, &credential).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            if let Err(response) =
+                                attempt_finished(&state, request_id, id, "failed").await
+                            {
+                                return response;
+                            }
+                            return HttpResponse::BadGateway().json(json!({
+                                "error": {"message": "NVIDIA accepted the media request but polling did not complete", "type": "upstream_poll_error"}
+                            }));
+                        }
                     }
-                    if let Err(response) = attempt_finished(&state, request_id, id, "failed").await
-                    {
-                        return response;
-                    }
-                    return HttpResponse::BadGateway().json(json!({
-                        "error": {"message": "provider returned asynchronous media output", "type": "upstream_protocol_error"}
-                    }));
-                }
-                let response = response;
+                } else {
+                    response
+                };
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
                 let content_type = response
@@ -1441,11 +1861,13 @@ async fn multimodal(
             Ok(response)
                 if response.status().as_u16() == 408
                     || response.status().as_u16() == 401
+                    || response.status().as_u16() == 402
                     || response.status().as_u16() == 403
                     || response.status().as_u16() == 429
                     || response.status().is_server_error() =>
             {
-                if matches!(response.status().as_u16(), 401 | 403)
+                rate_limited |= response.status().as_u16() == 429;
+                if matches!(response.status().as_u16(), 401..=403)
                     && let Err(response) = quarantine_key(&state, id).await
                 {
                     return response;
@@ -1474,6 +1896,11 @@ async fn multimodal(
                 }
             }
         }
+    }
+    if rate_limited && let Some(seconds) = retry_after_for_keys(&state.vault.list()) {
+        return HttpResponse::TooManyRequests()
+            .insert_header(("retry-after", seconds.to_string()))
+            .json(json!({"error":{"message":"All NVIDIA upstream keys are rate limited","type":"upstream_rate_limited"}}));
     }
     HttpResponse::ServiceUnavailable().json(json!({"error":{"message":"No eligible NVIDIA upstream key","type":"upstream_unavailable"}}))
 }
@@ -1616,6 +2043,22 @@ fn retry_after_duration(response: &reqwest::Response) -> Option<Duration> {
     let remaining = deadline.duration_since(std::time::SystemTime::now()).ok()?;
     let seconds = i64::try_from(remaining.as_secs()).ok()?.clamp(1, 300);
     Some(Duration::seconds(seconds))
+}
+
+fn retry_after_for_keys(keys: &[nvidia_build_lb_core::KeySummary]) -> Option<u64> {
+    let now = Utc::now();
+    if keys.is_empty()
+        || keys.iter().any(|key| {
+            key.enabled && key.verified && key.cooldown_until.is_none_or(|until| until <= now)
+        })
+    {
+        return None;
+    }
+    keys.iter()
+        .filter_map(|key| key.cooldown_until)
+        .filter_map(|until| (until - now).num_seconds().try_into().ok())
+        .min()
+        .map(|seconds: u64| seconds.clamp(1, 300))
 }
 
 fn model_not_found() -> HttpResponse {
@@ -1852,6 +2295,7 @@ fn validate_chat_request(request: &Value) -> Result<(), HttpResponse> {
         "seed",
         "frequency_penalty",
         "presence_penalty",
+        "metadata",
     ];
     let allowed = if model == "z-ai/glm-5.2" {
         GLM_ALLOWED
@@ -2221,13 +2665,15 @@ fn mock_modality(path: &str, request: &Value) -> (Vec<u8>, &'static str) {
 }
 
 fn mock_jpeg() -> Vec<u8> {
-    vec![0xff, 0xd8, 0xff, 0xd9]
+    base64::engine::general_purpose::STANDARD
+        .decode("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAH/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAEFAqf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/AYf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/AYf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAY/Av/Z")
+        .expect("built-in JPEG fixture is valid base64")
 }
 
 fn mock_wav() -> Vec<u8> {
-    let mut bytes = vec![0_u8; 44];
+    let mut bytes = vec![0_u8; 48];
     bytes[0..4].copy_from_slice(b"RIFF");
-    bytes[4..8].copy_from_slice(&36_u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&40_u32.to_le_bytes());
     bytes[8..12].copy_from_slice(b"WAVE");
     bytes[12..16].copy_from_slice(b"fmt ");
     bytes[16..20].copy_from_slice(&16_u32.to_le_bytes());
@@ -2236,13 +2682,15 @@ fn mock_wav() -> Vec<u8> {
     bytes[24..28].copy_from_slice(&44_100_u32.to_le_bytes());
     bytes[34..36].copy_from_slice(&16_u16.to_le_bytes());
     bytes[36..40].copy_from_slice(b"data");
+    bytes[40..44].copy_from_slice(&4_u32.to_le_bytes());
+    bytes[44..48].copy_from_slice(&[0, 0, 0, 0]);
     bytes
 }
 
 fn mock_mp4() -> Vec<u8> {
     vec![
         0, 0, 0, 24, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0, 0, b'i', b's', b'o',
-        b'm', b'm', b'o', b'o', b'v',
+        b'm', b'm', b'p', b'4', 0, 0, 0, 8, b'm', b'o', b'o', b'v',
     ]
 }
 
@@ -2261,16 +2709,79 @@ fn mock_response(request: &Value, stream: bool) -> HttpResponse {
             "data: {}\n\ndata: [DONE]\n\n",
             json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
         ));
+        let chunks = vec![first, terminal];
+        let delay = env::var("NBLB_MOCK_STREAM_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(StdDuration::from_millis);
+        let body = stream::unfold((chunks, 0_usize), move |(chunks, index)| async move {
+            let chunk = chunks.get(index).cloned()?;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            Some((Ok::<Bytes, actix_web::Error>(chunk), (chunks, index + 1)))
+        });
         HttpResponse::Ok()
             .insert_header(("content-type", "text/event-stream"))
             .insert_header(("cache-control", "no-cache"))
-            .streaming(stream::iter(vec![
-                Ok::<Bytes, actix_web::Error>(first),
-                Ok(terminal),
-            ]))
+            .streaming(body)
     } else {
         HttpResponse::Ok().json(json!({"id":id,"object":"chat.completion","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":"NVIDIA Build LB"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":3,"total_tokens":3}}))
     }
+}
+
+/// Mock streaming uses the same durable stream guard as a real provider. The
+/// first frame is intentionally yielded by the body stream (rather than
+/// before the response is returned), so a client timeout exercises the actual
+/// disconnect/cancellation path in PostgreSQL smoke.
+fn mock_stream_response(
+    request: &Value,
+    state: web::Data<AppState>,
+    request_id: Uuid,
+    key_id: Uuid,
+) -> HttpResponse {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("z-ai/glm-5.2")
+        .to_owned();
+    let id = format!("chatcmpl-{}", Uuid::new_v4());
+    let chunks = vec![
+        Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":"NVIDIA Build LB"},"finish_reason":null}]})
+        )),
+        Bytes::from(format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+        )),
+    ];
+    let delay = env::var("NBLB_MOCK_STREAM_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(StdDuration::from_millis);
+    let upstream: UpstreamByteStream = Box::pin(stream::unfold(
+        (chunks, 0_usize),
+        move |(chunks, index)| async move {
+            let chunk = chunks.get(index).cloned()?;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            Some((Ok::<Bytes, reqwest::Error>(chunk), (chunks, index + 1)))
+        },
+    ));
+    let downstream = chat_response_stream(
+        upstream,
+        SseValidator::default(),
+        VecDeque::new(),
+        state,
+        request_id,
+        key_id,
+    );
+    HttpResponse::Ok()
+        .insert_header(("content-type", "text/event-stream"))
+        .insert_header(("cache-control", "no-cache"))
+        .streaming(downstream)
 }
 
 fn validate_chat_response(body: &[u8], stream: bool) -> Result<(), ()> {
@@ -2321,18 +2832,19 @@ fn validate_chat_response(body: &[u8], stream: bool) -> Result<(), ()> {
         {
             return Err(());
         }
-        if let Some(message) = choice.get("message") {
-            let message = message.as_object().ok_or(())?;
-            if message
-                .keys()
-                .any(|key| !matches!(key.as_str(), "role" | "content" | "tool_calls" | "refusal"))
-                || message
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-            {
-                return Err(());
-            }
+        let message = choice.get("message").and_then(Value::as_object).ok_or(())?;
+        if message
+            .keys()
+            .any(|key| !matches!(key.as_str(), "role" | "content"))
+            || message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            || message
+                .get("content")
+                .is_some_and(|value| !value.is_string() && !value.is_null())
+        {
+            return Err(());
         }
     }
     if let Some(usage) = object.get("usage") {
@@ -2360,7 +2872,58 @@ fn sse_error_frame(message: &str) -> Bytes {
     ))
 }
 
+fn canonical_sse_chunk(bytes: &[u8]) -> Bytes {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Bytes::new();
+    };
+    let normalized = text.replace("\r\n", "\n");
+    let mut output = String::new();
+    for frame in normalized.split("\n\n") {
+        if frame.is_empty() {
+            continue;
+        }
+        let mut data = Vec::new();
+        for line in frame.lines() {
+            if let Some(value) = line.strip_prefix("data:") {
+                data.push(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        if !data.is_empty() {
+            output.push_str("data: ");
+            output.push_str(&data.join("\n"));
+            output.push_str("\n\n");
+        }
+    }
+    if output.is_empty() {
+        Bytes::new()
+    } else {
+        Bytes::from(output)
+    }
+}
+
 type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+async fn prime_stream(
+    mut upstream: UpstreamByteStream,
+) -> Result<(UpstreamByteStream, SseValidator, VecDeque<Bytes>), ()> {
+    let mut validator = SseValidator::default();
+    let mut prefix = VecDeque::new();
+    loop {
+        match upstream.next().await {
+            Some(Ok(chunk)) => {
+                validator.feed(&chunk)?;
+                prefix.push_back(chunk);
+                if validator.frame_count > 0 {
+                    return Ok((upstream, validator, prefix));
+                }
+                if prefix.len() > 256 {
+                    return Err(());
+                }
+            }
+            Some(Err(_)) | None => return Err(()),
+        }
+    }
+}
 
 struct StreamAttemptGuard {
     state: web::Data<AppState>,
@@ -2381,11 +2944,27 @@ impl Drop for StreamAttemptGuard {
         // terminal update is therefore scheduled from Drop so a started row
         // cannot survive an abandoned downstream connection.
         tokio::spawn(async move {
-            let _ = state
+            if let Err(error) = state
                 .vault
                 .attempt_finished(request_id, key_id, "cancelled")
-                .await;
+                .await
+            {
+                eprintln!("stream cancellation ledger update failed: {error:#}");
+            }
         });
+    }
+}
+
+async fn finish_stream_failure(state: &web::Data<AppState>, request_id: Uuid, key_id: Uuid) {
+    if record_failure(state, key_id, None).await.is_err() {
+        eprintln!("stream failure health update failed");
+    }
+    if let Err(error) = state
+        .vault
+        .attempt_finished(request_id, key_id, "failed")
+        .await
+    {
+        eprintln!("stream failure ledger update failed: {error:#}");
     }
 }
 
@@ -2492,6 +3071,15 @@ impl SseValidator {
             return Ok(());
         }
         let value: Value = serde_json::from_str(&data).map_err(|_| ())?;
+        let object = value.as_object().ok_or(())?;
+        if object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "id" | "object" | "model" | "choices" | "created"
+            )
+        }) {
+            return Err(());
+        }
         let id = value.get("id").and_then(Value::as_str).ok_or(())?;
         let model = value.get("model").and_then(Value::as_str).ok_or(())?;
         if value.get("object").and_then(Value::as_str) != Some("chat.completion.chunk")
@@ -2520,8 +3108,20 @@ impl SseValidator {
         }
         if choices.iter().any(|choice| {
             !choice.is_object()
+                || choice.as_object().is_some_and(|choice| {
+                    choice
+                        .keys()
+                        .any(|key| !matches!(key.as_str(), "index" | "delta" | "finish_reason"))
+                })
                 || choice.get("index").and_then(Value::as_u64).is_none()
-                || choice.get("delta").and_then(Value::as_object).is_none()
+                || choice
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .is_none_or(|delta| {
+                        delta
+                            .keys()
+                            .any(|key| !matches!(key.as_str(), "role" | "content"))
+                    })
                 || !choice
                     .get("finish_reason")
                     .is_some_and(|reason| reason.is_null() || reason.is_string())
@@ -2534,6 +3134,8 @@ impl SseValidator {
 
 fn chat_response_stream(
     upstream: UpstreamByteStream,
+    validator: SseValidator,
+    prefix: VecDeque<Bytes>,
     state: web::Data<AppState>,
     request_id: Uuid,
     key_id: Uuid,
@@ -2542,7 +3144,8 @@ fn chat_response_stream(
     stream::unfold(
         (
             upstream,
-            SseValidator::default(),
+            validator,
+            prefix,
             state,
             request_id,
             key_id,
@@ -2554,83 +3157,98 @@ fn chat_response_stream(
             },
             false,
         ),
-        |(mut upstream, mut validator, state, request_id, key_id, guard, mut terminal)| async move {
+        |(
+            mut upstream,
+            mut validator,
+            mut prefix,
+            state,
+            request_id,
+            key_id,
+            guard,
+            mut terminal,
+        )| async move {
             if terminal {
                 return None;
+            }
+            if let Some(chunk) = prefix.pop_front() {
+                return Some((
+                    Ok(canonical_sse_chunk(&chunk)),
+                    (
+                        upstream, validator, prefix, state, request_id, key_id, guard, terminal,
+                    ),
+                ));
             }
             match upstream.next().await {
                 Some(Ok(chunk)) => {
                     if validator.feed(&chunk).is_err() {
-                        let _ = record_failure(&state, key_id, None).await;
-                        let _ = state
-                            .vault
-                            .attempt_finished(request_id, key_id, "failed")
-                            .await;
+                        finish_stream_failure(&state, request_id, key_id).await;
                         terminal = true;
                         guard.terminal.store(true, Ordering::Release);
                         return Some((
                             Ok(sse_error_frame("invalid upstream stream")),
                             (
-                                upstream, validator, state, request_id, key_id, guard, terminal,
+                                upstream, validator, prefix, state, request_id, key_id, guard,
+                                terminal,
                             ),
                         ));
                     }
                     Some((
-                        Ok(chunk),
+                        Ok(canonical_sse_chunk(&chunk)),
                         (
-                            upstream, validator, state, request_id, key_id, guard, terminal,
+                            upstream, validator, prefix, state, request_id, key_id, guard, terminal,
                         ),
                     ))
                 }
                 Some(Err(_)) => {
-                    let _ = record_failure(&state, key_id, None).await;
-                    let _ = state
-                        .vault
-                        .attempt_finished(request_id, key_id, "failed")
-                        .await;
+                    finish_stream_failure(&state, request_id, key_id).await;
                     terminal = true;
                     guard.terminal.store(true, Ordering::Release);
                     Some((
                         Ok(sse_error_frame("upstream stream failed")),
                         (
-                            upstream, validator, state, request_id, key_id, guard, terminal,
+                            upstream, validator, prefix, state, request_id, key_id, guard, terminal,
                         ),
                     ))
                 }
                 None => {
                     if validator.finish().is_err() {
-                        let _ = record_failure(&state, key_id, None).await;
-                        let _ = state
-                            .vault
-                            .attempt_finished(request_id, key_id, "failed")
-                            .await;
+                        finish_stream_failure(&state, request_id, key_id).await;
                         guard.terminal.store(true, Ordering::Release);
                         return Some((
                             Ok(sse_error_frame("incomplete upstream stream")),
-                            (upstream, validator, state, request_id, key_id, guard, true),
+                            (
+                                upstream, validator, prefix, state, request_id, key_id, guard, true,
+                            ),
                         ));
                     }
                     if record_request(&state, key_id).await.is_err() {
-                        let _ = state
+                        if let Err(error) = state
                             .vault
                             .attempt_finished(request_id, key_id, "failed")
-                            .await;
+                            .await
+                        {
+                            eprintln!("stream accounting ledger update failed: {error:#}");
+                        }
                         guard.terminal.store(true, Ordering::Release);
                         return Some((
                             Ok(sse_error_frame("request accounting unavailable")),
-                            (upstream, validator, state, request_id, key_id, guard, true),
+                            (
+                                upstream, validator, prefix, state, request_id, key_id, guard, true,
+                            ),
                         ));
                     }
-                    if state
+                    if let Err(error) = state
                         .vault
                         .attempt_finished(request_id, key_id, "succeeded")
                         .await
-                        .is_err()
                     {
+                        eprintln!("stream success ledger update failed: {error:#}");
                         guard.terminal.store(true, Ordering::Release);
                         return Some((
                             Ok(sse_error_frame("request ledger unavailable")),
-                            (upstream, validator, state, request_id, key_id, guard, true),
+                            (
+                                upstream, validator, prefix, state, request_id, key_id, guard, true,
+                            ),
                         ));
                     }
                     guard.terminal.store(true, Ordering::Release);
@@ -2652,7 +3270,48 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
 }
 
 fn valid_jpeg(bytes: &[u8]) -> bool {
-    bytes.len() >= 4 && bytes.starts_with(&[0xff, 0xd8]) && bytes.ends_with(&[0xff, 0xd9])
+    if bytes.len() < 16 || !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
+        return false;
+    }
+    let mut index = 2;
+    let mut has_frame = false;
+    while index + 3 < bytes.len().saturating_sub(2) {
+        if bytes[index] != 0xff {
+            index += 1;
+            continue;
+        }
+        while index < bytes.len() && bytes[index] == 0xff {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let marker = bytes[index];
+        index += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if marker == 0xd8 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if index + 2 > bytes.len() {
+            return false;
+        }
+        let segment_len = u16::from_be_bytes([bytes[index], bytes[index + 1]]) as usize;
+        if segment_len < 2 || index + segment_len > bytes.len() {
+            return false;
+        }
+        if (0xc0..=0xc3).contains(&marker) {
+            if segment_len < 7 {
+                return false;
+            }
+            let height = u16::from_be_bytes([bytes[index + 3], bytes[index + 4]]);
+            let width = u16::from_be_bytes([bytes[index + 5], bytes[index + 6]]);
+            has_frame = width > 0 && height > 0;
+        }
+        index += segment_len;
+    }
+    has_frame
 }
 
 fn valid_image(bytes: &[u8]) -> bool {
@@ -2684,11 +3343,25 @@ fn valid_wav(bytes: &[u8]) -> bool {
     let channels = u16::from_le_bytes(bytes[22..24].try_into().unwrap_or_default());
     let sample_rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap_or_default());
     let bits = u16::from_le_bytes(bytes[34..36].try_into().unwrap_or_default());
+    let riff_size = u32::from_le_bytes(bytes[4..8].try_into().unwrap_or_default()) as usize;
+    let Some(data_offset) = bytes.windows(4).position(|chunk| chunk == b"data") else {
+        return false;
+    };
+    if data_offset + 8 > bytes.len() {
+        return false;
+    }
+    let data_size = u32::from_le_bytes(
+        bytes[data_offset + 4..data_offset + 8]
+            .try_into()
+            .unwrap_or_default(),
+    ) as usize;
     fmt_size >= 16
         && channels == 1
         && sample_rate == 44_100
         && bits == 16
-        && bytes.windows(4).any(|chunk| chunk == b"data")
+        && riff_size + 8 == bytes.len()
+        && data_size > 0
+        && data_offset + 8 + data_size == bytes.len()
 }
 
 fn valid_data_url(value: &str, image_only: bool) -> bool {
@@ -2885,25 +3558,23 @@ async fn authorize_scope(
 }
 
 fn authorized(req: &HttpRequest, state: &AppState) -> bool {
-    admin_surface_allowed(req)
+    admin_surface_allowed(req, state)
         && bearer(req).is_some_and(|value| {
             constant_time_equal(value.as_bytes(), state.admin_token.as_bytes())
         })
 }
 
-fn admin_surface_allowed(req: &HttpRequest) -> bool {
+fn admin_surface_allowed(req: &HttpRequest, state: &AppState) -> bool {
     let raw_host = req
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let host = raw_host
-        .strip_prefix('[')
-        .and_then(|value| value.split_once(']').map(|(host, _)| host))
-        .unwrap_or_else(|| raw_host.split(':').next().unwrap_or_default())
-        .to_ascii_lowercase();
-    let host_allowed = admin_host_allowed(&host);
-    if !host_allowed {
+    if raw_host.contains(',') {
+        return false;
+    }
+    let (host, port) = parse_host_authority(raw_host);
+    if !admin_host_allowed(&host) || port.is_some_and(|port| port != state.public_port) {
         return false;
     }
     let Some(origin) = req.headers().get(header::ORIGIN) else {
@@ -2912,10 +3583,27 @@ fn admin_surface_allowed(req: &HttpRequest) -> bool {
     let Ok(origin) = origin.to_str() else {
         return false;
     };
-    origin == format!("https://{host}")
-        || origin == format!("http://{host}")
-        || origin == "http://localhost:2456"
-        || origin == "http://127.0.0.1:2456"
+    origin == format!("https://{host}:{}", state.public_port)
+        || origin == format!("http://{host}:{}", state.public_port)
+        || (state.public_port == 80 && origin == format!("http://{host}"))
+        || (state.public_port == 443 && origin == format!("https://{host}"))
+}
+
+fn parse_host_authority(raw: &str) -> (String, Option<u16>) {
+    if let Some(value) = raw.strip_prefix('[')
+        && let Some((host, remainder)) = value.split_once(']')
+    {
+        let port = remainder
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok());
+        return (host.to_ascii_lowercase(), port);
+    }
+    if let Some((host, port)) = raw.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host.to_ascii_lowercase(), Some(port));
+    }
+    (raw.to_ascii_lowercase(), None)
 }
 
 fn admin_host_allowed(raw_host: &str) -> bool {

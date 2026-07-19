@@ -328,10 +328,12 @@ def test_build_candidate_probes_before_enable_and_persists_stage_contracts() -> 
 def test_build_candidate_recipe_owns_deterministic_runtime_gate() -> None:
     script = _text("scripts/qa/build-candidate.sh")
 
-    assert script.count("docker buildx build --pull --no-cache --provenance=false") == 2
-    assert script.count("--build-arg SOURCE_DATE_EPOCH=0") == 2
-    assert script.count("rewrite-timestamp=true") == 2
-    assert script.count("docker load --input") == 2
+    # The Rust candidate owns immutable application, PostgreSQL, and fixture
+    # images. Keep this sensor aligned with the three-image release recipe.
+    assert script.count("docker buildx build --pull --no-cache --provenance=false") == 3
+    assert script.count("--build-arg SOURCE_DATE_EPOCH=0") == 3
+    assert script.count("rewrite-timestamp=true") == 3
+    assert script.count("docker load --input") == 3
     assert "uv run python -m scripts.qa.source_manifest" in script
     assert "uv run python -m scripts.qa.source_snapshot" in script
     assert '"$CLIENT_DIR/source-snapshot"' in script
