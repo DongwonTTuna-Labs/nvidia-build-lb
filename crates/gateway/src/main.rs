@@ -3659,9 +3659,7 @@ fn eligible_key_count(keys: &[nvidia_build_lb_core::KeySummary]) -> usize {
     let now = Utc::now();
     keys.iter()
         .filter(|key| {
-            key.enabled
-                && key.verified
-                && key.cooldown_until.is_none_or(|until| until <= now)
+            key.enabled && key.verified && key.cooldown_until.is_none_or(|until| until <= now)
         })
         .count()
 }
