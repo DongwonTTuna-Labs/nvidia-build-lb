@@ -5,16 +5,26 @@
       "apps/admin/**/*.ts",
       "apps/admin/**/*.svelte",
       "apps/admin/**/*.json",
+      "apps/public/**/*.ts",
+      "apps/public/**/*.svelte",
+      "apps/public/**/*.json",
       "package.json",
       "biome.json",
       "knip.json",
       "!apps/admin/.svelte-kit",
       "!apps/admin/build",
+      "!apps/public/.svelte-kit",
+      "!apps/public/build",
       "!node_modules",
       "!.venv"
     ]
   },
   "formatter": { "enabled": true, "indentStyle": "space", "lineWidth": 100 },
   "linter": { "enabled": true, "rules": { "preset": "recommended" } },
-  "overrides": [{ "includes": ["apps/admin/**/*.svelte"], "linter": { "enabled": false } }]
+  "overrides": [
+    {
+      "includes": ["apps/admin/**/*.svelte", "apps/public/**/*.svelte"],
+      "linter": { "enabled": false }
+    }
+  ]
 }

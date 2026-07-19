@@ -1093,6 +1093,9 @@ fn routes(cfg: &mut web::ServiceConfig) {
                     hosts.next().is_none() && admin_host_allowed(host)
                 })),
         );
+    // Keep the public status artifact separate from the loopback-only admin
+    // files so the root dashboard cannot expose operator data by fallback.
+    cfg.service(Files::new("/", "/app/public").index_file("index.html"));
 }
 
 async fn build_state() -> Result<AppState> {
@@ -1171,7 +1174,7 @@ async fn build_state() -> Result<AppState> {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(2456),
-        csp_hashes: static_script_hashes("/app/static"),
+        csp_hashes: static_script_hashes(&["/app/static", "/app/public"]),
     })
 }
 
@@ -1195,10 +1198,14 @@ async fn seed_existing_routing_profiles(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-fn static_script_hashes(root: &str) -> Vec<String> {
-    ["index.html"]
-        .into_iter()
-        .filter_map(|name| std::fs::read_to_string(std::path::Path::new(root).join(name)).ok())
+fn static_script_hashes(roots: &[&str]) -> Vec<String> {
+    roots
+        .iter()
+        .flat_map(|root| {
+            ["index.html"].into_iter().filter_map(|name| {
+                std::fs::read_to_string(std::path::Path::new(root).join(name)).ok()
+            })
+        })
         .flat_map(|html| inline_script_bodies(&html))
         .map(|body| {
             use base64::{Engine as _, engine::general_purpose::STANDARD};
