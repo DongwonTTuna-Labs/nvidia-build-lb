@@ -829,8 +829,10 @@ struct Health {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // The container listener is an internal contract.  The published host
+    // port is used only for Host/Origin validation and must never move the
+    // listener away from the compose target port.
     let port = env::var("NVIDIA_BUILD_LB_BIND_PORT")
-        .or_else(|_| env::var("NVIDIA_BUILD_LB_PUBLIC_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2456);

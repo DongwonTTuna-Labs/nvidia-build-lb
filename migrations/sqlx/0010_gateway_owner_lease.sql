@@ -19,9 +19,9 @@ CREATE INDEX IF NOT EXISTS gateway_instances_last_seen_idx
     ON nblb.gateway_instances (last_seen_at);
 
 -- Rows written before owner leases cannot be safely attributed to a live
--- process. A recent owner-less row may still belong to a live legacy process;
--- fail the migration instead of silently terminating that request. Older rows
--- are safe to reconcile as abandoned evidence.
+-- process. Fail the migration while any owner-less request is still open;
+-- age is not proof that a draining legacy process has stopped, and silently
+-- closing the row could corrupt the request's eventual terminal evidence.
 DO $$
 BEGIN
     IF EXISTS (
@@ -29,14 +29,9 @@ BEGIN
         FROM nblb.request_attempts
         WHERE finished_at IS NULL
           AND owner_id IS NULL
-          AND created_at >= now() - interval '30 seconds'
     ) THEN
         RAISE EXCEPTION
-            'cannot adopt gateway owner lease while a live legacy request attempt exists';
+            'cannot adopt gateway owner lease while an owner-less legacy request attempt is open';
     END IF;
 END
 $$;
-
-UPDATE nblb.request_attempts
-SET outcome = 'abandoned_after_restart', finished_at = now()
-WHERE finished_at IS NULL AND owner_id IS NULL;
