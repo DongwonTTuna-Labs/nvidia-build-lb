@@ -4183,10 +4183,11 @@ fn admin_surface_allowed(req: &HttpRequest, state: &AppState) -> bool {
     let Ok(origin) = origin.to_str() else {
         return false;
     };
-    origin == format!("https://{host}:{}", state.public_port)
-        || origin == format!("http://{host}:{}", state.public_port)
-        || (state.public_port == 80 && origin == format!("http://{host}"))
-        || (state.public_port == 443 && origin == format!("https://{host}"))
+    let origin_host = format_origin_host(&host);
+    origin == format!("https://{origin_host}:{}", state.public_port)
+        || origin == format!("http://{origin_host}:{}", state.public_port)
+        || (state.public_port == 80 && origin == format!("http://{origin_host}"))
+        || (state.public_port == 443 && origin == format!("https://{origin_host}"))
 }
 
 fn parse_host_authority(raw: &str) -> (String, Option<u16>) {
@@ -4204,6 +4205,14 @@ fn parse_host_authority(raw: &str) -> (String, Option<u16>) {
         return (host.to_ascii_lowercase(), Some(port));
     }
     (raw.to_ascii_lowercase(), None)
+}
+
+fn format_origin_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
 }
 
 fn admin_host_allowed(raw_host: &str) -> bool {
@@ -4366,10 +4375,10 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        SseValidator, admin_host_allowed, bearer, eligible_key_count, inline_script_bodies,
-        parse_multimodal_request, percent_encode_userinfo, should_migrate_file_vault,
-        upstream_endpoint, upstream_endpoint_for, validate_admin_token, validate_chat_request,
-        validate_chat_response,
+        SseValidator, admin_host_allowed, bearer, eligible_key_count, format_origin_host,
+        inline_script_bodies, parse_multimodal_request, percent_encode_userinfo,
+        should_migrate_file_vault, upstream_endpoint, upstream_endpoint_for, validate_admin_token,
+        validate_chat_request, validate_chat_response,
     };
     use actix_web::http::header;
     use actix_web::test::TestRequest;
@@ -4505,6 +4514,8 @@ mod tests {
     fn admin_host_boundary_handles_ipv6_and_header_confusion() {
         assert!(admin_host_allowed("[::1]:2456"));
         assert!(admin_host_allowed("::1"));
+        assert_eq!(format_origin_host("::1"), "[::1]");
+        assert_eq!(format_origin_host("127.0.0.1"), "127.0.0.1");
         assert!(!admin_host_allowed("127.0.0.1:2456,evil"));
         assert!(!admin_host_allowed(""));
     }
