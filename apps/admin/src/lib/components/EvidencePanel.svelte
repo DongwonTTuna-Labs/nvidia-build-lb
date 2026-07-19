@@ -33,8 +33,8 @@ export let onEvent: (event: AdminEvent) => void;
     {#if checks.length}<div class="check-list"><h3>슬롯별 확인</h3>{#each checks as check}<p><strong>{check.label}</strong><span>{checkStatusLabel(check.status)} · {check.request_count}회 요청 · {check.failure_count}회 실패</span></p>{/each}</div>{/if}
     {#if attentions.length}<div class="attention-list" role="status" aria-live="polite"><h3>먼저 확인할 주의</h3>{#each attentions as attention}<p class="attention"><strong>{attention.label ?? attentionLabel(attention.code)}</strong><span>{actionLabel(attention.next_action)}</span><button class="link-button" type="button" onclick={() => onAttention(attention)}>{attention.next_action === "probe" ? "검증 시작" : `${actionLabel(attention.next_action)} 열기`}</button></p>{/each}</div>{/if}
     {#if adminEvents.length}<div class="check-list"><h3>최근 작업</h3>{#each adminEvents as event}<p><strong>{eventKindLabel(event.kind ?? "request_attempt")}</strong><span>{event.profile_id ?? "프로필 미상"} · {outcomeLabel(event.outcome ?? "")}{#if event.created_at} · {formatDateTime(event.created_at)}{/if}</span><button class="link-button" type="button" onclick={() => onEvent(event)}>상세 보기</button></p>{/each}</div>{/if}
-    {#if evidence.source_of_truth === "unavailable"}<p class="attention">지속성 증거를 확인하지 못했습니다. 이 snapshot을 운영 증거로 사용하지 말고 저장소 상태를 다시 확인하세요.</p>{/if}
-    {#if (state === "degraded" || state === "stale" || state === "partial") && eligibleKeys === 0}<p class="attention">현재 요청 가능한 키가 없습니다. 라우팅에서 cooldown·중지 원인을 확인하세요.</p>{/if}
+    {#if evidence.source_of_truth === "unavailable"}<p class="attention" role="status" aria-live="polite">지속성 증거를 확인하지 못했습니다. 이 snapshot을 운영 증거로 사용하지 말고 저장소 상태를 다시 확인하세요.</p>{/if}
+    {#if (state === "degraded" || state === "stale" || state === "partial") && eligibleKeys === 0}<p class="attention" role="status" aria-live="polite">현재 요청 가능한 키가 없습니다. 라우팅에서 cooldown·중지 원인을 확인하세요.</p>{/if}
   {/if}
 </section>
 

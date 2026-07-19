@@ -291,6 +291,7 @@ async function refresh() {
   loading = true;
   state = "loading";
   error = "";
+  upstreamError = "";
   clientError = "";
   notice = "";
   const timeout = setTimeout(() => controller.abort(), 10_000);
@@ -1186,7 +1187,7 @@ onMount(() => {
 
   {#if authenticated}
   <RouteNavigation active={active} onSelect={(route) => void selectRoute(route)} />
-  <p id="nav-hint" class="nav-hint">모바일에서는 좌우로 메뉴를 더 볼 수 있습니다.</p>
+  <p class="nav-hint">모바일에서는 좌우로 메뉴를 더 볼 수 있습니다.</p>
 
   <main id="main-content" aria-busy={loading}>
     <div class="route-heading"><p class="eyebrow">{routeTitle[active]}</p><h1 id="route-heading" bind:this={routeHeading} tabindex="-1">{routeTitle[active]}</h1><p class="muted">{routeDescription[active]}</p></div>

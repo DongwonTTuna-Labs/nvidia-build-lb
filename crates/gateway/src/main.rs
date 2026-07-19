@@ -671,6 +671,16 @@ async fn sync_database_delta(
                 bail!("concurrent upstream retirement state")
             }
         }
+        // Provider receipts are invalid once a key loses verification or is
+        // durably retired. Delete them in this transaction so capability
+        // projections cannot observe proof from an older credential state.
+        if (!current.verified && previous.verified) || (current.retired && !previous.retired) {
+            sqlx::query("DELETE FROM nblb.profile_probe_receipts WHERE key_id=$1")
+                .bind(current.id)
+                .execute(&mut *tx)
+                .await
+                .context("invalidate stale profile provider receipts")?;
+        }
         if current.cooldown_until != previous.cooldown_until {
             let result = sqlx::query(
                 "UPDATE nblb.upstream_keys SET cooldown_until=$2 WHERE id=$1 AND cooldown_until IS NOT DISTINCT FROM $3",
@@ -1384,7 +1394,7 @@ async fn operator_readiness(req: HttpRequest, state: web::Data<AppState>) -> imp
         }))
 }
 
-/// Returns the durable profile/key provider receipts.  A successful key-level
+/// Returns the durable profile/key provider receipts. A successful key-level
 /// probe alone must never make every modality appear ready.
 async fn profile_proof_keys(state: &AppState) -> Result<HashMap<String, HashSet<Uuid>>> {
     let Some(pool) = &state.vault.database else {
@@ -1413,30 +1423,13 @@ async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl Responder 
     if let Err(response) = authorize_scope(&req, &state, "models:read").await {
         return response;
     }
-    let keys = state.vault.list();
-    let eligible = keys
-        .iter()
-        .filter(|key| {
-            key.enabled
-                && key.verified
-                && key.cooldown_until.is_none_or(|until| until <= Utc::now())
-        })
-        .map(|key| key.id)
-        .collect::<HashSet<_>>();
-    let proofs = match profile_proof_keys(&state).await {
-        Ok(proofs) => proofs,
-        Err(_) => {
-            return HttpResponse::ServiceUnavailable()
-                .json(json!({"error":{"code":"capability_state_unavailable"}}));
-        }
-    };
+    // Keep the public OpenAI-compatible model catalog discoverable before a
+    // first request succeeds. Provider proof is an operational readiness
+    // signal, exposed by the admin capability/readiness endpoints below; it
+    // must not create a discovery deadlock for clients that need the model ID
+    // in order to make that first request.
     let data: Vec<Value> = PROFILES
         .iter()
-        .filter(|id| {
-            proofs
-                .get(**id)
-                .is_some_and(|key_ids| key_ids.iter().any(|key_id| eligible.contains(key_id)))
-        })
         .map(|id| json!({"id": id, "object": "model", "owned_by": "nvidia", "created": 1784332800}))
         .collect();
     HttpResponse::Ok().json(json!({"object":"list","data":data}))
@@ -2018,6 +2011,9 @@ async fn probe_key(
     };
     if state.upstream_url.starts_with("mock://") {
         if credential.contains("fail") {
+            if let Err(response) = quarantine_key(&state, id).await {
+                return response;
+            }
             return HttpResponse::UnprocessableEntity().json(json!({
                 "probe_status": "invalid_credential",
                 "error": {"code": "invalid_upstream_credential"}
