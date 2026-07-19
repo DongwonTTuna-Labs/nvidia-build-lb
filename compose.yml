@@ -81,16 +81,13 @@ services:
     image: ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_APP_REGISTRY_DIGEST:?raw application registry digest required}
     environment:
       NBLB_DATABASE_URL: postgres://nvidia_build_lb@db/nvidia_build_lb
-      NBLB_VAULT_MASTER_KEY_FILE: /run/nvidia-build-lb/secrets/vault_master_key
       NBLB_UPSTREAM_URL: ${NBLB_UPSTREAM_URL:-https://integrate.api.nvidia.com/v1/chat/completions}
+      NBLB_MAGPIE_TTS_ENDPOINT: ${NBLB_MAGPIE_TTS_ENDPOINT:-https://877104f7-e885-42b9-8de8-f6e4c6303969.invocation.api.nvcf.nvidia.com/v1/audio/synthesize}
       NBLB_REQUIRE_DOWNSTREAM_TOKEN: ${NBLB_REQUIRE_DOWNSTREAM_TOKEN:-1}
       # The container always listens on 2456; NBLB_PORT is the loopback
       # publish/Host authority accepted by the gateway.
       NVIDIA_BUILD_LB_BIND_PORT: 2456
       NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_PORT:-2456}
-      NVIDIA_BUILD_LB_ADMIN_EVENT_MAX_ROWS: ${NBLB_ADMIN_EVENT_MAX_ROWS:-100000}
-      NVIDIA_BUILD_LB_ADMIN_ATTEMPT_MAX_ROWS: ${NBLB_ADMIN_ATTEMPT_MAX_ROWS:-40000}
-      NVIDIA_BUILD_LB_ADMIN_LEDGER_PRUNE_BATCH_SIZE: ${NBLB_ADMIN_LEDGER_PRUNE_BATCH_SIZE:-1000}
     labels:
       nvidia-build-lb.component: gateway
       com.centurylinklabs.watchtower.enable: "false"

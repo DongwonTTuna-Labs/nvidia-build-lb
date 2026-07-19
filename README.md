@@ -45,9 +45,10 @@ docker build --file docker/postgres.Dockerfile --tag nvidia-build-lb-postgres:lo
 운영 compose는 root-only secret directory에 `admin_token`, `vault_master_key`,
 `db_password`를 둔 뒤 `NBLB_APP_REGISTRY_DIGEST`와
 `NBLB_POSTGRES_REGISTRY_DIGEST`를 immutable digest로 지정합니다.
+Magpie TTS의 NVCF invocation endpoint를 교체해야 하는 배포는
+`NBLB_MAGPIE_TTS_ENDPOINT`로 명시적으로 덮어씁니다.
 
 ## 관리자 UI 보안
 
 Svelte static HTML의 inline bootstrap hash를 Rust가 기동 시 계산해 CSP
-`script-src`에 추가합니다. `/admin/showcase`는 명시적인 Rust route로 제공하며
-`/admin/showcase/`는 canonical URL로 redirect합니다.
+`script-src`에 추가합니다. 운영 관리자 화면은 `/admin` 한 경로로 제공합니다.

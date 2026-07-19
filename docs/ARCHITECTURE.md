@@ -23,8 +23,8 @@ Actix Rust gateway :2456 ── HTTPS ── NVIDIA hosted API
   `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/nvidia/inference`: profile별
   modality validation과 provider response validation
 - `/admin/api/v1/*`: admin bearer + host boundary를 통과한 운영 DTO
-- `/admin`, `/admin/showcase`: Svelte static UI. Rust가 build HTML inline bootstrap
-  hash를 계산해 CSP에 반영한다.
+- `/admin`: Svelte static UI. Rust가 build HTML inline bootstrap hash를 계산해
+  CSP에 반영한다.
 
 ## 상태 모델
 

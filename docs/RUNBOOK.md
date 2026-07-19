@@ -25,8 +25,8 @@ gateway readiness가 false면 `/admin/api/v1/operator-readiness`를 admin bearer
 - DB unhealthy: app은 watchdog으로 종료된다. DB를 먼저 복구하고 `migrate` 완료 후
   app을 재기동한다.
 - upstream 401/402/429/5xx: 해당 key cooldown과 failover evidence를 확인한다.
-- UI 404: `/admin`과 `/admin/showcase` canonical route, Cloudflare tunnel route,
-  app static artifact를 순서대로 확인한다.
+- UI 404: `/admin` route, Cloudflare tunnel route, app static artifact를 순서대로
+  확인한다.
 
 ## 복구 원칙
 

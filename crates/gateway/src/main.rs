@@ -1,14 +1,14 @@
 #![forbid(unsafe_code)]
 //! Actix gateway for the NVIDIA hosted API load balancer.
 
-use actix_files::{Files, NamedFile};
+use actix_files::Files;
 use actix_web::{
     App, HttpRequest, HttpResponse, HttpServer, Responder, guard, http::header,
     middleware::DefaultHeaders, web,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{Duration, Utc};
 use futures_util::{Stream, StreamExt, stream};
 use nvidia_build_lb_core::{
@@ -114,17 +114,30 @@ impl VaultStore {
             .fetch_all(pool)
             .await
             .context("load routing cursors")?;
-            let routing_state_empty = rows.is_empty();
             let cursors = rows
                 .into_iter()
                 .map(|(profile, slot)| (profile, slot.saturating_sub(1) as usize))
                 .collect::<BTreeMap<_, _>>();
-            if keys.is_empty() && downstream.is_empty() && routing_state_empty {
-                // PostgreSQL is authoritative as soon as it contains any
-                // durable state.  Only consult the encrypted file fallback
-                // for a genuinely empty database; a corrupt rollback copy
-                // must not prevent a valid database-backed restart.
+            let file_vault = if keys.is_empty() && downstream.is_empty() {
                 let file_vault = Vault::open(&path, master_key)?;
+                if should_migrate_file_vault(
+                    keys.len(),
+                    downstream.len(),
+                    file_vault.list().len(),
+                    file_vault.list_downstream().len(),
+                ) {
+                    Some(file_vault)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(file_vault) = file_vault {
+                // SQLx seeds routing_state rows during migration, so cursor
+                // presence is not evidence that the database contains the
+                // user's durable credentials.  Migrate a non-empty encrypted
+                // file vault whenever both credential tables are empty.
                 sync_database(pool, &file_vault).await?;
                 file_vault
             } else {
@@ -358,6 +371,15 @@ fn db_downstream_record(row: DbDownstreamRow) -> Result<VaultDownstreamRecord> {
     })
 }
 
+fn should_migrate_file_vault(
+    database_keys: usize,
+    database_downstream: usize,
+    file_keys: usize,
+    file_downstream: usize,
+) -> bool {
+    database_keys == 0 && database_downstream == 0 && (file_keys > 0 || file_downstream > 0)
+}
+
 async fn sync_database(pool: &PgPool, vault: &Vault) -> Result<()> {
     let cursors = PROFILES
         .iter()
@@ -468,6 +490,15 @@ async fn sync_database_delta(
         .collect::<HashMap<_, _>>();
     for current in current_keys {
         let Some(previous) = previous_keys.get(&current.id) else {
+            let active_count = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.upstream_keys WHERE retired = false",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .context("count active upstream keys")?;
+            if active_count >= nvidia_build_lb_core::MAX_UPSTREAM_KEYS as i64 {
+                bail!("at most two upstream credentials are supported")
+            }
             let result = sqlx::query(
                 "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING",
             )
@@ -553,11 +584,13 @@ async fn sync_database_delta(
                 .checked_sub(previous_count)
                 .context("key request count delta overflow")?;
             let result = sqlx::query(
-                "UPDATE nblb.upstream_keys SET request_count=GREATEST(0, request_count + $2) WHERE id=$1 AND request_count=$3",
+                // Request counters are additive telemetry. Do not make a
+                // successful provider response fail merely because another
+                // gateway process incremented the same row first.
+                "UPDATE nblb.upstream_keys SET request_count=GREATEST(0, request_count + $2) WHERE id=$1",
             )
             .bind(current.id)
             .bind(delta)
-            .bind(previous_count)
             .execute(&mut *tx)
             .await
             .context("update upstream request count")?;
@@ -574,11 +607,10 @@ async fn sync_database_delta(
                 .checked_sub(previous_count)
                 .context("key failure count delta overflow")?;
             let result = sqlx::query(
-                "UPDATE nblb.upstream_keys SET failure_count=GREATEST(0, failure_count + $2) WHERE id=$1 AND failure_count=$3",
+                "UPDATE nblb.upstream_keys SET failure_count=GREATEST(0, failure_count + $2) WHERE id=$1",
             )
             .bind(current.id)
             .bind(delta)
-            .bind(previous_count)
             .execute(&mut *tx)
             .await
             .context("update upstream failure count")?;
@@ -651,11 +683,10 @@ async fn sync_database_delta(
                 .checked_sub(previous_count)
                 .context("downstream request count delta overflow")?;
             let result = sqlx::query(
-                "UPDATE nblb.downstream_credentials SET request_count=GREATEST(0, request_count + $2) WHERE id=$1 AND request_count=$3",
+                "UPDATE nblb.downstream_credentials SET request_count=GREATEST(0, request_count + $2) WHERE id=$1",
             )
             .bind(current.id)
             .bind(delta)
-            .bind(previous_count)
             .execute(&mut *tx)
             .await
             .context("update downstream request count")?;
@@ -665,11 +696,10 @@ async fn sync_database_delta(
         }
         if current.last_used_at != previous.last_used_at {
             let result = sqlx::query(
-                "UPDATE nblb.downstream_credentials SET last_used_at=$2 WHERE id=$1 AND last_used_at IS NOT DISTINCT FROM $3",
+                "UPDATE nblb.downstream_credentials SET last_used_at=GREATEST(COALESCE(last_used_at, $2), $2) WHERE id=$1",
             )
             .bind(current.id)
             .bind(current.last_used_at)
-            .bind(previous.last_used_at)
             .execute(&mut *tx)
             .await
             .context("update downstream last-used timestamp")?;
@@ -685,12 +715,13 @@ async fn sync_database_delta(
         if previous.wrapping_sub(current) % 2 == 0 {
             continue;
         }
-        let previous_slot = i16::try_from(previous % 2 + 1).context("previous cursor overflow")?;
         let result = sqlx::query(
-            "UPDATE nblb.routing_state SET next_slot=CASE WHEN next_slot=1 THEN 2 ELSE 1 END, generation=generation+1 WHERE profile_id=$1 AND next_slot=$2",
+            // The advisory transaction lock serializes all cursor advances.
+            // Toggle the current database value rather than requiring the
+            // caller's possibly stale in-memory slot to still match it.
+            "UPDATE nblb.routing_state SET next_slot=CASE WHEN next_slot=1 THEN 2 ELSE 1 END, generation=generation+1 WHERE profile_id=$1",
         )
         .bind(profile)
-        .bind(previous_slot)
         .execute(&mut *tx)
         .await
         .context("update routing cursor")?;
@@ -878,8 +909,6 @@ fn routes(cfg: &mut web::ServiceConfig) {
             "/admin/api/v1/downstream-tokens/{id}",
             web::delete().to(revoke_downstream_legacy),
         )
-        .route("/admin/showcase", web::get().to(showcase))
-        .route("/admin/showcase/", web::get().to(showcase_redirect))
         .service(
             Files::new("/admin", "/app/static")
                 .index_file("index.html")
@@ -893,34 +922,6 @@ fn routes(cfg: &mut web::ServiceConfig) {
                     admin_host_allowed(host)
                 })),
         );
-}
-
-async fn showcase(req: HttpRequest) -> actix_web::Result<NamedFile> {
-    if !admin_host_allowed(
-        req.headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default(),
-    ) {
-        return Err(actix_web::error::ErrorNotFound("not found"));
-    }
-    NamedFile::open_async("/app/static/showcase.html")
-        .await
-        .map_err(actix_web::error::ErrorNotFound)
-}
-
-async fn showcase_redirect(req: HttpRequest) -> HttpResponse {
-    if !admin_host_allowed(
-        req.headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default(),
-    ) {
-        return HttpResponse::NotFound().finish();
-    }
-    HttpResponse::PermanentRedirect()
-        .insert_header((header::LOCATION, "/admin/showcase"))
-        .finish()
 }
 
 async fn build_state() -> Result<AppState> {
@@ -1003,7 +1004,7 @@ async fn build_state() -> Result<AppState> {
 }
 
 fn static_script_hashes(root: &str) -> Vec<String> {
-    ["index.html", "showcase.html"]
+    ["index.html"]
         .into_iter()
         .filter_map(|name| std::fs::read_to_string(std::path::Path::new(root).join(name)).ok())
         .flat_map(|html| inline_script_bodies(&html))
@@ -1308,7 +1309,7 @@ async fn overview(req: HttpRequest, state: web::Data<AppState>) -> impl Responde
         "attentions": attentions,
         "checks": checks,
         "public_health": {"hostname":"nvidia-lb.dongwontuna.net","status":"not_verified","next_action":"verify_public_route"},
-        "last_operation": {"kind":"overview_snapshot","status":"succeeded","observed_at":Utc::now()},
+        "snapshot_observed_at": Utc::now(),
     }))
 }
 
@@ -1828,7 +1829,7 @@ async fn revoke_downstream_legacy(
 async fn chat_completions(
     req: HttpRequest,
     state: web::Data<AppState>,
-    body: web::Json<Value>,
+    mut payload: web::Payload,
 ) -> impl Responder {
     if let Some(response) = public_guard_response(&req) {
         return response;
@@ -1836,7 +1837,14 @@ async fn chat_completions(
     if let Err(response) = authorize_scope(&req, &state, "chat:write").await {
         return response;
     }
-    let request = body.into_inner();
+    let body = match read_request_body(&mut payload, 64 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return invalid_request("request body must be valid JSON"),
+    };
     if let Err(response) = validate_chat_request(&request) {
         return response;
     }
@@ -2129,7 +2137,7 @@ async fn chat_completions(
 async fn multimodal(
     req: HttpRequest,
     state: web::Data<AppState>,
-    body: web::Bytes,
+    mut payload: web::Payload,
 ) -> impl Responder {
     if let Some(response) = public_guard_response(&req) {
         return response;
@@ -2143,6 +2151,10 @@ async fn multimodal(
     if let Err(response) = authorize_scope(&req, &state, scope).await {
         return response;
     }
+    let body = match read_request_body(&mut payload, 64 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let content_type = req
         .headers()
         .get(header::CONTENT_TYPE)
@@ -2487,6 +2499,30 @@ fn parse_multimodal_request(
     Ok(request)
 }
 
+/// Reads a request body only after the route has passed host and bearer
+/// authorization.  Using the raw Actix payload here prevents an unauthenticated
+/// caller from forcing JSON extraction and validation work before rejection.
+async fn read_request_body(
+    payload: &mut web::Payload,
+    limit: usize,
+) -> Result<Bytes, HttpResponse> {
+    let mut body = BytesMut::new();
+    while let Some(chunk) = payload.next().await {
+        let chunk = chunk.map_err(|_| {
+            HttpResponse::BadRequest().json(json!({
+                "error": {"message": "request body could not be read", "type": "invalid_request"}
+            }))
+        })?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(HttpResponse::PayloadTooLarge().json(json!({
+                "error": {"message": "request body exceeds the endpoint limit", "type": "request_too_large"}
+            })));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
 fn modality_body_limit(path: &str) -> usize {
     match path {
         "/v1/images/generations" => 256 * 1024,
@@ -2787,6 +2823,7 @@ fn validate_chat_request(request: &Value) -> Result<(), HttpResponse> {
         "frequency_penalty",
         "presence_penalty",
         "metadata",
+        "chat_template_kwargs",
     ];
     let allowed = if model == "z-ai/glm-5.2" {
         GLM_ALLOWED
@@ -2836,6 +2873,13 @@ fn validate_chat_request(request: &Value) -> Result<(), HttpResponse> {
         let Some(content) = message.get("content") else {
             return Err(invalid_request("message content is required"));
         };
+        if content.is_null()
+            && message.get("role").and_then(Value::as_str) == Some("assistant")
+            && (message.get("tool_calls").is_some_and(Value::is_array)
+                || message.get("function_call").is_some_and(Value::is_object))
+        {
+            continue;
+        }
         if !validate_chat_content(content, allowed_content) {
             return Err(invalid_request(
                 "message content does not match the selected model",
@@ -2926,12 +2970,18 @@ fn upstream_endpoint_for(configured: &str, path: &str, model: &str) -> String {
                 "https://integrate.api.nvidia.com/v1/chat/completions".to_owned()
             }
             "nvidia/nvclip" => "https://integrate.api.nvidia.com/v1/embeddings".to_owned(),
-            "nvidia/magpie-tts-multilingual" => "https://877104f7-e885-42b9-8de8-f6e4c6303969.invocation.api.nvcf.nvidia.com/v1/audio/synthesize".to_owned(),
+            "nvidia/magpie-tts-multilingual" => magpie_tts_endpoint(),
             "nvidia/parakeet-ctc-1.1b" => upstream_endpoint(configured, "/v1/audio/transcriptions"),
             _ => upstream_endpoint(configured, path),
         };
     }
     upstream_endpoint(configured, path)
+}
+
+fn magpie_tts_endpoint() -> String {
+    env::var("NBLB_MAGPIE_TTS_ENDPOINT").unwrap_or_else(|_| {
+        "https://877104f7-e885-42b9-8de8-f6e4c6303969.invocation.api.nvcf.nvidia.com/v1/audio/synthesize".to_owned()
+    })
 }
 
 fn prepare_modality_request(path: &str, request: &Value) -> Result<Value, HttpResponse> {
@@ -3574,8 +3624,6 @@ impl SseValidator {
         self.frame_count = self.frame_count.saturating_add(1);
         if data.trim() == "[DONE]" {
             self.done = true;
-            self.emitted
-                .push_back(Bytes::from_static(b"data: [DONE]\n\n"));
             return Ok(());
         }
         let value: Value = serde_json::from_str(&data).map_err(|_| ())?;
@@ -3786,7 +3834,16 @@ fn chat_response_stream(
                             ));
                         }
                         guard.terminal.store(true, Ordering::Release);
-                        return None;
+                        // Do not expose the provider's success terminator until
+                        // the durable request and attempt ledger commits have
+                        // succeeded.  A client must never observe `[DONE]` for
+                        // a request the gateway recorded as failed.
+                        return Some((
+                            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                            (
+                                upstream, validator, prefix, state, request_id, key_id, guard, true,
+                            ),
+                        ));
                     }
                 }
             }
@@ -4310,8 +4367,9 @@ async fn attempt_finished(
 mod tests {
     use super::{
         SseValidator, admin_host_allowed, bearer, eligible_key_count, inline_script_bodies,
-        parse_multimodal_request, percent_encode_userinfo, upstream_endpoint,
-        upstream_endpoint_for, validate_admin_token, validate_chat_request, validate_chat_response,
+        parse_multimodal_request, percent_encode_userinfo, should_migrate_file_vault,
+        upstream_endpoint, upstream_endpoint_for, validate_admin_token, validate_chat_request,
+        validate_chat_response,
     };
     use actix_web::http::header;
     use actix_web::test::TestRequest;
@@ -4478,6 +4536,15 @@ mod tests {
             "messages": [{"role":"user","content":{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}}]
         });
         assert!(validate_chat_request(&glm_object).is_err());
+        let glm_tool_follow_up = serde_json::json!({
+            "model": "z-ai/glm-5.2",
+            "chat_template_kwargs": {"enable_thinking": false},
+            "messages": [
+                {"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+                {"role":"tool","content":"result"}
+            ]
+        });
+        assert!(validate_chat_request(&glm_tool_follow_up).is_ok());
     }
 
     #[test]
@@ -4528,6 +4595,14 @@ mod tests {
     }
 
     #[test]
+    fn seeded_routing_rows_do_not_block_file_vault_migration() {
+        assert!(should_migrate_file_vault(0, 0, 2, 0));
+        assert!(should_migrate_file_vault(0, 0, 0, 1));
+        assert!(!should_migrate_file_vault(0, 0, 0, 0));
+        assert!(!should_migrate_file_vault(1, 0, 2, 0));
+    }
+
+    #[test]
     fn sse_validation_preserves_frames_split_across_chunks() {
         let mut validator = SseValidator::default();
         validator
@@ -4538,9 +4613,8 @@ mod tests {
             .feed(b"\n\ndata: [DONE]\n\n")
             .expect("complete frames");
         let emitted: Vec<_> = validator.take_emitted().into_iter().collect();
-        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted.len(), 1);
         assert!(std::str::from_utf8(&emitted[0]).unwrap().contains("chat-1"));
-        assert_eq!(emitted[1], bytes::Bytes::from_static(b"data: [DONE]\n\n"));
         validator.finish().expect("complete stream");
     }
 }

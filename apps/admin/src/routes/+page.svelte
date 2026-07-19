@@ -523,7 +523,7 @@ async function refresh() {
       attentions?: Attention[];
       checks?: Check[];
       public_health?: PublicHealth;
-      last_operation?: { observed_at?: string };
+      snapshot_observed_at?: string;
     };
     if (epoch !== refreshEpoch || currentAuthEpoch !== authEpoch) return;
     structuralReady = healthReady;
@@ -544,8 +544,8 @@ async function refresh() {
     attentions = Array.isArray(snapshot.attentions) ? snapshot.attentions : [];
     checks = Array.isArray(snapshot.checks) ? snapshot.checks : [];
     if (snapshot.public_health) publicHealth = snapshot.public_health;
-    lastOperation = snapshot.last_operation?.observed_at
-      ? formatDateTime(snapshot.last_operation.observed_at)
+    lastOperation = snapshot.snapshot_observed_at
+      ? formatDateTime(snapshot.snapshot_observed_at)
       : updatedAt;
     structuralReady = healthReady && snapshot.runtime?.ready === true;
     trafficReady = healthTrafficReady && snapshot.runtime?.traffic_ready === true;
@@ -963,7 +963,7 @@ async function deleteKey(key: Key) {
       const payload = await response.json().catch(() => ({}));
       throw new Error(responseMessage(payload, "NVIDIA 키를 사용 중지하지 못했습니다."));
     }
-    notice = `${key.label}을(를) 라우팅에서 사용 중지했습니다. 필요하면 다시 포함할 수 있습니다.`;
+    notice = `${key.label}을(를) 영구 폐기했습니다. 감사 이력은 보존되며, 교체하려면 새 키를 등록하세요.`;
     await refresh();
   } catch (caught) {
     if (controller.signal.aborted || operation !== mutationEpoch) return;
@@ -999,7 +999,7 @@ async function confirmDestructive(event: SubmitEvent) {
     if (action.kind === "revoke") await revokeClient(action.id);
     else {
       const key = keys.find((candidate) => candidate.id === action.id);
-      if (key && key.enabled) await deleteKey(key);
+      if (key) await deleteKey(key);
       else error = "이미 사라진 항목입니다. 최신 상태를 다시 확인하세요.";
     }
   } finally {
@@ -1414,7 +1414,7 @@ onMount(() => {
         </div>
         {#if attentions.length}<div class="attention-list" aria-labelledby="attention-title"><h3 id="attention-title">지금 확인할 주의</h3>{#each attentions as attention}<p class="attention"><span><strong>{attention.label ?? attention.code}</strong> · 다음 조치: {actionLabel(attention.next_action)}{#if attention.expires_at} · {formatDateTime(attention.expires_at)}까지{/if}</span><button class="link-button" type="button" onclick={() => void handleAttention(attention)}>{attention.next_action === "probe" ? "검증 시작" : `${actionLabel(attention.next_action)} 열기`}</button></p>{/each}</div>{/if}
         {#if checks.length}<div class="check-list" aria-labelledby="check-title"><h3 id="check-title">슬롯별 상태 점검</h3>{#each checks as check}<p><strong>{check.label}</strong><span>{checkStatusLabel(check.status)} · {check.request_count}회 요청 · {check.failure_count}회 실패</span></p>{/each}</div>{/if}
-        <div class="facts"><span>공개 경로 <strong>{publicHealth.status === "verified" ? "검증 완료" : "검증 필요"}</strong><small>{publicHealth.hostname}</small></span><span>마지막 작업 <strong>{lastOperation}</strong></span></div>
+        <div class="facts"><span>공개 경로 <strong>{publicHealth.status === "verified" ? "검증 완료" : "검증 필요"}</strong><small>{publicHealth.hostname}</small></span><span>마지막 상태 확인 <strong>{lastOperation}</strong></span></div>
     </section>
     <section id="routing" class:panel-hidden={active !== "routing"} class="panel" aria-labelledby="routing-title" hidden={active !== "routing"}>
         <h2 id="routing-title">두 슬롯의 상태</h2>
@@ -1426,7 +1426,7 @@ onMount(() => {
               {#if key}
                 {@const probe = key.verified ? "valid" : probeState[key.id]}
                 {@const eligible = key.enabled && key.verified && !key.cooldown_until}
-                <tr><th scope="row"><span id={`key-${key.id}`}>슬롯 {index + 1} · {key.label}</span><small>{key.fingerprint.slice(0, 15)}…</small></th><td data-label="상태"><span class:good={eligible} class="status"><span aria-hidden="true">{eligible ? "●" : "○"}</span> {key.cooldown_until ? "일시 대기" : !key.verified ? (probe === "invalid" ? "검증 실패" : "검증 필요") : key.enabled ? "활성" : "중지됨"}</span>{#if key.cooldown_until}<small>{formatDateTime(key.cooldown_until)}까지</small>{/if}{#if key.id === lifecycleKeyId && !key.enabled && probe !== "valid"}<small class="next-step">다음 단계: 제공자 검증을 통과하면 라우팅에 포함할 수 있습니다.</small>{/if}{#if !key.enabled && probe === "invalid"}<small>키를 교체하거나 다시 검증하세요.</small>{/if}</td><td data-label="누적">{key.request_count}회 요청 · {key.failure_count}회 실패</td><td data-label="조작" class="actions">{#if !key.verified}<button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} 제공자 검증`} onclick={() => void probeKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>{probe === "pending" ? "검증 중…" : "검증"}</button>{/if}<button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.enabled ? "라우팅 제외" : "라우팅 포함"}`} onclick={() => void toggleKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed() || (!key.enabled && probe !== "valid")}>{key.enabled ? "제외" : "포함"}</button><button class="danger" type="button" aria-label={`슬롯 ${index + 1} ${key.label} 라우팅에서 사용 중지`} onclick={(event) => openConfirmation("delete", key.id, key.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>사용 중지</button></td></tr>
+                <tr><th scope="row"><span id={`key-${key.id}`}>슬롯 {index + 1} · {key.label}</span><small>{key.fingerprint.slice(0, 15)}…</small></th><td data-label="상태"><span class:good={eligible} class="status"><span aria-hidden="true">{eligible ? "●" : "○"}</span> {key.cooldown_until ? "일시 대기" : !key.verified ? (probe === "invalid" ? "검증 실패" : "검증 필요") : key.enabled ? "활성" : "중지됨"}</span>{#if key.cooldown_until}<small>{formatDateTime(key.cooldown_until)}까지</small>{/if}{#if key.id === lifecycleKeyId && !key.enabled && probe !== "valid"}<small class="next-step">다음 단계: 제공자 검증을 통과하면 라우팅에 포함할 수 있습니다.</small>{/if}{#if !key.enabled && probe === "invalid"}<small>키를 교체하거나 다시 검증하세요.</small>{/if}</td><td data-label="누적">{key.request_count}회 요청 · {key.failure_count}회 실패</td><td data-label="조작" class="actions"><button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.verified ? "재검증" : "제공자 검증"}`} onclick={() => void probeKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>{probe === "pending" ? "검증 중…" : key.verified ? "재검증" : "검증"}</button><button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.enabled ? "라우팅 제외" : "라우팅 포함"}`} onclick={() => void toggleKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed() || (!key.enabled && probe !== "valid")}>{key.enabled ? "제외" : "포함"}</button><button class="danger" type="button" aria-label={`슬롯 ${index + 1} ${key.label} 영구 폐기`} onclick={(event) => openConfirmation("delete", key.id, key.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>영구 폐기</button></td></tr>
               {:else}
                 <tr><th scope="row">슬롯 {index + 1}</th><td data-label="상태">구성 필요</td><td data-label="누적">아직 등록된 키가 없습니다.</td><td data-label="조작"></td></tr>
               {/if}
@@ -1454,11 +1454,11 @@ onMount(() => {
   </form>
 </dialog>
 
-<dialog bind:this={confirmDialog} aria-labelledby="confirm-title" onclose={() => { if (!confirmPending) pendingAction = null; void tick().then(() => confirmReturnFocus?.focus()); }}>
+<dialog bind:this={confirmDialog} aria-labelledby="confirm-title" aria-describedby="confirm-description" onclose={() => { if (!confirmPending) pendingAction = null; void tick().then(() => confirmReturnFocus?.focus()); }}>
   <form method="dialog" class="dialog-card" onsubmit={confirmDestructive}>
-    <h2 id="confirm-title" bind:this={confirmTitle} tabindex="-1">사용 중지 확인</h2>
-    <p>{pendingAction?.label ?? "이 항목"}을(를) 라우팅에서 사용 중지합니다. 나중에 다시 포함할 수 있습니다. 계속할까요?</p>
-    <div class="actions"><button class="secondary" type="button" onclick={() => confirmDialog?.close()} disabled={confirmPending}>{confirmPending ? "처리 중…" : "취소"}</button><button class="danger" type="submit" disabled={confirmPending}>{confirmPending ? "사용 중지 중…" : "사용 중지 확인"}</button></div>
+    <h2 id="confirm-title" bind:this={confirmTitle} tabindex="-1">영구 폐기 확인</h2>
+    <p id="confirm-description">{pendingAction?.label ?? "이 항목"}을(를) 영구 폐기합니다. 감사 이력은 남지만 이 키는 다시 라우팅에 포함할 수 없습니다. 교체하려면 새 키를 등록해야 합니다. 계속할까요?</p>
+    <div class="actions"><button class="secondary" type="button" onclick={() => confirmDialog?.close()} disabled={confirmPending}>{confirmPending ? "처리 중…" : "취소"}</button><button class="danger" type="submit" disabled={confirmPending}>{confirmPending ? "폐기 중…" : "영구 폐기 확인"}</button></div>
   </form>
 </dialog>
 
