@@ -973,7 +973,12 @@ async fn build_state() -> Result<AppState> {
     // The shared client must not have a total timeout: a valid SSE completion
     // may run longer than the ordinary request budget. Individual
     // non-stream requests and probe/poll calls apply bounded timeouts below.
-    let mut client_builder = reqwest::Client::builder().connect_timeout(UPSTREAM_CONNECT_TIMEOUT);
+    let mut client_builder = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        // A provider must never receive a bearer token on an implicit
+        // cross-origin redirect.  Endpoint aliases are explicit in
+        // `upstream_endpoint_for`, so redirects are not part of the contract.
+        .redirect(reqwest::redirect::Policy::none());
     if let Ok(ca_path) = env::var("NBLB_UPSTREAM_CA_FILE") {
         let certificate = reqwest::Certificate::from_pem(
             &std::fs::read(&ca_path).with_context(|| format!("read upstream CA: {ca_path}"))?,
@@ -2073,7 +2078,10 @@ async fn chat_completions(
                     || response.status().is_server_error() =>
             {
                 rate_limited |= response.status().as_u16() == 429;
-                let auth_failure = matches!(response.status().as_u16(), 401..=403);
+                // 402 means quota/credit exhaustion, not invalid custody. It
+                // therefore receives the same bounded cooldown/failover path
+                // as 429 instead of permanently quarantining the credential.
+                let auth_failure = matches!(response.status().as_u16(), 401 | 403);
                 if auth_failure {
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
@@ -2341,7 +2349,9 @@ async fn multimodal(
                     || response.status().is_server_error() =>
             {
                 rate_limited |= response.status().as_u16() == 429;
-                let auth_failure = matches!(response.status().as_u16(), 401..=403);
+                // 402 is a provider entitlement/credit signal, so cooldown
+                // and failover remain possible; only 401/403 quarantine.
+                let auth_failure = matches!(response.status().as_u16(), 401 | 403);
                 if auth_failure {
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
@@ -4078,7 +4088,12 @@ async fn authorize_scope(
     match state.vault.authenticate(token, scope).await {
         Ok(_) => Ok(()),
         Err(error) if error.to_string() == "insufficient scope" => Err(downstream_forbidden(scope)),
-        Err(_) => Err(downstream_unauthorized()),
+        Err(error) if error.to_string() == "invalid downstream credential" => {
+            Err(downstream_unauthorized())
+        }
+        Err(_) => Err(HttpResponse::ServiceUnavailable().json(json!({
+            "error": {"code": "credential_store_unavailable", "message": "Credential store is temporarily unavailable."}
+        }))),
     }
 }
 
@@ -4152,10 +4167,12 @@ fn admin_host_allowed(raw_host: &str) -> bool {
     matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1")
 }
 fn bearer(req: &HttpRequest) -> Option<&str> {
-    req.headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+    let mut values = req.headers().get_all(header::AUTHORIZATION);
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().and_then(|v| v.strip_prefix("Bearer "))
 }
 fn admin_unauthorized() -> HttpResponse {
     HttpResponse::Unauthorized()
@@ -4292,10 +4309,12 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        SseValidator, admin_host_allowed, eligible_key_count, inline_script_bodies,
+        SseValidator, admin_host_allowed, bearer, eligible_key_count, inline_script_bodies,
         parse_multimodal_request, percent_encode_userinfo, upstream_endpoint,
         upstream_endpoint_for, validate_admin_token, validate_chat_request, validate_chat_response,
     };
+    use actix_web::http::header;
+    use actix_web::test::TestRequest;
     use chrono::{Duration, Utc};
     use nvidia_build_lb_core::KeySummary;
     use uuid::Uuid;
@@ -4430,6 +4449,15 @@ mod tests {
         assert!(admin_host_allowed("::1"));
         assert!(!admin_host_allowed("127.0.0.1:2456,evil"));
         assert!(!admin_host_allowed(""));
+    }
+
+    #[test]
+    fn bearer_rejects_duplicate_authorization_headers() {
+        let request = TestRequest::default()
+            .append_header((header::AUTHORIZATION, "Bearer one"))
+            .append_header((header::AUTHORIZATION, "Bearer two"))
+            .to_http_request();
+        assert!(bearer(&request).is_none());
     }
 
     #[test]
