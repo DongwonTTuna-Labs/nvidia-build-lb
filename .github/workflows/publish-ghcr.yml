@@ -40,17 +40,23 @@ jobs:
           npm --prefix apps/admin run build
       - name: Build immutable images
         env:
-          IMAGE_TAG: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-          POSTGRES_TAG: ghcr.io/${{ github.repository }}:postgres-sha-${{ github.sha }}
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE_SHA: ${{ github.sha }}
         run: |
+          image_repository="$(printf '%s' "$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_TAG="$image_repository:sha-$IMAGE_SHA"
+          POSTGRES_TAG="$image_repository:postgres-sha-$IMAGE_SHA"
           docker buildx build --pull --file Dockerfile.rust --tag "$IMAGE_TAG" --push .
           docker buildx build --pull --file docker/postgres.Dockerfile --tag "$POSTGRES_TAG" --push .
       - name: Resolve and publish immutable digests
         id: publish
         env:
-          IMAGE_TAG: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-          POSTGRES_TAG: ghcr.io/${{ github.repository }}:postgres-sha-${{ github.sha }}
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          IMAGE_SHA: ${{ github.sha }}
         run: |
+          image_repository="$(printf '%s' "$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          IMAGE_TAG="$image_repository:sha-$IMAGE_SHA"
+          POSTGRES_TAG="$image_repository:postgres-sha-$IMAGE_SHA"
           app_digest="sha256:$(docker buildx imagetools inspect "$IMAGE_TAG" --raw | sha256sum | cut -d' ' -f1)"
           postgres_digest="sha256:$(docker buildx imagetools inspect "$POSTGRES_TAG" --raw | sha256sum | cut -d' ' -f1)"
           printf 'app_registry_digest=%s\n' "$app_digest" >> "$GITHUB_OUTPUT"
