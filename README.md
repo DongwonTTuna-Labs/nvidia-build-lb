@@ -14,7 +14,7 @@ load balancer입니다. PostgreSQL(SQLx migration)이 운영 상태의 권위 �
 - `migrations/sqlx`: SQLx 단일 migration 원본
 - `compose.yml`: PostgreSQL + migration + gateway 독립 스택
 
-저장소의 구현 소스는 Rust와 Svelte/TypeScript만 사용합니다. 저장소에는 Python,
+Git 추적 구현·배포 입력 표면은 Rust와 Svelte/TypeScript만 사용합니다. Git에는 Python,
 셸 스크립트, 수동 JavaScript 소스를 두지 않으며, SvelteKit이 빌드 과정에서
 생성하는 브라우저 번들은 Git에 저장하지 않고 이미지에만 포함합니다. Docker
 context에서도 `.venv`, `node_modules`, `target`, 빌드 산출물과 과거 증거 디렉터리를

@@ -22,6 +22,9 @@ Svelte/TypeScript로만 유지하며, 폐기된 레거시 계약을 복구하지
 - Rust `nblb-prestart`가 Docker secret의 형상·소유자·권한을 확인하고 UID 65532로
   gateway/migration을 exec한다.
 - Rust `nblb-healthcheck`와 `pg_isready`가 컨테이너 readiness를 판단한다.
+- `request_attempts.owner_id`와 `gateway_instances.last_seen_at`가 프로세스 lease를
+  나타낸다. 재시작 정리는 30초 이상 heartbeat가 끊긴 owner의 미완료 시도만 닫고,
+  살아 있는 다른 gateway의 streaming attempt는 건드리지 않는다.
 
 ## UI 원칙
 
@@ -35,5 +38,7 @@ Svelte/TypeScript로만 유지하며, 폐기된 레거시 계약을 복구하지
 - Svelte 변경은 `svelte-check`와 build를 먼저 실행한다.
 - Docker/compose 변경은 해당 image build와 `docker compose -f compose.yml config`를
   실행한다.
+- publish workflow의 digest 출력은 `sha256:` 없는 64자리 hex이고, Compose가
+  immutable image reference에 단 한 번만 접두사를 붙인다.
 - 최종 merge 전 한 번만 전체 workspace·정적 검사·라이브 NVIDIA/Cloudflare/Hermes
   증거를 수집한다. PR은 자동 merge하지 않는다.

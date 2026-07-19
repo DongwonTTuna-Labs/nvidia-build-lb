@@ -44,10 +44,31 @@ async fn main() -> Result<()> {
         .connect(&url)
         .await
         .context("connect PostgreSQL")?;
+    seed_existing_routing_profiles(&pool).await?;
     sqlx::migrate!("../../migrations/sqlx")
         .run(&pool)
         .await
         .context("run SQLx migrations")?;
+    Ok(())
+}
+
+async fn seed_existing_routing_profiles(pool: &sqlx::PgPool) -> Result<()> {
+    let table_exists =
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass('nblb.routing_state') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .context("inspect routing state before migrations")?;
+    if !table_exists {
+        return Ok(());
+    }
+    sqlx::query(
+        // The 0001 CHECK predates Parakeet; 0004 widens it and 0009 seeds
+        // that eighth profile after the migration has run.
+        "INSERT INTO nblb.routing_state (profile_id, next_slot, generation) VALUES ('z-ai/glm-5.2',1,0), ('microsoft/phi-4-multimodal-instruct',1,0), ('nvidia/vila',1,0), ('nvidia/nvclip',1,0), ('black-forest-labs/flux.1-kontext-dev',1,0), ('stabilityai/stable-video-diffusion',1,0), ('nvidia/magpie-tts-multilingual',1,0) ON CONFLICT (profile_id) DO NOTHING",
+    )
+    .execute(pool)
+    .await
+    .context("seed existing routing profiles before migrations")?;
     Ok(())
 }
 

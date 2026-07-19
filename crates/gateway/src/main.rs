@@ -82,6 +82,7 @@ struct VaultStore {
     vault: Mutex<Vault>,
     database: Option<PgPool>,
     sync_lock: tokio::sync::Mutex<()>,
+    owner_id: Option<Uuid>,
 }
 
 impl VaultStore {
@@ -91,11 +92,36 @@ impl VaultStore {
         database: Option<PgPool>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let vault = if let Some(pool) = &database {
-            sqlx::query("UPDATE nblb.request_attempts SET outcome='abandoned_after_restart', finished_at=now() WHERE finished_at IS NULL")
-                .execute(pool)
+        let owner_id = if let Some(pool) = &database {
+            let owner_id = Uuid::new_v4();
+            let mut tx = pool.begin().await.context("begin gateway owner lease")?;
+            sqlx::query("INSERT INTO nblb.gateway_instances (id) VALUES ($1)")
+                .bind(owner_id)
+                .execute(&mut *tx)
                 .await
-                .context("close attempts left by previous process")?;
+                .context("register gateway owner")?;
+            // Only attempts whose owner lease has expired are abandoned. A
+            // second process may still be streaming a live request, so a
+            // blanket `finished_at IS NULL` update is unsafe.
+            sqlx::query(
+                "UPDATE nblb.request_attempts AS attempt SET outcome='abandoned_after_restart', finished_at=now() WHERE attempt.finished_at IS NULL AND attempt.owner_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nblb.gateway_instances AS instance WHERE instance.id=attempt.owner_id AND instance.last_seen_at >= now() - interval '30 seconds')",
+            )
+            .execute(&mut *tx)
+            .await
+            .context("close attempts from expired gateway owners")?;
+            sqlx::query(
+                "DELETE FROM nblb.gateway_instances WHERE last_seen_at < now() - interval '30 seconds' AND id <> $1",
+            )
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await
+            .context("prune expired gateway owners")?;
+            tx.commit().await.context("commit gateway owner lease")?;
+            Some(owner_id)
+        } else {
+            None
+        };
+        let vault = if let Some(pool) = &database {
             let keys = sqlx::query_as::<_, DbKeyRow>(
                 "SELECT id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count FROM nblb.upstream_keys ORDER BY created_at, id",
             )
@@ -159,6 +185,7 @@ impl VaultStore {
             vault: Mutex::new(vault),
             database,
             sync_lock: tokio::sync::Mutex::new(()),
+            owner_id,
         })
     }
 
@@ -309,11 +336,12 @@ impl VaultStore {
             return Ok(());
         };
         sqlx::query(
-            "INSERT INTO nblb.request_attempts (request_id, profile_id, key_id, outcome) VALUES ($1,$2,$3,'started')",
+            "INSERT INTO nblb.request_attempts (request_id, profile_id, key_id, owner_id, outcome) VALUES ($1,$2,$3,$4,'started')",
         )
         .bind(request_id)
         .bind(profile)
         .bind(key_id)
+        .bind(self.owner_id)
         .execute(pool)
         .await
         .context("record request attempt")?;
@@ -325,16 +353,36 @@ impl VaultStore {
             return Ok(());
         };
         let result = sqlx::query(
-            "UPDATE nblb.request_attempts SET outcome=$3, finished_at=now() WHERE id = (SELECT id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1)",
+            "UPDATE nblb.request_attempts SET outcome=$3, finished_at=now() WHERE id = (SELECT id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$4 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1)",
         )
         .bind(request_id)
         .bind(key_id)
         .bind(outcome)
+        .bind(self.owner_id)
         .execute(pool)
         .await
         .context("finish request attempt")?;
         if result.rows_affected() != 1 {
             bail!("request attempt terminal row is missing")
+        }
+        Ok(())
+    }
+
+    async fn heartbeat_owner(&self) -> Result<()> {
+        let Some(pool) = &self.database else {
+            return Ok(());
+        };
+        let Some(owner_id) = self.owner_id else {
+            return Ok(());
+        };
+        let result =
+            sqlx::query("UPDATE nblb.gateway_instances SET last_seen_at=now() WHERE id=$1")
+                .bind(owner_id)
+                .execute(pool)
+                .await
+                .context("heartbeat gateway owner")?;
+        if result.rows_affected() != 1 {
+            bail!("gateway owner lease is missing")
         }
         Ok(())
     }
@@ -804,6 +852,10 @@ fn spawn_database_watchdog(state: web::Data<AppState>) {
         let mut failed_since = None;
         loop {
             tokio::time::sleep(StdDuration::from_secs(2)).await;
+            if let Err(error) = state.vault.heartbeat_owner().await {
+                eprintln!("postgres owner lease heartbeat failed: {error:#}");
+                std::process::exit(1);
+            }
             let healthy = sqlx::query_scalar::<_, i32>("SELECT 1")
                 .fetch_one(&pool)
                 .await
@@ -913,13 +965,11 @@ fn routes(cfg: &mut web::ServiceConfig) {
             Files::new("/admin", "/app/static")
                 .index_file("index.html")
                 .guard(guard::fn_guard(|context| {
-                    let host = context
-                        .head()
-                        .headers
-                        .get(header::HOST)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default();
-                    admin_host_allowed(host)
+                    let mut hosts = context.head().headers.get_all(header::HOST);
+                    let Some(host) = hosts.next().and_then(|value| value.to_str().ok()) else {
+                        return false;
+                    };
+                    hosts.next().is_none() && admin_host_allowed(host)
                 })),
         );
 }
@@ -1127,12 +1177,19 @@ fn read_required_secret(env_name: &str, path: &str) -> Result<String> {
 }
 
 fn public_guard_response(req: &HttpRequest) -> Option<HttpResponse> {
-    let raw_host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if raw_host.contains(',') || raw_host.is_empty() {
+    let mut hosts = req.headers().get_all(header::HOST);
+    let raw_host = hosts.next().and_then(|value| value.to_str().ok());
+    if hosts.next().is_some() {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
+        })));
+    }
+    let Some(raw_host) = raw_host else {
+        return Some(HttpResponse::Forbidden().json(json!({
+            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
+        })));
+    };
+    if raw_host.contains(',') || raw_host.is_empty() || !host_authority_well_formed(raw_host) {
         return Some(HttpResponse::Forbidden().json(json!({
             "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
         })));
@@ -1569,6 +1626,9 @@ async fn add_key(
         .await
     {
         Ok(summary) => HttpResponse::Created().json(summary),
+        Err(error) if is_unique_conflict(&error) => HttpResponse::Conflict().json(
+            json!({"error":{"code":"resource_conflict","message":"An active upstream slot with this label or credential already exists."}}),
+        ),
         Err(error) => HttpResponse::UnprocessableEntity()
             .json(json!({"error":{"code":"invalid_request","message":error.to_string()}})),
     }
@@ -1783,11 +1843,22 @@ async fn add_downstream(
             }
             HttpResponse::Created().json(value)
         }
-        Err(error) if error.to_string().contains("already exists") => HttpResponse::Conflict()
-            .json(json!({"error":{"code":"resource_conflict","message":error.to_string()}})),
+        Err(error)
+            if error.to_string().contains("already exists") || is_unique_conflict(&error) =>
+        {
+            HttpResponse::Conflict()
+                .json(json!({"error":{"code":"resource_conflict","message":error.to_string()}}))
+        }
         Err(error) => HttpResponse::UnprocessableEntity()
             .json(json!({"error":{"code":"invalid_request","message":error.to_string()}})),
     }
+}
+
+fn is_unique_conflict(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("duplicate key value violates unique constraint")
+        || text.contains("upstream_keys_active_")
+        || text.contains("downstream_credentials_active_label_idx")
 }
 
 async fn revoke_downstream(
@@ -1860,6 +1931,7 @@ async fn chat_completions(
     let key_attempts = state.vault.list().len().max(1);
     let mut attempted = Vec::new();
     let mut rate_limited = false;
+    let mut all_attempts_rate_limited = true;
     for _ in 0..key_attempts {
         let id = select_key(&state, profile).await;
         let Some(id) = id else { break };
@@ -1873,6 +1945,7 @@ async fn chat_completions(
         let credential = match state.vault.credential(id) {
             Ok(value) => value,
             Err(_) => {
+                all_attempts_rate_limited = false;
                 if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
                 }
@@ -1880,6 +1953,7 @@ async fn chat_completions(
             }
         };
         if state.upstream_url.starts_with("mock://") {
+            all_attempts_rate_limited = false;
             let force_first_failure = request
                 .get("metadata")
                 .and_then(Value::as_object)
@@ -1921,6 +1995,10 @@ async fn chat_completions(
             upstream_request = upstream_request.timeout(UPSTREAM_REQUEST_TIMEOUT);
         }
         let result = upstream_request.send().await;
+        match result.as_ref() {
+            Ok(response) if response.status().as_u16() == 429 => rate_limited = true,
+            _ => all_attempts_rate_limited = false,
+        }
         match result {
             Ok(response)
                 if response.status().as_u16() == 202
@@ -2085,7 +2163,6 @@ async fn chat_completions(
                     || response.status().as_u16() == 429
                     || response.status().is_server_error() =>
             {
-                rate_limited |= response.status().as_u16() == 429;
                 // 402 means quota/credit exhaustion, not invalid custody. It
                 // therefore receives the same bounded cooldown/failover path
                 // as 429 instead of permanently quarantining the credential.
@@ -2122,7 +2199,11 @@ async fn chat_completions(
             }
         }
     }
-    if rate_limited && let Some(seconds) = retry_after_for_keys(&state.vault.list()) {
+    if rate_limited
+        && all_attempts_rate_limited
+        && !attempted.is_empty()
+        && let Some(seconds) = retry_after_for_keys(&state.vault.list())
+    {
         return HttpResponse::TooManyRequests()
             .insert_header(("retry-after", seconds.to_string()))
             .json(json!({"error":{"message":"All NVIDIA upstream keys are rate limited","type":"upstream_rate_limited"}}));
@@ -2181,6 +2262,7 @@ async fn multimodal(
     let key_attempts = state.vault.list().len().max(1);
     let mut attempted = Vec::new();
     let mut rate_limited = false;
+    let mut all_attempts_rate_limited = true;
     for _ in 0..key_attempts {
         let Some(id) = select_key(&state, profile).await else {
             break;
@@ -2195,6 +2277,7 @@ async fn multimodal(
         let credential = match state.vault.credential(id).ok() {
             Some(value) => value,
             None => {
+                all_attempts_rate_limited = false;
                 if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
                 }
@@ -2278,6 +2361,10 @@ async fn multimodal(
                 .send()
                 .await
         };
+        match request_result.as_ref() {
+            Ok(response) if response.status().as_u16() == 429 => rate_limited = true,
+            _ => all_attempts_rate_limited = false,
+        }
         match request_result {
             Ok(response) if response.status().is_success() => {
                 // A 202 means NVIDIA accepted an asynchronous job. It is
@@ -2360,7 +2447,6 @@ async fn multimodal(
                     || response.status().as_u16() == 429
                     || response.status().is_server_error() =>
             {
-                rate_limited |= response.status().as_u16() == 429;
                 // 402 is a provider entitlement/credit signal, so cooldown
                 // and failover remain possible; only 401/403 quarantine.
                 let auth_failure = matches!(response.status().as_u16(), 401 | 403);
@@ -2395,7 +2481,11 @@ async fn multimodal(
             }
         }
     }
-    if rate_limited && let Some(seconds) = retry_after_for_keys(&state.vault.list()) {
+    if rate_limited
+        && all_attempts_rate_limited
+        && !attempted.is_empty()
+        && let Some(seconds) = retry_after_for_keys(&state.vault.list())
+    {
         return HttpResponse::TooManyRequests()
             .insert_header(("retry-after", seconds.to_string()))
             .json(json!({"error":{"message":"All NVIDIA upstream keys are rate limited","type":"upstream_rate_limited"}}));
@@ -4162,12 +4252,14 @@ fn authorized(req: &HttpRequest, state: &AppState) -> bool {
 }
 
 fn admin_surface_allowed(req: &HttpRequest, state: &AppState) -> bool {
-    let raw_host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if raw_host.contains(',') {
+    let mut hosts = req.headers().get_all(header::HOST);
+    let Some(raw_host) = hosts.next().and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    if hosts.next().is_some() {
+        return false;
+    }
+    if raw_host.contains(',') || !host_authority_well_formed(raw_host) {
         return false;
     }
     let (host, port) = parse_host_authority(raw_host);
@@ -4207,6 +4299,17 @@ fn parse_host_authority(raw: &str) -> (String, Option<u16>) {
     (raw.to_ascii_lowercase(), None)
 }
 
+fn host_authority_well_formed(raw: &str) -> bool {
+    if let Some(value) = raw.strip_prefix('[') {
+        let Some((_, remainder)) = value.split_once(']') else {
+            return false;
+        };
+        return remainder.is_empty()
+            || (remainder.starts_with(':') && remainder[1..].parse::<u16>().is_ok());
+    }
+    !raw.contains('[') && !raw.contains(']')
+}
+
 fn format_origin_host(host: &str) -> String {
     if host.contains(':') {
         format!("[{host}]")
@@ -4220,6 +4323,21 @@ fn admin_host_allowed(raw_host: &str) -> bool {
         return false;
     }
     if raw_host.eq_ignore_ascii_case("::1") {
+        return true;
+    }
+    if let Some(value) = raw_host.strip_prefix('[') {
+        let Some((host, remainder)) = value.split_once(']') else {
+            return false;
+        };
+        if remainder.is_empty() {
+            return host.eq_ignore_ascii_case("::1");
+        }
+        if !remainder.starts_with(':')
+            || remainder[1..].parse::<u16>().is_err()
+            || !host.eq_ignore_ascii_case("::1")
+        {
+            return false;
+        }
         return true;
     }
     let host = raw_host
@@ -4376,9 +4494,9 @@ async fn attempt_finished(
 mod tests {
     use super::{
         SseValidator, admin_host_allowed, bearer, eligible_key_count, format_origin_host,
-        inline_script_bodies, parse_multimodal_request, percent_encode_userinfo,
-        should_migrate_file_vault, upstream_endpoint, upstream_endpoint_for, validate_admin_token,
-        validate_chat_request, validate_chat_response,
+        host_authority_well_formed, inline_script_bodies, parse_multimodal_request,
+        percent_encode_userinfo, should_migrate_file_vault, upstream_endpoint,
+        upstream_endpoint_for, validate_admin_token, validate_chat_request, validate_chat_response,
     };
     use actix_web::http::header;
     use actix_web::test::TestRequest;
@@ -4517,6 +4635,12 @@ mod tests {
         assert_eq!(format_origin_host("::1"), "[::1]");
         assert_eq!(format_origin_host("127.0.0.1"), "127.0.0.1");
         assert!(!admin_host_allowed("127.0.0.1:2456,evil"));
+        assert!(!admin_host_allowed("[::1]evil"));
+        assert!(!admin_host_allowed("[::1]:not-a-port"));
+        assert!(!host_authority_well_formed("[::1]evil"));
+        assert!(!host_authority_well_formed(
+            "[nvidia-lb.dongwontuna.net]evil"
+        ));
         assert!(!admin_host_allowed(""));
     }
 

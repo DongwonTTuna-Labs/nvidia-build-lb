@@ -683,7 +683,9 @@ impl Vault {
             .state
             .keys
             .iter_mut()
-            .find(|key| key.id == id && !key.retired)
+            // Retirement excludes a slot from new selection, but it must not
+            // invalidate accounting for a request that selected it earlier.
+            .find(|key| key.id == id)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.request_count = key.request_count.saturating_add(1);
         key.failure_count = 0;
@@ -697,9 +699,15 @@ impl Vault {
             .state
             .keys
             .iter_mut()
-            .find(|key| key.id == id && !key.retired)
+            .find(|key| key.id == id)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.failure_count = key.failure_count.saturating_add(1);
+        if key.retired {
+            // Retired rows remain audit-addressable, but must not regain a
+            // routing cooldown or health state while an old request drains.
+            key.cooldown_until = None;
+            return self.persist();
+        }
         let delay = retry_after
             .map(|value| value.clamp(Duration::zero(), Duration::seconds(300)))
             .unwrap_or_else(|| Duration::seconds(1_i64 << key.failure_count.min(6)));
@@ -1030,6 +1038,25 @@ mod tests {
         vault.mark_verified(key.id).expect("probe reset");
         assert_eq!(vault.list()[0].failure_count, 0);
         assert!(vault.list()[0].cooldown_until.is_none());
+    }
+
+    #[test]
+    fn retired_key_can_finish_in_flight_accounting_but_not_admin_mutation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut vault = Vault::open(dir.path().join("vault.json"), [15; 32]).expect("open");
+        let key = vault
+            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .expect("add");
+        vault.mark_verified(key.id).expect("probe");
+        vault.set_enabled(key.id, true).expect("enable");
+        vault.delete(key.id).expect("retire");
+
+        vault.record_request(key.id).expect("account success");
+        vault
+            .record_failure(key.id, Some(Duration::seconds(1)))
+            .expect("account failure");
+        assert!(vault.set_enabled(key.id, true).is_err());
+        assert!(vault.mark_verified(key.id).is_err());
     }
 
     #[test]

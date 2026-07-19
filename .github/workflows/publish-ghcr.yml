@@ -57,8 +57,12 @@ jobs:
           image_repository="$(printf '%s' "$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           IMAGE_TAG="$image_repository:sha-$IMAGE_SHA"
           POSTGRES_TAG="$image_repository:postgres-sha-$IMAGE_SHA"
-          app_digest="sha256:$(docker buildx imagetools inspect "$IMAGE_TAG" --raw | sha256sum | cut -d' ' -f1)"
-          postgres_digest="sha256:$(docker buildx imagetools inspect "$POSTGRES_TAG" --raw | sha256sum | cut -d' ' -f1)"
+          # Compose owns the `sha256:` reference prefix.  Keep workflow
+          # outputs as the raw hexadecimal digest so operators cannot produce
+          # an invalid `sha256:sha256:...` image reference when copying the
+          # values into runtime.env.
+          app_digest="$(docker buildx imagetools inspect "$IMAGE_TAG" --raw | sha256sum | cut -d' ' -f1)"
+          postgres_digest="$(docker buildx imagetools inspect "$POSTGRES_TAG" --raw | sha256sum | cut -d' ' -f1)"
           printf 'app_registry_digest=%s\n' "$app_digest" >> "$GITHUB_OUTPUT"
           printf 'postgres_registry_digest=%s\n' "$postgres_digest" >> "$GITHUB_OUTPUT"
           {
