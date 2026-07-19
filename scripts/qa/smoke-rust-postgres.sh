@@ -44,6 +44,7 @@ NVIDIA_BUILD_LB_PUBLIC_PORT="$port" \
   NBLB_VAULT_MASTER_KEY="$master" \
   NBLB_VAULT_PATH="$work/vault.json" \
   NBLB_UPSTREAM_URL=mock://local \
+  NBLB_MOCK_STREAM_DELAY_MS=1000 \
   NVIDIA_BUILD_LB_ADMIN_TOKEN=targeted-admin \
   target/debug/nvidia-build-lb-gateway >"$work/gateway.log" 2>&1 &
 gateway_pid=$!
@@ -83,13 +84,20 @@ test "$key_count" = 2
 test "$downstream_count" = 1
 test "$profile_count" = 8
 test "$attempt_count" -ge 1
-key_id=$(docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atc \
-  'select id from nblb.upstream_keys order by created_at limit 1')
-cancelled_id=$(docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atqc \
-  "insert into nblb.request_attempts(request_id,profile_id,key_id,outcome,finished_at) values (gen_random_uuid(),'z-ai/glm-5.2','$key_id','cancelled',now()) returning id")
+# Abort a real streaming client while the mock provider is delaying its first
+# frame. The Actix stream guard must close the started ledger row as cancelled;
+# inserting a synthetic row would not prove disconnect handling.
+curl -sS --max-time 0.25 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+  -d '{"model":"z-ai/glm-5.2","stream":true,"messages":[{"role":"user","content":"cancel"}]}' \
+  "http://127.0.0.1:$port/v1/chat/completions" >/dev/null 2>&1 || true
+cancelled_id=''
+for _ in $(seq 1 40); do
+  cancelled_id=$(docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atc \
+    "select id from nblb.request_attempts where outcome='cancelled' order by created_at desc limit 1")
+  [[ -n "$cancelled_id" ]] && break
+  sleep .1
+done
 test -n "$cancelled_id"
-docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atc \
-  "select outcome from nblb.request_attempts where id='$cancelled_id'" | grep -Fx cancelled >/dev/null
 
 kill "$gateway_pid"
 wait "$gateway_pid" 2>/dev/null || true
@@ -109,4 +117,4 @@ done
 curl -fsS -H 'Authorization: Bearer targeted-admin' \
   "http://127.0.0.1:$port/admin/api/v1/overview" \
   | jq -e '.upstream_keys.items|length == 2' >/dev/null
-printf '%s\n' '{"status":"PASS","scope":"rust-gateway-postgres","checks":["migration","db-source-of-truth","two-key-restart","scoped-api"]}'
+printf '%s\n' '{"status":"PASS","scope":"rust-gateway-postgres","checks":["migration","db-source-of-truth","two-key-restart","scoped-api","client-disconnect-cancellation"]}'
