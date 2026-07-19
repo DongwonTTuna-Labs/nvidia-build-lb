@@ -28,5 +28,14 @@ export let label = "";
       overflow-wrap: anywhere;
     }
   }
+  @media (forced-colors: active) {
+    .status {
+      border-color: ButtonText;
+      color: ButtonText;
+    }
+    .status.good {
+      border-color: ButtonText;
+      color: ButtonText;
+    }
+  }
 </style>
-

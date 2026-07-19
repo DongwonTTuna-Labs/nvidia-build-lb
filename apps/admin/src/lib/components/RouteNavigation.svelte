@@ -67,4 +67,3 @@ export let onSelect: (route: AdminRouteId) => void;
     }
   }
 </style>
-
