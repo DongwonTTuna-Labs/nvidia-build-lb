@@ -197,13 +197,6 @@ impl VaultStore {
             .unwrap_or_default()
     }
 
-    fn is_retired(&self, id: Uuid) -> bool {
-        self.vault
-            .lock()
-            .map(|vault| vault.is_retired(id))
-            .unwrap_or(true)
-    }
-
     fn list_downstream(&self) -> Vec<DownstreamSummary> {
         self.vault
             .lock()
@@ -216,6 +209,18 @@ impl VaultStore {
             .lock()
             .map_err(|_| anyhow!("vault lock"))
             .and_then(|vault| vault.credential(id))
+    }
+
+    fn credential_for_probe(&self, id: Uuid) -> Result<String> {
+        self.vault
+            .lock()
+            .map_err(|_| anyhow!("vault lock"))
+            .and_then(|vault| {
+                if vault.is_retired(id) {
+                    bail!("retired upstream credential")
+                }
+                vault.credential(id)
+            })
     }
 
     async fn set_cursor(&self, profile: &str, cursor: usize) -> Result<()> {
@@ -1732,10 +1737,7 @@ async fn probe_key(
         return admin_unauthorized();
     }
     let id = path.into_inner();
-    if state.vault.is_retired(id) {
-        return HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}}));
-    }
-    let credential = match state.vault.credential(id) {
+    let credential = match state.vault.credential_for_probe(id) {
         Ok(value) => value,
         Err(_) => {
             return HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}}));
@@ -3629,7 +3631,11 @@ async fn prime_stream(
             Some(Ok(chunk)) => {
                 validator.feed(&chunk)?;
                 prefix.extend(validator.take_emitted());
-                if validator.frame_count > 0 {
+                // A bare [DONE] is not a usable completion.  Do not hand the
+                // response to Actix until at least one validated data chunk
+                // exists, otherwise failover is lost after a premature
+                // provider terminator.
+                if validator.data_frame_count > 0 {
                     return Ok((upstream, validator, prefix));
                 }
                 if prefix.len() > 256 {
@@ -4840,5 +4846,16 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert!(std::str::from_utf8(&emitted[0]).unwrap().contains("chat-1"));
         validator.finish().expect("complete stream");
+    }
+
+    #[test]
+    fn sse_done_without_data_is_not_a_completion() {
+        let mut validator = SseValidator::default();
+        validator
+            .feed(b"data: [DONE]\n\n")
+            .expect("valid terminator");
+        assert_eq!(validator.frame_count, 1);
+        assert_eq!(validator.data_frame_count, 0);
+        assert!(validator.finish().is_err());
     }
 }
