@@ -36,6 +36,7 @@ import { type AdminRouteId, adminRoutes } from "$lib/copy";
 // Secrets are deliberately kept outside Svelte's reactive state.
 const session = { token: "" };
 const custody = { token: "", credentialId: "", authToken: "" };
+const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 let authenticated = false;
 let active: AdminRouteId = "overview";
 let state: SnapshotState = "empty";
@@ -620,7 +621,7 @@ async function issueClient(event: SubmitEvent) {
     const payload = (await response.json().catch(() => ({}))) as { token?: string; id?: string };
     const issuedToken = payload.token?.trim() ?? "";
     const issuedCredentialId = payload.id?.trim() ?? "";
-    if (!response.ok || !issuedToken || !issuedCredentialId)
+    if (!response.ok || !issuedToken || !uuidPattern.test(issuedCredentialId))
       throw new Error(responseMessage(payload, "접속 키를 발급하지 못했습니다."));
     custody.token = issuedToken;
     custody.credentialId = issuedCredentialId;
