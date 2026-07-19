@@ -1010,7 +1010,10 @@ def _admin(
 
 
 def _admin_post(settings: Settings, path: str) -> None:
-    _admin(settings, "POST", path, expected=(204,))
+    # Rust gateway state aliases return the updated redacted key as 200;
+    # older deployments used an empty 204 response. Accept both while the
+    # helper remains compatible with either canonical runtime.
+    _admin(settings, "POST", path, expected=(200, 204))
 
 
 def _token_item(settings: Settings, token_id: str) -> dict[str, object]:
@@ -1154,7 +1157,16 @@ def _upstream_counts(settings: Settings) -> tuple[dict[str, int], list[str]]:
         if not isinstance(count, int):
             raise CutoverError("upstream_counter_invalid")
         counts[key_id] = count
-        if item.get("enabled") is True and item.get("routing_state") == "eligible":
+        cooldown_until = item.get("cooldown_until")
+        cooldown_active = False
+        if isinstance(cooldown_until, str):
+            try:
+                cooldown_active = datetime.fromisoformat(cooldown_until.replace("Z", "+00:00")) > datetime.now(UTC)
+            except ValueError:
+                raise CutoverError("upstream_cooldown_invalid") from None
+        elif cooldown_until is not None:
+            raise CutoverError("upstream_cooldown_invalid")
+        if item.get("enabled") is True and item.get("verified") is True and not cooldown_active:
             eligible.append(key_id)
     return counts, eligible
 
