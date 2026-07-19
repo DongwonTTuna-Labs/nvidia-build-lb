@@ -3,12 +3,19 @@
   "ignoreDependencies": ["@sveltejs/adapter-static"],
   "ignoreFiles": [
     "**/src/lib/copy.ts",
-    "**/src/routes/**",
     "**/svelte.config.ts"
   ],
   "workspaces": {
-    "apps/admin": {
-      "entry": ["svelte.config.ts", "vite.config.ts", "src/routes/**/*.svelte", "src/routes/**/*.ts"],
+    ".": {
+      "sveltekit": "svelte.config.ts",
+      "entry": [
+        "svelte.config.ts",
+        "vite.config.ts",
+        "src/routes/**/*.svelte",
+        "src/routes/**/*.ts",
+        "src/lib/**/*.svelte",
+        "src/lib/**/*.ts"
+      ],
       "project": ["src/**/*.{ts,svelte}", "*.config.ts"]
     }
   }

@@ -1,123 +1,28 @@
 <script lang="ts">
 import { onMount, tick } from "svelte";
+import {
+  modelCapabilities,
+  routeDescription,
+  routeTitle,
+  supportedScopes,
+} from "$lib/admin-config";
+import type {
+  AdminEvent,
+  Attention,
+  Check,
+  Client,
+  Evidence,
+  Key,
+  MutationState,
+  ProfileCapability,
+  PublicHealth,
+  Recommendation,
+  SlotProjection,
+  SnapshotState,
+} from "$lib/admin-types";
+import RouteNavigation from "$lib/components/RouteNavigation.svelte";
+import StatusBadge from "$lib/components/StatusBadge.svelte";
 import { type AdminRouteId, adminRoutes } from "$lib/copy";
-
-type SnapshotState =
-  | "loading"
-  | "empty"
-  | "ready"
-  | "degraded"
-  | "stale"
-  | "offline"
-  | "error"
-  | "success"
-  | "partial"
-  | "conflict"
-  | "recovery";
-type MutationState = "idle" | "pending" | "unknown" | "reconcile";
-type Key = {
-  id: string;
-  label: string;
-  fingerprint: string;
-  enabled: boolean;
-  verified: boolean;
-  cooldown_until: string | null;
-  request_count: number;
-  failure_count: number;
-};
-type Client = {
-  id: string;
-  label: string;
-  scopes: string[];
-  active: boolean;
-  request_count: number;
-  revoked_at: string | null;
-};
-type Evidence = {
-  source_of_truth: string;
-  persisted_upstream_keys: number;
-  persisted_downstream_credentials: number;
-  persisted_routing_profiles: number;
-  persisted_request_attempts?: number;
-};
-type Attention = {
-  id?: string;
-  resource?: { kind?: string; id?: string };
-  code: string;
-  label?: string;
-  next_action: string;
-  expires_at?: string | null;
-};
-type Check = {
-  id: string;
-  label: string;
-  status: string;
-  request_count: number;
-  failure_count: number;
-};
-type Recommendation = { action: string; label: string; route: AdminRouteId; reason: string };
-type PublicHealth = { hostname: string; status: string; next_action: string };
-type ProfileCapability = {
-  id: string;
-  route: string;
-  advertised: boolean;
-  available_now: boolean;
-  proof_status?: string;
-  modalities: string[];
-};
-type SlotProfile = { profile_id: string; eligible_now: boolean; reason: string | null };
-type SlotProjection = { slot_no: number; key_id: string; profiles: SlotProfile[] };
-type AdminEvent = {
-  id: string;
-  kind?: string;
-  outcome?: string;
-  created_at?: string;
-  profile_id?: string;
-  request_id?: string;
-  key_id?: string;
-};
-
-const supportedScopes = [
-  ["models:read", "모델 조회"],
-  ["chat:write", "대화"],
-  ["embeddings:write", "임베딩"],
-  ["images:write", "이미지"],
-  ["audio:write", "음성"],
-  ["media:write", "영상·미디어"],
-] as const;
-const routeTitle: Record<AdminRouteId, string> = {
-  overview: "개요",
-  routing: "라우팅",
-  clients: "접속 키",
-  models: "모델",
-  evidence: "증거",
-};
-const routeDescription: Record<AdminRouteId, string> = {
-  overview: "지금 요청을 받을 수 있는지와 다음 조치만 확인합니다.",
-  routing: "두 슬롯의 현재 선택 가능 여부와 장애 전환 상태입니다.",
-  clients: "Hermes 등 다운스트림에 필요한 권한만 발급·폐기합니다.",
-  models: "지원 모달리티와 실제 요청 경로를 한눈에 확인합니다.",
-  evidence: "PostgreSQL 지속성과 마지막 확인 시각을 검증합니다.",
-};
-const modelCapabilities: Record<string, { modalities: string; route: string }> = {
-  "z-ai/glm-5.2": { modalities: "텍스트·대화", route: "/v1/chat/completions" },
-  "microsoft/phi-4-multimodal-instruct": {
-    modalities: "텍스트·이미지·오디오",
-    route: "/v1/chat/completions",
-  },
-  "nvidia/vila": { modalities: "텍스트·이미지·영상", route: "/v1/chat/completions" },
-  "nvidia/nvclip": { modalities: "이미지·임베딩", route: "/v1/embeddings" },
-  "black-forest-labs/flux.1-kontext-dev": {
-    modalities: "이미지 생성",
-    route: "/v1/images/generations",
-  },
-  "stabilityai/stable-video-diffusion": {
-    modalities: "영상 생성",
-    route: "/v1/videos/generations",
-  },
-  "nvidia/magpie-tts-multilingual": { modalities: "음성", route: "/v1/audio/speech" },
-  "nvidia/parakeet-ctc-1.1b": { modalities: "음성 전사", route: "/v1/audio/transcriptions" },
-};
 
 // Secrets are deliberately kept outside Svelte's reactive state.
 const session = { token: "" };
@@ -1374,7 +1279,7 @@ onMount(() => {
   <a class="skip" href={authenticated ? "#route-heading" : "#admin-token"}>본문으로 건너뛰기</a>
   <header class="topbar">
     <div><p class="eyebrow">NVIDIA BUILD LB</p>{#if authenticated}<p class="brand">관리 콘솔</p>{:else}<h1 class="brand">관리자 로그인</h1>{/if}</div>
-    {#if authenticated}<div class="top-actions"><span class:good={requestAvailable()} class="status"><span aria-hidden="true">{requestAvailable() ? "●" : "○"}</span> {stateCopy()}</span><button class="secondary" type="button" onclick={() => void refresh()} disabled={!session.token || loading || mutating}>상태 새로고침</button><button class="secondary" type="button" onclick={logout} disabled={!session.token || secretOpen}>로그아웃</button></div>{/if}
+    {#if authenticated}<div class="top-actions"><StatusBadge good={requestAvailable()} label={stateCopy()} /><button class="secondary" type="button" onclick={() => void refresh()} disabled={!session.token || loading || mutating}>상태 새로고침</button><button class="secondary" type="button" onclick={logout} disabled={!session.token || secretOpen}>로그아웃</button></div>{/if}
   </header>
 
   {#if !authenticated}
@@ -1386,11 +1291,7 @@ onMount(() => {
   {/if}
 
   {#if authenticated}
-  <nav aria-label="관리 메뉴" class="nav">
-    {#each adminRoutes as route}
-      <a href={route.href} aria-current={active === route.id ? "page" : undefined} onclick={(event) => { event.preventDefault(); void selectRoute(route.id); }}>{route.label}</a>
-    {/each}
-  </nav>
+  <RouteNavigation active={active} onSelect={(route) => void selectRoute(route)} />
   <p class="nav-hint" aria-hidden="true">모바일에서는 좌우로 메뉴를 더 볼 수 있습니다.</p>
 
   <main id="main-content" aria-busy={loading}>
@@ -1486,10 +1387,8 @@ onMount(() => {
   :global(button:focus-visible), :global(a:focus-visible), :global(input:focus-visible), :global(textarea:focus-visible), :global([tabindex]:focus-visible) { outline: 3px solid #76b900; outline-offset: 3px; }
   .shell { min-height: 100vh; max-width: 1120px; margin: 0 auto; padding: max(16px, env(safe-area-inset-top)) 32px calc(32px + env(safe-area-inset-bottom)); }
   .skip { position: absolute; left: 16px; top: 8px; transform: translateY(-180%); background: #1d2124; color: #f5f7f6; padding: 10px 14px; z-index: 3; border-radius: 6px; } .skip:focus { transform: translateY(0); }
-  .topbar, .auth, .nav, .route-heading { display: flex; gap: 16px; align-items: center; } .topbar { justify-content: space-between; min-height: 56px; } .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; } .brand { margin: 0; font-size: 1.1rem; font-weight: 800; } .eyebrow { margin: 0; color: #76b900; font-size: .72rem; font-weight: 800; letter-spacing: .12em; }
-  .status { display: inline-flex; align-items: center; gap: 5px; width: fit-content; border: 1px solid #6b746f; border-radius: 6px; padding: 8px 10px; color: #d0d5d2; font-weight: 700; white-space: nowrap; } .status.good { color: #76b900; border-color: #76b900; }
+  .topbar, .auth, .route-heading { display: flex; gap: 16px; align-items: center; } .topbar { justify-content: space-between; min-height: 56px; } .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; } .brand { margin: 0; font-size: 1.1rem; font-weight: 800; } .eyebrow { margin: 0; color: #76b900; font-size: .72rem; font-weight: 800; letter-spacing: .12em; }
   .auth { align-items: end; margin: 16px 0; } .auth label { flex: 1; } label { display: grid; gap: 6px; color: #d0d5d2; font-size: .9rem; font-weight: 700; } input, textarea { width: 100%; min-height: 44px; border: 1px solid #6b746f; border-radius: 6px; padding: 10px 12px; color: #f5f7f6; background: #171a1d; font: inherit; } textarea { min-height: 76px; resize: vertical; }
-  .nav { display: flex; flex-wrap: wrap; overflow: visible; border-bottom: 1px solid #6b746f; } .nav a { min-height: 44px; padding: 10px 12px; color: #d0d5d2; text-decoration: none; white-space: nowrap; } .nav a[aria-current="page"] { color: #76b900; border-bottom: 3px solid #76b900; font-weight: 800; }
   main { padding-top: 32px; } .route-heading { align-items: baseline; flex-wrap: wrap; margin-bottom: 24px; } .route-heading .eyebrow { flex-basis: 100%; } h1, h2, h3, p { margin: 0; } h1 { font-size: clamp(1.6rem, 3vw, 2rem); } h2 { font-size: 1.35rem; } h3 { font-size: 1rem; } .muted, small { color: #aab2ae; } .live { min-height: 24px; color: #d0d5d2; }
   .panel, article, .subpanel { display: grid; gap: 12px; padding: 24px; background: #171a1d; border: 1px solid #6b746f; border-radius: 8px; } .judgments { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; } article { background: #1d2124; min-width: 0; } article span { color: #aab2ae; font-size: .85rem; } article strong { font-size: 1.25rem; overflow-wrap: anywhere; } .recommendation { border-color: #76b900; } .attention-list, .check-list { display: grid; gap: 8px; } .check-list p { display: flex; justify-content: space-between; gap: 12px; margin: 0; padding: 10px 0; border-bottom: 1px solid #6b746f; } .check-list p > * { min-width: 0; overflow-wrap: anywhere; } .profile-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; } .profile-grid article { padding: 12px; }
   .alert, .notice, .attention { display: flex; gap: 12px; align-items: center; margin: 12px 0; padding: 12px 14px; border-radius: 6px; } .alert { color: #ff8a8a; border: 1px solid #ff8a8a; } .auth-error { max-width: 760px; } .notice { color: #76b900; border: 1px solid #76b900; } .attention { color: #ffd166; border: 1px solid #ffd166; } .attention > * { min-width: 0; overflow-wrap: anywhere; } .next-step { color: #ffd166; }
@@ -1500,7 +1399,7 @@ onMount(() => {
   .subpanel { margin-top: 20px; } .facts, .model-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; } .facts span { padding: 12px; background: #1d2124; border-radius: 6px; } .facts strong { display: block; margin-top: 4px; } .model-list { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); } .model-list h3 { overflow-wrap: anywhere; word-break: break-word; } code { color: #b8a1ff; overflow-wrap: anywhere; word-break: break-word; } .event-detail { display: grid; gap: 10px; margin: 0; } .event-detail div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; } .event-detail dt { color: #aab2ae; } .event-detail dd { margin: 0; overflow-wrap: anywhere; }
   dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid #6b746f; border-radius: 8px; background: #171a1d; color: #f5f7f6; box-shadow: 0 8px 24px rgb(0 0 0 / .28); } dialog::backdrop { background: rgb(0 0 0 / .7); } .dialog-card { display: grid; gap: 16px; padding: 24px; } .dialog-card textarea { color: #76b900; font-family: ui-monospace, monospace; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button, .top-actions .status { flex: 1; } .auth button, .form button { width: 100%; } .judgments { grid-template-columns: 1fr; } .panel { padding: 16px; } .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .nav { gap: 4px; overflow-x: auto; scrollbar-width: thin; padding-right: 52px; background: linear-gradient(90deg, transparent 0 calc(100% - 44px), #171a1d 100%); } .nav::after { content: "좌우로 더 보기"; position: sticky; right: 0; align-self: center; flex: 0 0 auto; color: #aab2ae; font-size: .72rem; background: #171a1d; padding: 4px 6px; pointer-events: none; } .nav a { flex: 0 0 auto; text-align: center; } .status { white-space: normal; overflow-wrap: anywhere; } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; flex-wrap: wrap; } .actions button { flex: 1 1 120px; } }
-  @media (forced-colors: active) { .status, .panel, article, input, textarea, button, fieldset, dialog { border: 1px solid ButtonText; } .primary, .secondary, .danger { background: Canvas; color: ButtonText; } }
+  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button { flex: 1; } .auth button, .form button { width: 100%; } .judgments { grid-template-columns: 1fr; } .panel { padding: 16px; } .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; flex-wrap: wrap; } .actions button { flex: 1 1 120px; } }
+  @media (forced-colors: active) { .panel, article, input, textarea, button, fieldset, dialog { border: 1px solid ButtonText; } .primary, .secondary, .danger { background: Canvas; color: ButtonText; } }
   @media (prefers-reduced-motion: reduce) { :global(*) { scroll-behavior: auto !important; transition: none !important; } }
 </style>
