@@ -34,20 +34,34 @@ curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/models" |
 curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
   -d '{"model":"z-ai/glm-5.2","stream":true,"messages":[{"role":"user","content":"smoke"}]}' \
   "http://127.0.0.1:$port/v1/chat/completions" | grep -Fx 'data: [DONE]' >/dev/null
-for path in /v1/embeddings /v1/images/generations /v1/audio/speech /v1/nvidia/inference; do
+for path in /v1/embeddings /v1/images/generations /v1/audio/speech /v1/videos/generations /v1/nvidia/inference; do
   payload='{"model":"nvidia/nvclip","input":"smoke"}'
   case "$path" in
     /v1/images/generations) payload='{"model":"black-forest-labs/flux.1-kontext-dev","prompt":"smoke"}' ;;
     /v1/audio/speech) payload='{"model":"nvidia/magpie-tts-multilingual","input":"smoke"}' ;;
+    /v1/videos/generations) payload='{"model":"stabilityai/stable-video-diffusion","input_reference":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}' ;;
     /v1/nvidia/inference) payload='{"model":"stabilityai/stable-video-diffusion","input":{"image":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}' ;;
   esac
-  curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-    -d "$payload" "http://127.0.0.1:$port$path" >/dev/null
+  if [[ "$path" == /v1/audio/speech ]]; then
+    curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+      -d "$payload" "http://127.0.0.1:$port$path" -o "$work/speech.wav"
+    response=''
+  else
+    response=$(curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+      -d "$payload" "http://127.0.0.1:$port$path")
+  fi
+  case "$path" in
+    /v1/embeddings) jq -e '.object == "list" and (.data[0].embedding | length) == 1024' <<<"$response" >/dev/null ;;
+    /v1/images/generations) encoded=$(jq -er '.data[0].b64_json' <<<"$response"); test -n "$encoded"; printf '%s' "$encoded" | base64 -d >/dev/null ;;
+    /v1/audio/speech) test "$(wc -c < "$work/speech.wav")" -ge 44; test "$(dd if="$work/speech.wav" bs=1 count=4 2>/dev/null)" = RIFF ;;
+    /v1/videos/generations) jq -er '.data[0].b64_json' <<<"$response" | base64 -d >/dev/null ;;
+    /v1/nvidia/inference) jq -er '.video' <<<"$response" | base64 -d >/dev/null ;;
+  esac
 done
-test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{"model":"stabilityai/stable-video-diffusion","input_reference":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}' "http://127.0.0.1:$port/v1/videos/generations")" = 404
 test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d '{not-json' "http://127.0.0.1:$port/v1/embeddings")" = 400
-printf 'synthetic-audio' >"$work/audio.bin"
-test "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" \
-  -F 'model=nvidia/magpie-tts-multilingual' -F "file=@$work/audio.bin;type=audio/wav" \
-  "http://127.0.0.1:$port/v1/audio/transcriptions")" = 422
+printf 'RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00D\xac\x00\x00\x00\x00\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00' >"$work/audio.wav"
+transcription=$(curl -fsS -H "Authorization: Bearer $token" \
+  -F 'model=nvidia/parakeet-ctc-1.1b' -F "file=@$work/audio.wav;type=audio/wav" \
+  "http://127.0.0.1:$port/v1/audio/transcriptions")
+jq -e '.text == "NVIDIA Build LB"' <<<"$transcription" >/dev/null
 printf '%s\n' '{"status":"PASS","scope":"rust-gateway-mock","checks":["health","two-key-custody","scoped-token","models","streaming","multimodal"]}'

@@ -1154,6 +1154,7 @@ not secrets but are compacted only for L1 display.
 | `POST /v1/chat/completions` | loopback + public | `chat:write` | OpenAI/NVIDIA JSON or SSE |
 | `POST /v1/embeddings` | loopback + public | `embeddings:write` | OpenAI embedding JSON |
 | `POST /v1/images/generations` | loopback + public | `images:write` | OpenAI image JSON |
+| `POST /v1/videos/generations` | loopback + public | `media:write` | OpenAI-normalized video JSON |
 | `POST /v1/audio/speech` | loopback + public | `audio:write` | `audio/wav` bytes |
 | `POST /v1/audio/transcriptions` | loopback + public | `audio:write` | OpenAI transcription JSON |
 | `POST /v1/nvidia/inference` | loopback + public | `media:write` | NVIDIA-native video JSON |
@@ -1327,7 +1328,16 @@ For this rule `White_Space` is the exact closed set U+0009..000D, U+0020,
 U+0085, U+00A0, U+1680, U+2000..200A, U+2028, U+2029, U+202F, U+205F, and
 U+3000; a runtime Unicode-version change cannot alter it.
 
-`/v1/nvidia/inference` is explicitly not OpenAI `/v1/videos`. It accepts only:
+`/v1/nvidia/inference` remains the canonical NVIDIA-native video adapter. The
+gateway also exposes `/v1/videos/generations` as a strict OpenAI-compatible
+alias for the same `stabilityai/stable-video-diffusion` profile. The alias
+accepts only the closed `model,input_reference,seed,cfg_scale,motion_bucket_id`
+shape below, translates `input_reference` to the native `input.image`, and
+normalizes a successful native response to `{created,data:[{b64_json}],model}`.
+It does not advertise any additional model or provider capability; both routes
+share the same validation, timeout, failover, and response-contract rules.
+
+The native route accepts only:
 
 ```json
 {
@@ -1942,7 +1952,7 @@ The route and modality arrays are not inferred at runtime; their exact rows are:
 | `nvidia/vila` | `chat` | `["text","image","video"]` | `["text"]` |
 | `nvidia/nvclip` | `embeddings` | `["text","image"]` | `["vector"]` |
 | `black-forest-labs/flux.1-kontext-dev` | `images` | `["text"]` | `["image"]` |
-| `stabilityai/stable-video-diffusion` | `nvidia_native` | `["image"]` | `["video"]` |
+| `stabilityai/stable-video-diffusion` | `nvidia_native` + `videos` | `["image"]` | `["video"]` |
 | `nvidia/magpie-tts-multilingual` | `speech` | `["text"]` | `["audio"]` |
 | `nvidia/parakeet-ctc-1.1b` | `transcriptions` | `["audio"]` | `["text"]` |
 
@@ -2281,7 +2291,7 @@ complete EOF/chunk terminator are mandatory.
 | `nvidia/vila` / chat | `https://ai.api.nvidia.com:443/v1/vlm/nvidia/vila` | keep exact | JSON or SSE | nonstream 202 only | 60 s total or 30 min stream / 32 MiB or 256 MiB / 2 |
 | `nvidia/nvclip` / embeddings | `https://integrate.api.nvidia.com:443/v1/embeddings` | keep exact | JSON | no | 60 s / 32 MiB / 4 |
 | `black-forest-labs/flux.1-kontext-dev` / images | `https://ai.api.nvidia.com:443/v1/genai/black-forest-labs/flux.1-kontext-dev` | remove public model | JSON | no | 180 s / 32 MiB / 1 |
-| `stabilityai/stable-video-diffusion` / native | `https://ai.api.nvidia.com:443/v1/genai/stabilityai/stable-video-diffusion` | remove public model | JSON | no | 180 s / 128 MiB / 1 |
+| `stabilityai/stable-video-diffusion` / native + OpenAI alias | `https://ai.api.nvidia.com:443/v1/genai/stabilityai/stable-video-diffusion` | remove public model; alias maps `input_reference` to native `image` | JSON | no | 180 s / 128 MiB / 1 |
 | `nvidia/magpie-tts-multilingual` / speech | `https://877104f7-e885-42b9-8de8-f6e4c6303969.invocation.api.nvcf.nvidia.com:443/v1/audio/synthesize` | multipart mapping | WAV | no | 60 s / 32 MiB / 2 |
 
 Each table deadline is one monotonic total deadline starting immediately after

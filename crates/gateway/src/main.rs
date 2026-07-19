@@ -463,6 +463,7 @@ fn routes(cfg: &mut web::ServiceConfig) {
         .route("/v1/chat/completions", web::post().to(chat_completions))
         .route("/v1/embeddings", web::post().to(multimodal))
         .route("/v1/images/generations", web::post().to(multimodal))
+        .route("/v1/videos/generations", web::post().to(multimodal))
         .route("/v1/audio/speech", web::post().to(multimodal))
         .route("/v1/audio/transcriptions", web::post().to(multimodal))
         .route("/v1/nvidia/inference", web::post().to(multimodal))
@@ -1097,11 +1098,16 @@ async fn chat_completions(
                     }
                 };
                 if validate_chat_response(&bytes, false).is_err() {
+                    if let Err(response) = quarantine_key(&state, id).await {
+                        return response;
+                    }
                     if let Err(response) = attempt_finished(&state, request_id, id, "failed").await
                     {
                         return response;
                     }
-                    continue;
+                    return HttpResponse::BadGateway().json(json!({
+                        "error": {"message": "provider returned an invalid chat response", "type": "upstream_protocol_error"}
+                    }));
                 }
                 if let Err(response) = record_request(&state, id).await {
                     return response;
@@ -1166,14 +1172,16 @@ async fn chat_completions(
                     }
                 };
                 if validate_chat_response(&bytes, stream).is_err() {
-                    if let Err(response) = record_failure(&state, id, None).await {
+                    if let Err(response) = quarantine_key(&state, id).await {
                         return response;
                     }
                     if let Err(response) = attempt_finished(&state, request_id, id, "failed").await
                     {
                         return response;
                     }
-                    continue;
+                    return HttpResponse::BadGateway().json(json!({
+                        "error": {"message": "provider returned an invalid chat response", "type": "upstream_protocol_error"}
+                    }));
                 }
                 if let Err(response) = record_request(&state, id).await {
                     return response;
@@ -1296,7 +1304,22 @@ async fn multimodal(
             if let Err(response) = attempt_finished(&state, request_id, id, "succeeded").await {
                 return response;
             }
-            return mock_modality(req.path(), &request);
+            let (body, content_type) = mock_modality(req.path(), &request);
+            let (body, content_type) = match normalize_modality_response(
+                req.path(),
+                &body,
+                content_type,
+            ) {
+                Ok(value) => value,
+                Err(_) => {
+                    return HttpResponse::BadGateway().json(json!({
+                        "error": {"message": "mock provider fixture failed the modality contract", "type": "mock_contract_invalid"}
+                    }));
+                }
+            };
+            return HttpResponse::Ok()
+                .insert_header(("content-type", content_type))
+                .body(body);
         }
         let endpoint = upstream_endpoint_for(&state.upstream_url, req.path(), profile);
         let multipart_transcription = req.path() == "/v1/audio/transcriptions"
@@ -1329,8 +1352,8 @@ async fn multimodal(
                 .text("text", input.to_owned())
                 .text("language", language.to_owned())
                 .text("voice", voice.to_owned())
-                .text("encoding", "pcm16".to_owned())
-                .text("sample_rate", "44100".to_owned());
+                .text("encoding", "LINEAR_PCM".to_owned())
+                .text("sample_rate_hz", "44100".to_owned());
             state
                 .client
                 .post(&endpoint)
@@ -1350,24 +1373,19 @@ async fn multimodal(
         };
         match request_result {
             Ok(response) if response.status().is_success() => {
-                let response = if response.status().as_u16() == 202 {
-                    match poll_nvcf(&state.client, response, &endpoint, &credential).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            if let Err(response) = record_failure(&state, id, None).await {
-                                return response;
-                            }
-                            if let Err(response) =
-                                attempt_finished(&state, request_id, id, "failed").await
-                            {
-                                return response;
-                            }
-                            continue;
-                        }
+                if response.status().as_u16() == 202 {
+                    if let Err(response) = record_failure(&state, id, None).await {
+                        return response;
                     }
-                } else {
-                    response
-                };
+                    if let Err(response) = attempt_finished(&state, request_id, id, "failed").await
+                    {
+                        return response;
+                    }
+                    return HttpResponse::BadGateway().json(json!({
+                        "error": {"message": "provider returned asynchronous media output", "type": "upstream_protocol_error"}
+                    }));
+                }
+                let response = response;
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
                 let content_type = response
@@ -1390,21 +1408,26 @@ async fn multimodal(
                         continue;
                     }
                 };
-                let (bytes, content_type) =
-                    match normalize_modality_response(req.path(), &bytes, &content_type) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            if let Err(response) = record_failure(&state, id, None).await {
-                                return response;
-                            }
-                            if let Err(response) =
-                                attempt_finished(&state, request_id, id, "failed").await
-                            {
-                                return response;
-                            }
-                            continue;
+                let (bytes, content_type) = match normalize_modality_response(
+                    req.path(),
+                    &bytes,
+                    &content_type,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        if let Err(response) = quarantine_key(&state, id).await {
+                            return response;
                         }
-                    };
+                        if let Err(response) =
+                            attempt_finished(&state, request_id, id, "failed").await
+                        {
+                            return response;
+                        }
+                        return HttpResponse::BadGateway().json(json!({
+                                "error": {"message": "provider returned an invalid modality response", "type": "upstream_protocol_error"}
+                            }));
+                    }
+                };
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
@@ -1483,6 +1506,14 @@ fn parse_multimodal_request(
         }
         if body.len() > 64 * 1024 * 1024 {
             return Err(invalid_request("multipart body exceeds 64 MiB"));
+        }
+        let has_audio_part = body
+            .windows(b"Content-Type: audio/".len())
+            .any(|window| window.eq_ignore_ascii_case(b"Content-Type: audio/"));
+        if !has_audio_part {
+            return Err(invalid_request(
+                "multipart transcription file must declare an audio MIME type",
+            ));
         }
         let text = String::from_utf8_lossy(body);
         let model = text
@@ -1565,9 +1596,7 @@ fn profile_supports_path(path: &str, model: &str) -> bool {
         "/v1/videos/generations" => model == "stabilityai/stable-video-diffusion",
         "/v1/audio/speech" => model == "nvidia/magpie-tts-multilingual",
         "/v1/audio/transcriptions" => model == "nvidia/parakeet-ctc-1.1b",
-        "/v1/nvidia/inference" => {
-            matches!(model, "nvidia/vila" | "stabilityai/stable-video-diffusion")
-        }
+        "/v1/nvidia/inference" => model == "stabilityai/stable-video-diffusion",
         _ => false,
     }
 }
@@ -1622,7 +1651,7 @@ fn validate_modality_fields(
                 "motion_bucket_id",
             ],
         ),
-        "/v1/nvidia/inference" => (&[], &["model", "input", "messages", "stream", "parameters"]),
+        "/v1/nvidia/inference" => (&["input"], &["model", "input"]),
         _ => (&[], &["model"]),
     };
     for field in required {
@@ -1637,89 +1666,156 @@ fn validate_modality_fields(
         return Err(invalid_request(&format!("unsupported field: {unknown}")));
     }
     match path {
-        "/v1/embeddings" if !object["input"].is_string() && !object["input"].is_array() => {
-            Err(invalid_request("input must be a string or array"))
+        "/v1/embeddings" => {
+            let valid = object["input"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+                || object["input"].as_array().is_some_and(|items| {
+                    !items.is_empty()
+                        && items.len() <= 64
+                        && items
+                            .iter()
+                            .all(|item| item.as_str().is_some_and(|value| !value.is_empty()))
+                });
+            if valid {
+                Ok(())
+            } else {
+                Err(invalid_request(
+                    "input must be a non-empty string or an array of at most 64 strings",
+                ))
+            }
         }
-        "/v1/images/generations" if !object["prompt"].is_string() => {
-            Err(invalid_request("prompt must be a string"))
+        "/v1/images/generations" => {
+            if !object["prompt"].is_string() {
+                return Err(invalid_request("prompt must be a string"));
+            }
+            if let Some(size) = object.get("size")
+                && size.as_str() != Some("1024x1024")
+            {
+                return Err(invalid_request("size must be 1024x1024"));
+            }
+            if object.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
+                return Err(invalid_request("n must be 1"));
+            }
+            if let Some(format) = object.get("response_format")
+                && format.as_str() != Some("b64_json")
+            {
+                return Err(invalid_request("response_format must be b64_json"));
+            }
+            Ok(())
         }
-        "/v1/videos/generations"
+        "/v1/videos/generations" => {
             if object
                 .get("input_reference")
                 .and_then(Value::as_str)
-                .is_none_or(|value| !valid_data_url(value, true)) =>
-        {
-            Err(invalid_request(
-                "input_reference must be a valid PNG or JPEG data URL",
-            ))
+                .is_none_or(|value| !valid_data_url(value, true))
+            {
+                return Err(invalid_request(
+                    "input_reference must be a valid PNG or JPEG data URL",
+                ));
+            }
+            validate_video_options(object)
         }
-        "/v1/audio/speech" if !object["input"].is_string() => {
-            Err(invalid_request("input must be a string"))
+        "/v1/audio/speech" => {
+            if !object["input"].is_string() {
+                return Err(invalid_request("input must be a string"));
+            }
+            if let Some(format) = object.get("response_format")
+                && format.as_str() != Some("wav")
+            {
+                return Err(invalid_request("response_format must be wav"));
+            }
+            if let Some(speed) = object.get("speed")
+                && speed.as_f64() != Some(1.0)
+            {
+                return Err(invalid_request("speed must be 1.0"));
+            }
+            if let Some(voice) = object.get("voice")
+                && voice.as_str().is_none_or(|value| {
+                    value.trim().is_empty() || value.chars().any(char::is_control)
+                })
+            {
+                return Err(invalid_request("voice must be a non-empty safe string"));
+            }
+            Ok(())
         }
         "/v1/nvidia/inference" => {
             let input = object
                 .get("input")
                 .ok_or_else(|| invalid_request("input is required"))?;
-            if !input.is_string() && !input.is_object() {
-                return Err(invalid_request("input must be a string or object"));
+            let Some(input) = input.as_object() else {
+                return Err(invalid_request("input must be an object"));
+            };
+            if let Some(unknown) = input.keys().find(|field| {
+                !["image", "seed", "cfg_scale", "motion_bucket_id"].contains(&field.as_str())
+            }) {
+                return Err(invalid_request(&format!(
+                    "unsupported input field: {unknown}"
+                )));
             }
-            if let Some(input) = input.as_object() {
-                if let Some(unknown) = input.keys().find(|field| {
-                    ![
-                        "image",
-                        "image_url",
-                        "prompt",
-                        "seed",
-                        "cfg_scale",
-                        "motion_bucket_id",
-                    ]
-                    .contains(&field.as_str())
-                }) {
-                    return Err(invalid_request(&format!(
-                        "unsupported input field: {unknown}"
-                    )));
-                }
-                if !input.contains_key("image")
-                    && !input.contains_key("image_url")
-                    && !input.contains_key("prompt")
-                {
-                    return Err(invalid_request(
-                        "input requires image, image_url, or prompt",
-                    ));
-                }
-                if let Some(image) = input.get("image").or_else(|| input.get("image_url"))
-                    && image
-                        .as_str()
-                        .is_none_or(|value| !valid_data_url(value, true))
-                {
-                    return Err(invalid_request(
-                        "input image must be a valid PNG or JPEG data URL",
-                    ));
-                }
-                if let Some(seed) = input.get("seed")
-                    && !seed.is_i64()
-                {
-                    return Err(invalid_request("seed must be an integer"));
-                }
-                if let Some(cfg) = input.get("cfg_scale")
-                    && cfg
-                        .as_f64()
-                        .is_none_or(|value| !(0.0..=30.0).contains(&value))
-                {
-                    return Err(invalid_request("cfg_scale must be between 0 and 30"));
-                }
-                if let Some(bucket) = input.get("motion_bucket_id")
-                    && bucket.as_u64().is_none_or(|value| value > 255)
-                {
-                    return Err(invalid_request(
-                        "motion_bucket_id must be between 0 and 255",
-                    ));
-                }
+            if input
+                .get("image")
+                .and_then(Value::as_str)
+                .is_none_or(|value| !valid_data_url(value, true))
+            {
+                return Err(invalid_request(
+                    "input.image must be a valid PNG or JPEG data URL",
+                ));
+            }
+            if let Some(seed) = input.get("seed")
+                && seed
+                    .as_i64()
+                    .is_none_or(|value| !(0..=u32::MAX as i64).contains(&value))
+            {
+                return Err(invalid_request(
+                    "seed must be an integer between 0 and 4294967295",
+                ));
+            }
+            if let Some(cfg) = input.get("cfg_scale")
+                && cfg.as_f64().is_none_or(|value| {
+                    value.is_nan() || !(1.0..=9.0).contains(&value) || value == 1.0
+                })
+            {
+                return Err(invalid_request(
+                    "cfg_scale must be greater than 1 and at most 9",
+                ));
+            }
+            if let Some(bucket) = input.get("motion_bucket_id")
+                && bucket.as_i64() != Some(127)
+            {
+                return Err(invalid_request("motion_bucket_id must equal 127"));
             }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+fn validate_video_options(object: &serde_json::Map<String, Value>) -> Result<(), HttpResponse> {
+    if let Some(seed) = object.get("seed")
+        && seed
+            .as_i64()
+            .is_none_or(|value| !(0..=u32::MAX as i64).contains(&value))
+    {
+        return Err(invalid_request(
+            "seed must be an integer between 0 and 4294967295",
+        ));
+    }
+    if let Some(cfg) = object.get("cfg_scale")
+        && cfg
+            .as_f64()
+            .is_none_or(|value| value.is_nan() || !(1.0..=9.0).contains(&value) || value == 1.0)
+    {
+        return Err(invalid_request(
+            "cfg_scale must be greater than 1 and at most 9",
+        ));
+    }
+    if let Some(bucket) = object.get("motion_bucket_id")
+        && bucket.as_i64() != Some(127)
+    {
+        return Err(invalid_request("motion_bucket_id must equal 127"));
+    }
+    Ok(())
 }
 
 fn validate_chat_request(request: &Value) -> Result<(), HttpResponse> {
@@ -1739,7 +1835,7 @@ fn validate_chat_request(request: &Value) -> Result<(), HttpResponse> {
             "error": {"message": "model is not compatible with this endpoint", "type": "model_route_mismatch"}
         })));
     }
-    const ALLOWED: &[&str] = &[
+    const GLM_ALLOWED: &[&str] = &[
         "model",
         "messages",
         "stream",
@@ -1757,9 +1853,22 @@ fn validate_chat_request(request: &Value) -> Result<(), HttpResponse> {
         "frequency_penalty",
         "presence_penalty",
     ];
+    let allowed = if model == "z-ai/glm-5.2" {
+        GLM_ALLOWED
+    } else {
+        &[
+            "model",
+            "messages",
+            "stream",
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "seed",
+        ]
+    };
     if let Some(unknown) = object
         .keys()
-        .find(|field| !ALLOWED.contains(&field.as_str()))
+        .find(|field| !allowed.contains(&field.as_str()))
     {
         return Err(invalid_request(&format!("unsupported field: {unknown}")));
     }
@@ -1767,21 +1876,80 @@ fn validate_chat_request(request: &Value) -> Result<(), HttpResponse> {
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid_request("messages must be an array"))?;
-    if messages.is_empty()
-        || messages.iter().any(|message| {
-            !message.is_object()
-                || !matches!(
-                    message.get("role").and_then(Value::as_str),
-                    Some("system" | "user" | "assistant" | "tool")
-                )
-                || message.get("content").is_some_and(Value::is_null)
-        })
-    {
+    if messages.is_empty() {
         return Err(invalid_request(
             "messages must contain valid role/content entries",
         ));
     }
+    let allowed_content = match model {
+        "microsoft/phi-4-multimodal-instruct" => &["text", "image_url", "audio_url"][..],
+        "nvidia/vila" => &["text", "image_url", "video_url"][..],
+        _ => &["text"][..],
+    };
+    for message in messages {
+        let Some(message) = message.as_object() else {
+            return Err(invalid_request(
+                "messages must contain valid role/content entries",
+            ));
+        };
+        if !matches!(
+            message.get("role").and_then(Value::as_str),
+            Some("system" | "user" | "assistant" | "tool")
+        ) {
+            return Err(invalid_request("message role is not supported"));
+        }
+        let Some(content) = message.get("content") else {
+            return Err(invalid_request("message content is required"));
+        };
+        if !validate_chat_content(content, allowed_content) {
+            return Err(invalid_request(
+                "message content does not match the selected model",
+            ));
+        }
+    }
     Ok(())
+}
+
+fn validate_chat_content(content: &Value, allowed_types: &[&str]) -> bool {
+    if let Some(text) = content.as_str() {
+        return !text.is_empty();
+    }
+    let Some(items) = content.as_array() else {
+        return false;
+    };
+    !items.is_empty()
+        && items.iter().all(|item| {
+            let Some(item) = item.as_object() else {
+                return false;
+            };
+            let Some(kind) = item.get("type").and_then(Value::as_str) else {
+                return false;
+            };
+            if !allowed_types.contains(&kind) {
+                return false;
+            }
+            match kind {
+                "text" => {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                        && item
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "type" | "text"))
+                }
+                "image_url" | "audio_url" | "video_url" => {
+                    item.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            "type" | "image_url" | "audio_url" | "video_url"
+                        )
+                    }) && item
+                        .get(kind)
+                        .is_some_and(|value| value.is_string() || value.is_object())
+                }
+                _ => false,
+            }
+        })
 }
 
 /// Resolve a modality endpoint from the configured chat endpoint without
@@ -1869,24 +2037,56 @@ fn prepare_modality_request(path: &str, request: &Value) -> Result<Value, HttpRe
                 .ok_or_else(|| invalid_request("input_reference must be a PNG or JPEG data URL"))?;
             let mut result = serde_json::Map::new();
             result.insert("image".to_owned(), Value::String(input.to_owned()));
-            for field in ["seed", "cfg_scale", "motion_bucket_id"] {
-                if let Some(value) = object.get(field) {
-                    result.insert(field.to_owned(), value.clone());
-                }
-            }
+            result.insert(
+                "seed".to_owned(),
+                object.get("seed").cloned().unwrap_or_else(|| json!(0)),
+            );
+            result.insert(
+                "cfg_scale".to_owned(),
+                object
+                    .get("cfg_scale")
+                    .cloned()
+                    .unwrap_or_else(|| json!(1.8)),
+            );
+            result.insert(
+                "motion_bucket_id".to_owned(),
+                object
+                    .get("motion_bucket_id")
+                    .cloned()
+                    .unwrap_or_else(|| json!(127)),
+            );
             Ok(Value::Object(result))
         }
         "/v1/nvidia/inference" => {
-            let model = object
-                .get("model")
+            let input = object
+                .get("input")
+                .and_then(Value::as_object)
+                .ok_or_else(|| invalid_request("input must be an object"))?;
+            let image = input
+                .get("image")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
-            if model == "stabilityai/stable-video-diffusion"
-                && let Some(input) = object.get("input").and_then(Value::as_object)
-            {
-                return Ok(input.clone().into());
-            }
-            Ok(request.clone())
+                .ok_or_else(|| invalid_request("input.image is required"))?;
+            let mut result = serde_json::Map::new();
+            result.insert("image".to_owned(), Value::String(image.to_owned()));
+            result.insert(
+                "seed".to_owned(),
+                input.get("seed").cloned().unwrap_or_else(|| json!(0)),
+            );
+            result.insert(
+                "cfg_scale".to_owned(),
+                input
+                    .get("cfg_scale")
+                    .cloned()
+                    .unwrap_or_else(|| json!(1.8)),
+            );
+            result.insert(
+                "motion_bucket_id".to_owned(),
+                input
+                    .get("motion_bucket_id")
+                    .cloned()
+                    .unwrap_or_else(|| json!(127)),
+            );
+            Ok(Value::Object(result))
         }
         _ => Ok(request.clone()),
     }
@@ -1968,29 +2168,82 @@ async fn poll_nvcf(
     }
 }
 
-fn mock_modality(path: &str, request: &Value) -> HttpResponse {
+fn mock_modality(path: &str, request: &Value) -> (Vec<u8>, &'static str) {
     let model = request
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("nvidia/multimodal");
-    let body = match path {
+    match path {
         "/v1/embeddings" => {
-            json!({"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.0,1.0]}],"model":model,"usage":{"prompt_tokens":1,"total_tokens":1}})
+            let embedding = vec![0.0_f64; 1024];
+            (
+                serde_json::to_vec(&json!({
+                    "object":"list",
+                    "data":[{"object":"embedding","index":0,"embedding":embedding}],
+                    "model":model,
+                    "usage":{"prompt_tokens":1,"total_tokens":1}
+                }))
+                .expect("mock embedding fixture is serializable"),
+                "application/json",
+            )
         }
         "/v1/images/generations" => {
-            json!({"artifacts":[{"base64":"","finishReason":"SUCCESS","seed":0}],"model":model})
+            let encoded = base64::engine::general_purpose::STANDARD.encode(mock_jpeg());
+            (
+                serde_json::to_vec(&json!({
+                    "artifacts":[{"base64":encoded,"finishReason":"SUCCESS","seed":0}],
+                    "model":model
+                }))
+                .expect("mock image fixture is serializable"),
+                "application/json",
+            )
         }
-        "/v1/audio/speech" => {
-            return HttpResponse::Ok()
-                .content_type("audio/wav")
-                .body(b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec());
-        }
-        "/v1/audio/transcriptions" => json!({"text":"NVIDIA Build LB","model":model}),
+        "/v1/audio/speech" => (mock_wav(), "audio/wav"),
+        "/v1/audio/transcriptions" => (
+            serde_json::to_vec(&json!({"text":"NVIDIA Build LB","model":model}))
+                .expect("mock transcription fixture is serializable"),
+            "application/json",
+        ),
         _ => {
-            json!({"video":"ZGF0YQ==","finish_reason":"SUCCESS","seed":0,"model":model})
+            let encoded = base64::engine::general_purpose::STANDARD.encode(mock_mp4());
+            (
+                serde_json::to_vec(&json!({
+                    "video":encoded,
+                    "finish_reason":"SUCCESS",
+                    "seed":0,
+                    "model":model
+                }))
+                .expect("mock video fixture is serializable"),
+                "application/json",
+            )
         }
-    };
-    HttpResponse::Ok().json(body)
+    }
+}
+
+fn mock_jpeg() -> Vec<u8> {
+    vec![0xff, 0xd8, 0xff, 0xd9]
+}
+
+fn mock_wav() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 44];
+    bytes[0..4].copy_from_slice(b"RIFF");
+    bytes[4..8].copy_from_slice(&36_u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(b"WAVE");
+    bytes[12..16].copy_from_slice(b"fmt ");
+    bytes[16..20].copy_from_slice(&16_u32.to_le_bytes());
+    bytes[20..22].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[22..24].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[24..28].copy_from_slice(&44_100_u32.to_le_bytes());
+    bytes[34..36].copy_from_slice(&16_u16.to_le_bytes());
+    bytes[36..40].copy_from_slice(b"data");
+    bytes
+}
+
+fn mock_mp4() -> Vec<u8> {
+    vec![
+        0, 0, 0, 24, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0, 0, b'i', b's', b'o',
+        b'm', b'm', b'o', b'o', b'v',
+    ]
 }
 
 fn mock_response(request: &Value, stream: bool) -> HttpResponse {
@@ -2402,6 +2655,10 @@ fn valid_jpeg(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes.starts_with(&[0xff, 0xd8]) && bytes.ends_with(&[0xff, 0xd9])
 }
 
+fn valid_image(bytes: &[u8]) -> bool {
+    valid_jpeg(bytes) || valid_png(bytes)
+}
+
 fn valid_png(bytes: &[u8]) -> bool {
     bytes.len() >= 24
         && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
@@ -2456,7 +2713,11 @@ fn validate_modality_response(path: &str, body: &[u8], content_type: &str) -> Re
     let value: Value = serde_json::from_slice(body).map_err(|_| ())?;
     let valid = match path {
         "/v1/embeddings" => {
-            value.get("object").and_then(Value::as_str) == Some("list")
+            value.as_object().is_some_and(|object| {
+                object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "object" | "data" | "model" | "usage"))
+            }) && value.get("object").and_then(Value::as_str) == Some("list")
                 && value.get("model").and_then(Value::as_str) == Some("nvidia/nvclip")
                 && value
                     .get("data")
@@ -2481,9 +2742,11 @@ fn validate_modality_response(path: &str, body: &[u8], content_type: &str) -> Re
                     .get("usage")
                     .and_then(Value::as_object)
                     .is_some_and(|usage| {
-                        usage
-                            .keys()
-                            .all(|key| matches!(key.as_str(), "prompt_tokens" | "total_tokens"))
+                        usage.contains_key("prompt_tokens")
+                            && usage.contains_key("total_tokens")
+                            && usage
+                                .keys()
+                                .all(|key| matches!(key.as_str(), "prompt_tokens" | "total_tokens"))
                             && usage.values().all(|value| value.as_u64().is_some())
                     })
         }
@@ -2497,7 +2760,7 @@ fn validate_modality_response(path: &str, body: &[u8], content_type: &str) -> Re
                             item.get("b64_json")
                                 .and_then(Value::as_str)
                                 .and_then(decode_base64)
-                                .is_some_and(|bytes| valid_jpeg(&bytes))
+                                .is_some_and(|bytes| valid_image(&bytes))
                         })
                 })
                 || value
@@ -2512,7 +2775,7 @@ fn validate_modality_response(path: &str, body: &[u8], content_type: &str) -> Re
                                         .get("base64")
                                         .and_then(Value::as_str)
                                         .and_then(decode_base64)
-                                        .is_some_and(|bytes| valid_jpeg(&bytes))
+                                        .is_some_and(|bytes| valid_image(&bytes))
                             })
                     })
         }
@@ -2526,7 +2789,28 @@ fn validate_modality_response(path: &str, body: &[u8], content_type: &str) -> Re
             .get("text")
             .and_then(Value::as_str)
             .is_some_and(|text| !text.trim().is_empty()),
-        "/v1/videos/generations" | "/v1/nvidia/inference" => {
+        "/v1/videos/generations" => {
+            (value
+                .get("video")
+                .and_then(Value::as_str)
+                .and_then(decode_base64)
+                .is_some_and(|bytes| valid_mp4(&bytes))
+                && value.get("finish_reason").and_then(Value::as_str) == Some("SUCCESS")
+                && value.get("seed").and_then(Value::as_i64).is_some())
+                || value
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        !items.is_empty()
+                            && items.iter().all(|item| {
+                                item.get("b64_json")
+                                    .and_then(Value::as_str)
+                                    .and_then(decode_base64)
+                                    .is_some_and(|bytes| valid_mp4(&bytes))
+                            })
+                    })
+        }
+        "/v1/nvidia/inference" => {
             value
                 .get("video")
                 .and_then(Value::as_str)
@@ -2846,11 +3130,36 @@ mod tests {
             .is_ok()
         );
         assert!(validate_chat_request(&serde_json::json!({"model":"z-ai/glm-5.2"})).is_err());
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        assert!(
+            parse_multimodal_request(
+                "/v1/videos/generations",
+                &serde_json::to_vec(&serde_json::json!({
+                    "model":"stabilityai/stable-video-diffusion",
+                    "input_reference": png
+                }))
+                .expect("video request"),
+                "application/json",
+            )
+            .is_ok()
+        );
+        assert!(parse_multimodal_request(
+            "/v1/videos/generations",
+            br#"{"model":"stabilityai/stable-video-diffusion","input_reference":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=","motion_bucket_id":126}"#,
+            "application/json",
+        )
+        .is_err());
+        assert!(parse_multimodal_request(
+            "/v1/nvidia/inference",
+            br#"{"model":"nvidia/vila","input":{"image":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}}"#,
+            "application/json",
+        )
+        .is_err());
     }
 
     #[test]
     fn multipart_transcription_requires_model_and_file() {
-        let body = b"--test\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnvidia/parakeet-ctc-1.1b\r\n--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\naudio\r\n--test--\r\n";
+        let body = b"--test\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nnvidia/parakeet-ctc-1.1b\r\n--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\nContent-Type: audio/wav\r\n\r\naudio\r\n--test--\r\n";
         let parsed = parse_multimodal_request(
             "/v1/audio/transcriptions",
             body,
@@ -2883,5 +3192,25 @@ mod tests {
         assert!(validate_chat_response(valid, false).is_ok());
         let leaked = br#"{"id":"chat-1","object":"chat.completion","model":"z-ai/glm-5.2","choices":[],"provider_secret":"do-not-forward"}"#;
         assert!(validate_chat_response(leaked, false).is_err());
+    }
+
+    #[test]
+    fn chat_request_contract_is_profile_aware() {
+        let phi = serde_json::json!({
+            "model": "microsoft/phi-4-multimodal-instruct",
+            "messages": [{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]
+        });
+        assert!(validate_chat_request(&phi).is_ok());
+        let phi_tools = serde_json::json!({
+            "model": "microsoft/phi-4-multimodal-instruct",
+            "tools": [],
+            "messages": [{"role":"user","content":"hello"}]
+        });
+        assert!(validate_chat_request(&phi_tools).is_err());
+        let glm_object = serde_json::json!({
+            "model": "z-ai/glm-5.2",
+            "messages": [{"role":"user","content":{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}}]
+        });
+        assert!(validate_chat_request(&glm_object).is_err());
     }
 }

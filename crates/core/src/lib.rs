@@ -567,6 +567,9 @@ impl Vault {
         if enabled && !key.verified {
             bail!("provider probe is required before enabling key")
         }
+        if enabled && key.cooldown_until.is_some_and(|until| until > Utc::now()) {
+            bail!("key is cooling down")
+        }
         key.enabled = enabled;
         let result = summary(key);
         self.persist()?;
@@ -583,6 +586,8 @@ impl Vault {
             .find(|key| key.id == id)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.verified = true;
+        key.cooldown_until = None;
+        key.failure_count = 0;
         let result = summary(key);
         self.persist()?;
         Ok(result)
@@ -611,6 +616,7 @@ impl Vault {
         key.enabled = false;
         key.verified = false;
         key.cooldown_until = None;
+        key.failure_count = 0;
         let result = summary(key);
         self.persist()?;
         Ok(result)
@@ -647,6 +653,8 @@ impl Vault {
             .find(|key| key.id == id)
             .ok_or_else(|| anyhow!("key not found"))?;
         key.request_count = key.request_count.saturating_add(1);
+        key.failure_count = 0;
+        key.cooldown_until = None;
         self.persist()
     }
 
@@ -933,6 +941,46 @@ mod tests {
         assert!(summary.cooldown_until.is_some());
         assert_eq!(reopened.router_cursor_for("nvidia/vila"), 1);
         assert_eq!(reopened.credential(key.id).expect("decrypt"), credential);
+    }
+
+    #[test]
+    fn successful_request_and_probe_clear_failure_cooldown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut vault = Vault::open(dir.path().join("vault.json"), [13; 32]).expect("open");
+        let key = vault
+            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .expect("add");
+        vault.mark_verified(key.id).expect("probe");
+        vault.set_enabled(key.id, true).expect("enable");
+        vault
+            .record_failure(key.id, Some(Duration::seconds(30)))
+            .expect("failure");
+        assert!(vault.list()[0].cooldown_until.is_some());
+        vault.record_request(key.id).expect("success");
+        assert_eq!(vault.list()[0].failure_count, 0);
+        assert!(vault.list()[0].cooldown_until.is_none());
+        vault
+            .record_failure(key.id, Some(Duration::seconds(30)))
+            .expect("failure again");
+        vault.mark_verified(key.id).expect("probe reset");
+        assert_eq!(vault.list()[0].failure_count, 0);
+        assert!(vault.list()[0].cooldown_until.is_none());
+    }
+
+    #[test]
+    fn cooling_key_cannot_be_enabled_until_probe_reset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut vault = Vault::open(dir.path().join("vault.json"), [14; 32]).expect("open");
+        let key = vault
+            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .expect("add");
+        vault.mark_verified(key.id).expect("probe");
+        vault
+            .record_failure(key.id, Some(Duration::seconds(30)))
+            .expect("failure");
+        assert!(vault.set_enabled(key.id, true).is_err());
+        vault.mark_verified(key.id).expect("probe reset");
+        vault.set_enabled(key.id, true).expect("enable after reset");
     }
 
     #[test]
