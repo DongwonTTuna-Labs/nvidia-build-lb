@@ -1,0 +1,19 @@
+title = "nvidia-build-lb release scan"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated and local-only paths never enter the publication surface"
+paths = [
+  '''(^|/)\.omo/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.git/''',
+]
+
+[[allowlists]]
+description = "Historical v15 fixture binds two source-file SHA-256 fields"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)tests/fixtures/nvidia-routing-v15/contract-v15\.json$''']
+regexes = ['''"(?:auth_sha256|upstream_keys_sha256)"\s*:\s*"[0-9a-f]{64}"''']
