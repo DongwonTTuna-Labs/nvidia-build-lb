@@ -734,6 +734,7 @@ async fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2456);
     let state = web::Data::new(build_state().await.expect("gateway configuration"));
+    spawn_database_watchdog(state.clone());
     HttpServer::new(move || {
         App::new()
             .wrap(
@@ -752,8 +753,37 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+fn spawn_database_watchdog(state: web::Data<AppState>) {
+    let Some(pool) = state.vault.database.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut failed_since = None;
+        loop {
+            tokio::time::sleep(StdDuration::from_secs(2)).await;
+            let healthy = sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(&pool)
+                .await
+                .is_ok();
+            if healthy {
+                failed_since = None;
+                continue;
+            }
+            let first_failure = failed_since.get_or_insert_with(Instant::now);
+            if first_failure.elapsed() >= StdDuration::from_secs(2) {
+                eprintln!("postgres readiness lost; exiting for supervisor restart");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
 fn routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/health", web::get().to(health))
+        .route(
+            "/admin/api/v1/operator-readiness",
+            web::get().to(operator_readiness),
+        )
         .route("/v1/models", web::get().to(models))
         .route("/v1/chat/completions", web::post().to(chat_completions))
         .route("/v1/embeddings", web::post().to(multimodal))
@@ -1083,6 +1113,36 @@ async fn health(req: HttpRequest, state: web::Data<AppState>) -> impl Responder 
             traffic_ready,
             eligible_keys,
         })
+}
+
+async fn operator_readiness(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
+    if !authorized(&req, &state) {
+        return admin_unauthorized();
+    }
+    let database_ready = match &state.vault.database {
+        Some(pool) => sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(pool)
+            .await
+            .is_ok(),
+        None => true,
+    };
+    if !database_ready {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "runtime_state": "unavailable",
+            "readiness_cause": "runtime_unavailable",
+            "ledger_status": "capacity_blocked",
+            "capacity_blocker": "orphaned_pending"
+        }));
+    }
+    let eligible = eligible_key_count(&state.vault.list());
+    HttpResponse::Ok()
+        .insert_header(("cache-control", "no-store"))
+        .json(json!({
+            "runtime_state": "operational",
+            "readiness_cause": if eligible > 0 { "ready" } else { "no_eligible_upstream" },
+            "ledger_status": "ok",
+            "capacity_blocker": "none"
+        }))
 }
 
 async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
