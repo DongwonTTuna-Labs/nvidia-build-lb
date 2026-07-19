@@ -24,10 +24,12 @@ import type {
   SlotProjection,
   SnapshotState,
 } from "$lib/admin-types";
+import ClientsPanel from "$lib/components/ClientsPanel.svelte";
 import EvidencePanel from "$lib/components/EvidencePanel.svelte";
 import ModelsPanel from "$lib/components/ModelsPanel.svelte";
 import OverviewPanel from "$lib/components/OverviewPanel.svelte";
 import RouteNavigation from "$lib/components/RouteNavigation.svelte";
+import RoutingStatusPanel from "$lib/components/RoutingStatusPanel.svelte";
 import StatusBadge from "$lib/components/StatusBadge.svelte";
 import { type AdminRouteId, adminRoutes } from "$lib/copy";
 
@@ -1216,32 +1218,35 @@ onMount(() => {
       onSelectRoute={(route) => void selectRoute(route)}
       onAttention={(attention) => void handleAttention(attention)}
     />
-    <section id="routing" class:panel-hidden={active !== "routing"} class="panel" aria-labelledby="routing-title" hidden={active !== "routing"}>
-        <h2 id="routing-title">두 슬롯의 상태</h2>
-        <p class="muted">활성·cooldown 키만 새 요청을 받을 수 있습니다. 원문 키는 표시하지 않습니다.</p>
-        <div class="table-wrap">
-          <table><caption class="sr-only">NVIDIA upstream 슬롯</caption><thead><tr><th scope="col">키</th><th scope="col">상태</th><th scope="col">누적</th><th scope="col"><span class="sr-only">조작</span></th></tr></thead><tbody>
-            {#each [0, 1] as index}
-              {@const key = keys[index]}
-              {#if key}
-                {@const probe = key.verified ? "valid" : probeState[key.id]}
-                {@const eligible = key.enabled && key.verified && !key.cooldown_until}
-                <tr><th scope="row"><span id={`key-${key.id}`}>슬롯 {index + 1} · {key.label}</span><small>{key.fingerprint.slice(0, 15)}…</small></th><td data-label="상태"><StatusBadge good={eligible} label={key.cooldown_until ? "일시 대기" : !key.verified ? (probe === "invalid" ? "검증 실패" : "검증 필요") : key.enabled ? "활성" : "중지됨"} />{#if key.cooldown_until}<small>{formatDateTime(key.cooldown_until)}까지</small>{/if}{#if key.id === lifecycleKeyId && !key.enabled && probe !== "valid"}<small class="next-step">다음 단계: 제공자 검증을 통과하면 라우팅에 포함할 수 있습니다.</small>{/if}{#if !key.enabled && probe === "invalid"}<small>키를 교체하거나 다시 검증하세요.</small>{/if}</td><td data-label="누적">{key.request_count}회 요청 · {key.failure_count}회 실패</td><td data-label="조작" class="actions"><button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.verified ? "재검증" : "제공자 검증"}`} onclick={() => void probeKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>{probe === "pending" ? "검증 중…" : key.verified ? "재검증" : "검증"}</button><button class="secondary" type="button" aria-label={`슬롯 ${index + 1} ${key.label} ${key.enabled ? "라우팅 제외" : "라우팅 포함"}`} onclick={() => void toggleKey(key)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed() || (!key.enabled && probe !== "valid")}>{key.enabled ? "제외" : "포함"}</button><button class="danger" type="button" aria-label={`슬롯 ${index + 1} ${key.label} 영구 폐기`} onclick={(event) => openConfirmation("delete", key.id, key.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>영구 폐기</button></td></tr>
-              {:else}
-                <tr><th scope="row">슬롯 {index + 1}</th><td data-label="상태">구성 필요</td><td data-label="누적">아직 등록된 키가 없습니다.</td><td data-label="조작"></td></tr>
-              {/if}
-            {/each}
-          </tbody></table>
-        </div>
-        {#if readinessReasons.length}<p class="attention" role="status">발급·운영 준비 조건: {readinessReasons.map(actionLabel).join(" · ")}</p>{/if}
-        {#if keys.length < 2 || keys.some((key) => !key.enabled)}<div class="subpanel"><h3>{keys.length === 0 ? "첫 번째 키 추가" : keys.length < 2 ? "두 번째 키 추가" : "중지된 슬롯 교체"}</h3><p>서로 다른 두 키만 저장할 수 있습니다. 저장 후 원문은 즉시 지워집니다.</p><form bind:this={upstreamForm} class="form" onsubmit={addUpstream}><label for="upstream-label">라벨<input id="upstream-label" bind:this={upstreamLabelInput} bind:value={upstreamLabel} maxlength="128" required aria-describedby={showInlineUpstreamError() ? "upstream-error" : error ? "error-message" : undefined} aria-invalid={upstreamError ? "true" : undefined} placeholder="예: nvidia-primary" /></label><label for="upstream-credential">NVIDIA API 키<input id="upstream-credential" bind:this={upstreamCredentialInput} type="password" required autocomplete="off" aria-describedby={showInlineUpstreamError() ? "upstream-error" : error ? "error-message" : undefined} aria-invalid={upstreamError ? "true" : undefined} oninput={() => (formRevision += 1)} placeholder="nvapi-…" /></label>{#if showInlineUpstreamError()}<p id="upstream-error" class="alert" role="alert">{upstreamError}</p>{/if}<span class="sr-only">{formRevision}</span><button class="primary" type="submit" disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>암호화 저장</button></form></div>{/if}
-        {#if slotProjections.length}<div class="subpanel"><h3>프로필별 슬롯 준비</h3><p class="muted">두 슬롯의 자격 증명 상태와 모델별 제공자 proof를 분리해 표시합니다.</p><div class="profile-grid">{#each profileCapabilities as capability}<article><strong>{capability.id}</strong><small>{capability.route}</small><span>{capability.available_now ? "제공자 검증 완료" : capability.proof_status === "provider_proof_required" ? "제공자 proof 필요" : "두 슬롯 준비 확인 필요"}</span><small>{slotProjections.filter((slot) => slot.profiles.some((profile) => profile.profile_id === capability.id && profile.eligible_now)).length}/2 슬롯 가능</small></article>{/each}</div></div>{/if}
-    </section>
-    <section id="clients" class:panel-hidden={active !== "clients"} class="panel" aria-labelledby="clients-title" hidden={active !== "clients"}>
-        <h2 id="clients-title">필요한 권한만 발급</h2><p class="muted">새 접속 키는 발급 직후 native dialog에서 한 번만 보입니다.</p>
-        <form bind:this={clientForm} class="form" onsubmit={issueClient}><label for="client-label">라벨<input id="client-label" bind:this={clientLabelInput} bind:value={clientLabel} maxlength="128" required aria-describedby={clientError ? "error-message" : undefined} aria-invalid={clientError ? "true" : undefined} placeholder="예: hermes" /></label><fieldset><legend>권한 범위</legend>{#each supportedScopes as [scope, label]}<label class="check"><input type="checkbox" value={scope} bind:group={clientScopes} /> <span>{label}</span><small>{scope}</small></label>{/each}</fieldset><button class="primary" type="submit" disabled={!session.token || eligibleKeys !== 2 || !clientLabel.trim() || clientScopes.length === 0 || mutating || mutationState !== "idle" || !mutationAllowed()}>접속 키 발급</button></form>
-        <div class="table-wrap"><table><caption class="sr-only">다운스트림 접속 키</caption><thead><tr><th scope="col">라벨</th><th scope="col">권한</th><th scope="col">상태</th><th scope="col"><span class="sr-only">조작</span></th></tr></thead><tbody>{#each clients as client}<tr><th scope="row" id={`client-${client.id}`}>{client.label}<small>{client.request_count}회 사용</small></th><td data-label="권한">{client.scopes.join(", ")}</td><td data-label="상태">{client.active ? "사용 중" : "폐기됨"}</td><td data-label="조작">{#if client.active}<button class="danger" type="button" aria-label={`${client.label} 접속 키 폐기`} onclick={(event) => openConfirmation("revoke", client.id, client.label, event)} disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>폐기</button>{/if}</td></tr>{:else}<tr><td colspan="4">발급된 접속 키가 없습니다.</td></tr>{/each}</tbody></table></div>
-    </section>
+    <RoutingStatusPanel
+      active={active}
+      keys={keys}
+      probeState={probeState}
+      lifecycleKeyId={lifecycleKeyId}
+      sessionToken={session.token}
+      mutating={mutating}
+      mutationState={mutationState}
+      readinessReasons={readinessReasons}
+      profileCapabilities={profileCapabilities}
+      slotProjections={slotProjections}
+      onProbe={(key) => void probeKey(key)}
+      onToggle={(key) => void toggleKey(key)}
+      onDelete={(kind, id, label, event) => openConfirmation(kind, id, label, event)}
+    >
+      {#if keys.length < 2 || keys.some((key) => !key.enabled)}
+        <div class="subpanel"><h3>{keys.length === 0 ? "첫 번째 키 추가" : keys.length < 2 ? "두 번째 키 추가" : "중지된 슬롯 교체"}</h3><p>서로 다른 두 키만 저장할 수 있습니다. 저장 후 원문은 즉시 지워집니다.</p><form bind:this={upstreamForm} class="form" onsubmit={addUpstream}><label for="upstream-label">라벨<input id="upstream-label" bind:this={upstreamLabelInput} bind:value={upstreamLabel} maxlength="128" required aria-describedby={showInlineUpstreamError() ? "upstream-error" : error ? "error-message" : undefined} aria-invalid={upstreamError ? "true" : undefined} placeholder="예: nvidia-primary" /></label><label for="upstream-credential">NVIDIA API 키<input id="upstream-credential" bind:this={upstreamCredentialInput} type="password" required autocomplete="off" aria-describedby={showInlineUpstreamError() ? "upstream-error" : error ? "error-message" : undefined} aria-invalid={upstreamError ? "true" : undefined} oninput={() => (formRevision += 1)} placeholder="nvapi-…" /></label>{#if showInlineUpstreamError()}<p id="upstream-error" class="alert" role="alert">{upstreamError}</p>{/if}<span class="sr-only">{formRevision}</span><button class="primary" type="submit" disabled={!session.token || mutating || mutationState !== "idle" || !mutationAllowed()}>암호화 저장</button></form></div>
+      {/if}
+    </RoutingStatusPanel>
+    <ClientsPanel
+      active={active}
+      clients={clients}
+      sessionToken={session.token}
+      mutating={mutating}
+      mutationState={mutationState}
+      onRevoke={(id, label, event) => openConfirmation("revoke", id, label, event)}
+    >
+      <form bind:this={clientForm} class="form" onsubmit={issueClient}><label for="client-label">라벨<input id="client-label" bind:this={clientLabelInput} bind:value={clientLabel} maxlength="128" required aria-describedby={clientError ? "error-message" : undefined} aria-invalid={clientError ? "true" : undefined} placeholder="예: hermes" /></label><fieldset><legend>권한 범위</legend>{#each supportedScopes as [scope, label]}<label class="check"><input type="checkbox" value={scope} bind:group={clientScopes} /> <span>{label}</span><small>{scope}</small></label>{/each}</fieldset><button class="primary" type="submit" disabled={!session.token || eligibleKeys !== 2 || !clientLabel.trim() || clientScopes.length === 0 || mutating || mutationState !== "idle" || !mutationAllowed()}>접속 키 발급</button></form>
+    </ClientsPanel>
     <ModelsPanel active={active} state={state} profileCapabilities={profileCapabilities} models={models} />
     <EvidencePanel
       active={active}
@@ -1301,16 +1306,16 @@ onMount(() => {
   .topbar, .auth, .route-heading { display: flex; gap: 16px; align-items: center; } .topbar { justify-content: space-between; min-height: 56px; } .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; } .brand { margin: 0; font-size: 1.1rem; font-weight: 800; } .eyebrow { margin: 0; color: #76b900; font-size: .72rem; font-weight: 800; letter-spacing: .12em; }
   .auth { align-items: end; margin: 16px 0; } .auth label { flex: 1; } label { display: grid; gap: 6px; color: #d0d5d2; font-size: .9rem; font-weight: 700; } input, textarea { width: 100%; min-height: 44px; border: 1px solid #6b746f; border-radius: 6px; padding: 10px 12px; color: #f5f7f6; background: #171a1d; font: inherit; } textarea { min-height: 76px; resize: vertical; }
   main { padding-top: 32px; } .route-heading { align-items: baseline; flex-wrap: wrap; margin-bottom: 24px; } .route-heading .eyebrow { flex-basis: 100%; } h1, h2, h3, p { margin: 0; } h1 { font-size: clamp(1.6rem, 3vw, 2rem); } h2 { font-size: 1.35rem; } h3 { font-size: 1rem; } .muted, small { color: #aab2ae; } .live { min-height: 24px; color: #d0d5d2; } .nav-hint { display: none; }
-  .panel, article, .subpanel { display: grid; gap: 12px; padding: 24px; background: #171a1d; border: 1px solid #6b746f; border-radius: 8px; } article { background: #1d2124; min-width: 0; } article span { color: #aab2ae; font-size: .85rem; } article strong { font-size: 1.25rem; overflow-wrap: anywhere; } .profile-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; } .profile-grid article { padding: 12px; }
-  .alert, .notice, .attention { display: flex; gap: 12px; align-items: center; margin: 12px 0; padding: 12px 14px; border-radius: 6px; } .alert { color: #ff8a8a; border: 1px solid #ff8a8a; } .auth-error { max-width: 760px; } .notice { color: #76b900; border: 1px solid #76b900; } .attention { color: #ffd166; border: 1px solid #ffd166; } .attention > * { min-width: 0; overflow-wrap: anywhere; } .next-step { color: #ffd166; }
+  .subpanel { display: grid; gap: 12px; padding: 24px; background: #171a1d; border: 1px solid #6b746f; border-radius: 8px; }
+  .alert, .notice, .attention { display: flex; gap: 12px; align-items: center; margin: 12px 0; padding: 12px 14px; border-radius: 6px; } .alert { color: #ff8a8a; border: 1px solid #ff8a8a; } .auth-error { max-width: 760px; } .notice { color: #76b900; border: 1px solid #76b900; } .attention { color: #ffd166; border: 1px solid #ffd166; } .attention > * { min-width: 0; overflow-wrap: anywhere; }
   .link-button { margin-left: auto; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 6px; padding: 8px 10px; min-height: 44px; cursor: pointer; }
   button { min-height: 44px; border: 0; border-radius: 6px; padding: 10px 14px; cursor: pointer; font: inherit; font-weight: 800; } button:disabled { opacity: .5; cursor: not-allowed; } .primary { background: #76b900; color: #091006; } .secondary { background: #262b2e; color: #f5f7f6; border: 1px solid #6b746f; } .danger { background: transparent; color: #ff8a8a; border: 1px solid #ff8a8a; }
-  .table-wrap { overflow-x: auto; } table { width: 100%; border-collapse: collapse; min-width: 680px; } th, td { padding: 12px 10px; border-bottom: 1px solid #6b746f; text-align: left; vertical-align: middle; } th { color: #f5f7f6; } td, th small { display: table-cell; } tbody th { display: table-cell; } tbody th small { display: block; margin-top: 3px; } .actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .actions { display: flex; gap: 8px; justify-content: flex-end; }
   .form { display: grid; gap: 12px; max-width: 560px; } fieldset { display: grid; gap: 8px; border: 1px solid #6b746f; border-radius: 6px; padding: 14px; } legend { padding: 0 5px; color: #d0d5d2; font-weight: 800; } .check { display: flex; align-items: center; gap: 8px; min-height: 44px; } .check input { width: 20px; min-height: 20px; } .check small { margin-left: auto; }
   .subpanel { margin-top: 20px; } .event-detail { display: grid; gap: 10px; margin: 0; } .event-detail div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; } .event-detail dt { color: #aab2ae; } .event-detail dd { margin: 0; overflow-wrap: anywhere; }
   dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid #6b746f; border-radius: 8px; background: #171a1d; color: #f5f7f6; box-shadow: 0 8px 24px rgb(0 0 0 / .28); } dialog::backdrop { background: rgb(0 0 0 / .7); } .dialog-card { display: grid; gap: 16px; padding: 24px; } .dialog-card textarea { color: #76b900; font-family: ui-monospace, monospace; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button { flex: 1; } .auth button, .form button { width: 100%; } .nav-hint { display: block; margin: 6px 0 0; color: #aab2ae; font-size: .8rem; } .panel { padding: 16px; } .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; flex-wrap: wrap; } .actions button { flex: 1 1 120px; } }
-  @media (forced-colors: active) { .panel, article, input, textarea, button, fieldset, dialog { border: 1px solid ButtonText; } .primary, .secondary, .danger { background: Canvas; color: ButtonText; } }
+  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button { flex: 1; } .auth button, .form button { width: 100%; } .nav-hint { display: block; margin: 6px 0 0; color: #aab2ae; font-size: .8rem; } .subpanel { padding: 16px; } }
+  @media (forced-colors: active) { input, textarea, button, fieldset, dialog { border: 1px solid ButtonText; } .primary, .secondary, .danger { background: Canvas; color: ButtonText; } }
   @media (prefers-reduced-motion: reduce) { :global(*) { scroll-behavior: auto !important; transition: none !important; } }
 </style>
