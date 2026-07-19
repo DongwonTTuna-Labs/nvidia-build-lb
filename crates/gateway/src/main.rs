@@ -394,6 +394,19 @@ impl VaultStore {
         }
         Ok(())
     }
+
+    async fn cleanup_stale_attempts(&self) -> Result<u64> {
+        let Some(pool) = &self.database else {
+            return Ok(0);
+        };
+        let result = sqlx::query(
+            "UPDATE nblb.request_attempts AS attempt SET outcome='abandoned_after_restart', finished_at=now() WHERE attempt.finished_at IS NULL AND attempt.owner_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM nblb.gateway_instances AS instance WHERE instance.id=attempt.owner_id AND instance.last_seen_at >= now() - interval '30 seconds')",
+        )
+        .execute(pool)
+        .await
+        .context("close attempts from expired gateway owners")?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn db_key_record(row: DbKeyRow) -> Result<VaultKeyRecord> {
@@ -864,6 +877,10 @@ fn spawn_database_watchdog(state: web::Data<AppState>) {
                 eprintln!("postgres owner lease heartbeat failed: {error:#}");
                 std::process::exit(1);
             }
+            if let Err(error) = state.vault.cleanup_stale_attempts().await {
+                eprintln!("postgres stale attempt cleanup failed: {error:#}");
+                std::process::exit(1);
+            }
             let healthy = sqlx::query_scalar::<_, i32>("SELECT 1")
                 .fetch_one(&pool)
                 .await
@@ -1005,6 +1022,7 @@ async fn build_state() -> Result<AppState> {
             .connect(&url)
             .await
             .context("connect PostgreSQL")?;
+        seed_existing_routing_profiles(&pool).await?;
         sqlx::migrate!("../../migrations/sqlx")
             .run(&pool)
             .await
@@ -1059,6 +1077,26 @@ async fn build_state() -> Result<AppState> {
             .unwrap_or(2456),
         csp_hashes: static_script_hashes("/app/static"),
     })
+}
+
+async fn seed_existing_routing_profiles(pool: &PgPool) -> Result<()> {
+    let table_exists =
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass('nblb.routing_state') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .context("inspect routing state before migrations")?;
+    if !table_exists {
+        return Ok(());
+    }
+    // The 0001 CHECK predates Parakeet; 0004 widens it and 0009 seeds that
+    // eighth profile after migrations have run.
+    sqlx::query(
+        "INSERT INTO nblb.routing_state (profile_id, next_slot, generation) VALUES ('z-ai/glm-5.2',1,0), ('microsoft/phi-4-multimodal-instruct',1,0), ('nvidia/vila',1,0), ('nvidia/nvclip',1,0), ('black-forest-labs/flux.1-kontext-dev',1,0), ('stabilityai/stable-video-diffusion',1,0), ('nvidia/magpie-tts-multilingual',1,0) ON CONFLICT (profile_id) DO NOTHING",
+    )
+    .execute(pool)
+    .await
+    .context("seed existing routing profiles before migrations")?;
+    Ok(())
 }
 
 fn static_script_hashes(root: &str) -> Vec<String> {
@@ -1866,10 +1904,18 @@ async fn add_downstream(
 }
 
 fn is_unique_conflict(error: &anyhow::Error) -> bool {
-    let text = error.to_string();
-    text.contains("duplicate key value violates unique constraint")
-        || text.contains("upstream_keys_active_")
-        || text.contains("downstream_credentials_active_label_idx")
+    error.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains("duplicate key value violates unique constraint")
+            || text.contains("upstream_keys_active_")
+            || text.contains("downstream_credentials_active_label_idx")
+            || cause
+                .downcast_ref::<sqlx::Error>()
+                .and_then(|error| error.as_database_error())
+                .and_then(|database| database.code())
+                .as_deref()
+                == Some("23505")
+    })
 }
 
 async fn revoke_downstream(
@@ -4335,7 +4381,16 @@ fn host_authority_well_formed(raw: &str) -> bool {
         return remainder.is_empty()
             || (remainder.starts_with(':') && remainder[1..].parse::<u16>().is_ok());
     }
-    !raw.contains('[') && !raw.contains(']')
+    if raw.contains('[') || raw.contains(']') || raw.is_empty() {
+        return false;
+    }
+    match raw.matches(':').count() {
+        0 => true,
+        1 => raw
+            .split_once(':')
+            .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok()),
+        _ => raw.parse::<std::net::Ipv6Addr>().is_ok(),
+    }
 }
 
 fn format_origin_host(host: &str) -> String {
@@ -4347,7 +4402,7 @@ fn format_origin_host(host: &str) -> String {
 }
 
 fn admin_host_allowed(raw_host: &str) -> bool {
-    if raw_host.is_empty() || raw_host.contains(',') {
+    if raw_host.is_empty() || raw_host.contains(',') || !host_authority_well_formed(raw_host) {
         return false;
     }
     if raw_host.eq_ignore_ascii_case("::1") {
@@ -4669,6 +4724,10 @@ mod tests {
         assert!(!host_authority_well_formed(
             "[nvidia-lb.dongwontuna.net]evil"
         ));
+        assert!(!host_authority_well_formed("localhost:not-a-port"));
+        assert!(!admin_host_allowed("localhost:not-a-port"));
+        assert!(host_authority_well_formed("localhost:2456"));
+        assert!(host_authority_well_formed("::1"));
         assert!(!admin_host_allowed(""));
     }
 
