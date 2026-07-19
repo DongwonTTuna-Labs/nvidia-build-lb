@@ -1,10 +1,11 @@
 {
   "name": "@nvidia-build-lb/admin",
   "private": true,
+  "packageManager": "bun@1.3.14",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
-    "build": "vite build",
+    "build": "svelte-kit sync && vite build",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "format": "biome check ../../apps/admin",
     "knip": "knip --config ../../knip.json --no-config-hints"

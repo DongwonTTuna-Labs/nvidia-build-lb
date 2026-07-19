@@ -22,6 +22,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
       - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with:
@@ -33,11 +36,11 @@ jobs:
           cargo fmt --all -- --check
           cargo test --workspace
           cargo clippy --workspace --all-targets -- -D warnings
-          npm --prefix apps/admin ci --ignore-scripts --no-audit --no-fund
-          npm --prefix apps/admin run check
-          npm --prefix apps/admin run format
-          npm --prefix apps/admin run knip
-          npm --prefix apps/admin run build
+          bun install --cwd apps/admin --frozen-lockfile --ignore-scripts --no-progress
+          bun run --cwd apps/admin check
+          bun run --cwd apps/admin format
+          bun run --cwd apps/admin knip
+          bun run --cwd apps/admin build
       - name: Build immutable images
         env:
           IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}

@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.18
-FROM node:22-bookworm@sha256:5647be709086c696ff32edaaf1c70cd26d1da6ab2b39c32f3c7b4c4a31957e37 AS admin
+FROM oven/bun:1.3.14@sha256:50317d83cd5a5ae1d8b35b3379c69f57ce1a0dbf4def91f0965653d767851834 AS admin
 WORKDIR /src
-COPY apps/admin/package.json apps/admin/package-lock.json ./apps/admin/
-RUN npm ci --prefix apps/admin --ignore-scripts --no-audit --no-fund
+COPY apps/admin/package.json apps/admin/bun.lock ./apps/admin/
+RUN bun install --cwd apps/admin --frozen-lockfile --ignore-scripts --no-progress
 COPY apps/admin ./apps/admin
-RUN npm --prefix apps/admin run build
+RUN bun run --cwd apps/admin build
 
 FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
 WORKDIR /src
