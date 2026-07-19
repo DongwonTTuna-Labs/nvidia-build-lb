@@ -611,15 +611,12 @@ async function issueClient(event: SubmitEvent) {
     });
     if (operation !== mutationEpoch) return;
     const payload = (await response.json().catch(() => ({}))) as { token?: string; id?: string };
-    if (
-      !response.ok ||
-      typeof payload.token !== "string" ||
-      typeof payload.id !== "string" ||
-      !payload.id
-    )
+    const issuedToken = payload.token?.trim() ?? "";
+    const issuedCredentialId = payload.id?.trim() ?? "";
+    if (!response.ok || !issuedToken || !issuedCredentialId)
       throw new Error(responseMessage(payload, "접속 키를 발급하지 못했습니다."));
-    custody.token = payload.token;
-    custody.credentialId = payload.id ?? "";
+    custody.token = issuedToken;
+    custody.credentialId = issuedCredentialId;
     custody.authToken = session.token;
     custodyRevokeRequired = false;
     clientLabel = "";
