@@ -1,11 +1,19 @@
 <script lang="ts">
 import { onMount, tick } from "svelte";
+import { routeDescription, routeTitle, supportedScopes } from "$lib/admin-config";
 import {
-  modelCapabilities,
-  routeDescription,
-  routeTitle,
-  supportedScopes,
-} from "$lib/admin-config";
+  actionLabel,
+  attentionLabel,
+  attentionTarget,
+  checkStatusLabel,
+  eventKindLabel,
+  formatDateTime,
+  modelInfo,
+  outcomeLabel,
+  responseMessage,
+  validClient,
+  validKey,
+} from "$lib/admin-format";
 import type {
   AdminEvent,
   Attention,
@@ -20,6 +28,7 @@ import type {
   SlotProjection,
   SnapshotState,
 } from "$lib/admin-types";
+import OverviewPanel from "$lib/components/OverviewPanel.svelte";
 import RouteNavigation from "$lib/components/RouteNavigation.svelte";
 import StatusBadge from "$lib/components/StatusBadge.svelte";
 import { type AdminRouteId, adminRoutes } from "$lib/copy";
@@ -214,98 +223,12 @@ function logout() {
   announcement = "관리자 인증이 필요합니다.";
 }
 
-function responseMessage(body: unknown, fallback: string) {
-  if (!body || typeof body !== "object") return fallback;
-  const errorBody = (body as { error?: unknown }).error;
-  const message =
-    errorBody &&
-    typeof errorBody === "object" &&
-    typeof (errorBody as { message?: unknown }).message === "string"
-      ? (errorBody as { message: string }).message
-      : typeof errorBody === "string"
-        ? errorBody
-        : "";
-  if (!message) return fallback;
-  return message.replace(/nvapi-[A-Za-z0-9_-]+/g, "[redacted]").slice(0, 300);
-}
-
 function requestAvailable() {
   return !loading && trafficReady && eligibleKeys > 0 && ["ready", "success"].includes(state);
 }
 
 function mutationAllowed() {
   return !loading && !["offline", "stale", "partial", "error", "recovery"].includes(state);
-}
-
-function validKey(value: unknown): value is Key {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<Key>;
-  return (
-    typeof item.id === "string" &&
-    typeof item.label === "string" &&
-    typeof item.fingerprint === "string" &&
-    typeof item.enabled === "boolean" &&
-    typeof item.verified === "boolean" &&
-    (item.cooldown_until === null || typeof item.cooldown_until === "string") &&
-    Number.isSafeInteger(item.request_count) &&
-    Number.isSafeInteger(item.failure_count)
-  );
-}
-
-function validClient(value: unknown): value is Client {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<Client>;
-  return (
-    typeof item.id === "string" &&
-    typeof item.label === "string" &&
-    Array.isArray(item.scopes) &&
-    item.scopes.every((scope) => typeof scope === "string") &&
-    typeof item.active === "boolean" &&
-    Number.isSafeInteger(item.request_count) &&
-    (item.revoked_at === null || typeof item.revoked_at === "string")
-  );
-}
-
-function formatDateTime(value: string) {
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.valueOf())
-    ? "확인할 수 없음"
-    : parsed.toLocaleString("ko-KR", { timeZone: "Asia/Seoul" });
-}
-
-function actionLabel(action: string) {
-  return (
-    {
-      probe: "제공자 검증",
-      inspect_routing: "라우팅 원인 확인",
-      verify_public_route: "공개 경로 확인",
-      add_upstream_key: "NVIDIA 키 추가",
-      probe_upstream_key: "NVIDIA 키 검증",
-      routing: "라우팅 상태 확인",
-      evidence: "증거 상세 확인",
-      missing_upstream_slot: "부족한 슬롯 구성",
-      probe_required: "제공자 검증 실행",
-      slot_unavailable: "슬롯 장애 원인 확인",
-      readiness_snapshot_unavailable: "준비 상태 다시 확인",
-      snapshot_stale: "최신 상태 다시 확인",
-      offline: "네트워크 복구 후 다시 확인",
-    }[action] ?? "상태 확인"
-  );
-}
-
-function attentionLabel(code: string) {
-  return (
-    {
-      upstream_cooldown: "제공자 대기 중",
-      probe_required: "제공자 검증 필요",
-      upstream_disabled: "라우팅에서 중지됨",
-    }[code] ?? "확인 필요한 상태"
-  );
-}
-
-function attentionTarget(attention: Attention): AdminRouteId {
-  if (attention.next_action === "evidence") return "evidence";
-  return "routing";
 }
 
 async function handleAttention(attention: Attention) {
@@ -335,33 +258,6 @@ async function openEvent(event: AdminEvent) {
   eventDialog?.showModal();
   await tick();
   eventTitle?.focus({ preventScroll: true });
-}
-
-function checkStatusLabel(status: string) {
-  return (
-    {
-      eligible: "사용 가능",
-      cooldown: "일시 대기",
-      disabled: "중지됨",
-      probe_required: "검증 필요",
-    }[status] ?? "확인 필요"
-  );
-}
-
-function eventKindLabel(kind: string) {
-  return kind === "request_attempt" ? "요청 시도" : "운영 이벤트";
-}
-
-function outcomeLabel(outcome: string) {
-  return (
-    {
-      succeeded: "성공",
-      failed: "실패",
-      started: "진행 중",
-      cancelled: "취소됨",
-      abandoned_after_restart: "재시작 후 종료",
-    }[outcome] ?? "확인 필요"
-  );
 }
 
 async function request(
@@ -1082,10 +978,6 @@ function recommendedAction() {
   return "지금 필요한 작업이 없습니다.";
 }
 
-function modelInfo(model: string) {
-  return modelCapabilities[model] ?? { modalities: "제공자 프로필", route: "/v1/nvidia/inference" };
-}
-
 function profileReadiness() {
   if (!models.length) return "모델 목록 미확인";
   return requestAvailable() ? "공통 슬롯 선택 가능" : "선택 가능한 슬롯 없음";
@@ -1304,19 +1196,23 @@ onMount(() => {
     {#if ["stale", "offline", "partial"].includes(state)}<p class="attention" role="status">이 화면의 일부 정보는 마지막 성공 확인보다 오래됐습니다. 상태를 다시 확인하기 전에는 변경할 수 없습니다.</p>{/if}
     {#if notice}<p class="notice" role="status">{notice}</p>{/if}
 
-    <section id="overview" class:panel-hidden={active !== "overview"} class="panel" aria-labelledby="overview-title" hidden={active !== "overview"}>
-        <h2 id="overview-title">지금의 판단</h2>
-        <div class="judgments">
-          <article><span>구조 상태</span><strong>{structuralReady ? "검증 완료" : "확인 필요"}</strong><small>{structuralReady ? "게이트웨이와 저장소가 연결돼 있습니다." : "관리자 인증과 키 구성이 필요합니다."}</small></article>
-          <article><span>현재 모델 라우팅</span><strong>{profileReadiness()}</strong><small>{requestAvailable() ? "공통 슬롯을 선택할 수 있습니다. 모델별 제공자 검증 결과는 모델 화면에서 따로 확인하세요." : "모든 슬롯이 중지·cooldown이거나 아직 구성되지 않았습니다."}</small></article>
-          <article><span>구성된 슬롯</span><strong>{keys.length}/2 슬롯</strong><small>두 개의 서로 다른 키를 암호화해 저장합니다.</small></article>
-          <article><span>사용 가능한 키</span><strong>{eligibleKeys}/2 키</strong><small>{requestAvailable() ? "rate-aware round-robin으로 분산합니다." : "라우팅에서 중지·cooldown 원인을 확인하세요."}</small></article>
-          <article class="recommendation"><span>다음 조치</span><strong>{recommendation.label}</strong><small>{recommendation.reason}</small><button class="primary" type="button" onclick={() => void selectRoute(recommendation.route)} disabled={loading || mutating}>{recommendation.route === "evidence" ? "증거 확인" : "조치 화면 열기"}</button></article>
-        </div>
-        {#if attentions.length}<div class="attention-list" aria-labelledby="attention-title"><h3 id="attention-title">지금 확인할 주의</h3>{#each attentions as attention}<p class="attention"><span><strong>{attention.label ?? attention.code}</strong> · 다음 조치: {actionLabel(attention.next_action)}{#if attention.expires_at} · {formatDateTime(attention.expires_at)}까지{/if}</span><button class="link-button" type="button" onclick={() => void handleAttention(attention)}>{attention.next_action === "probe" ? "검증 시작" : `${actionLabel(attention.next_action)} 열기`}</button></p>{/each}</div>{/if}
-        {#if checks.length}<div class="check-list" aria-labelledby="check-title"><h3 id="check-title">슬롯별 상태 점검</h3>{#each checks as check}<p><strong>{check.label}</strong><span>{checkStatusLabel(check.status)} · {check.request_count}회 요청 · {check.failure_count}회 실패</span></p>{/each}</div>{/if}
-        <div class="facts"><span>공개 경로 <strong>{publicHealth.status === "verified" ? "검증 완료" : "검증 필요"}</strong><small>{publicHealth.hostname}</small></span><span>마지막 상태 확인 <strong>{lastOperation}</strong></span></div>
-    </section>
+    <OverviewPanel
+      active={active}
+      structuralReady={structuralReady}
+      profileReadiness={profileReadiness()}
+      requestAvailable={requestAvailable()}
+      keysCount={keys.length}
+      eligibleKeys={eligibleKeys}
+      recommendation={recommendation}
+      attentions={attentions}
+      checks={checks}
+      publicHealth={publicHealth}
+      lastOperation={lastOperation}
+      loading={loading}
+      mutating={mutating}
+      onSelectRoute={(route) => void selectRoute(route)}
+      onAttention={(attention) => void handleAttention(attention)}
+    />
     <section id="routing" class:panel-hidden={active !== "routing"} class="panel" aria-labelledby="routing-title" hidden={active !== "routing"}>
         <h2 id="routing-title">두 슬롯의 상태</h2>
         <p class="muted">활성·cooldown 키만 새 요청을 받을 수 있습니다. 원문 키는 표시하지 않습니다.</p>
@@ -1390,7 +1286,7 @@ onMount(() => {
   .topbar, .auth, .route-heading { display: flex; gap: 16px; align-items: center; } .topbar { justify-content: space-between; min-height: 56px; } .top-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; } .brand { margin: 0; font-size: 1.1rem; font-weight: 800; } .eyebrow { margin: 0; color: #76b900; font-size: .72rem; font-weight: 800; letter-spacing: .12em; }
   .auth { align-items: end; margin: 16px 0; } .auth label { flex: 1; } label { display: grid; gap: 6px; color: #d0d5d2; font-size: .9rem; font-weight: 700; } input, textarea { width: 100%; min-height: 44px; border: 1px solid #6b746f; border-radius: 6px; padding: 10px 12px; color: #f5f7f6; background: #171a1d; font: inherit; } textarea { min-height: 76px; resize: vertical; }
   main { padding-top: 32px; } .route-heading { align-items: baseline; flex-wrap: wrap; margin-bottom: 24px; } .route-heading .eyebrow { flex-basis: 100%; } h1, h2, h3, p { margin: 0; } h1 { font-size: clamp(1.6rem, 3vw, 2rem); } h2 { font-size: 1.35rem; } h3 { font-size: 1rem; } .muted, small { color: #aab2ae; } .live { min-height: 24px; color: #d0d5d2; }
-  .panel, article, .subpanel { display: grid; gap: 12px; padding: 24px; background: #171a1d; border: 1px solid #6b746f; border-radius: 8px; } .judgments { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; } article { background: #1d2124; min-width: 0; } article span { color: #aab2ae; font-size: .85rem; } article strong { font-size: 1.25rem; overflow-wrap: anywhere; } .recommendation { border-color: #76b900; } .attention-list, .check-list { display: grid; gap: 8px; } .check-list p { display: flex; justify-content: space-between; gap: 12px; margin: 0; padding: 10px 0; border-bottom: 1px solid #6b746f; } .check-list p > * { min-width: 0; overflow-wrap: anywhere; } .profile-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; } .profile-grid article { padding: 12px; }
+  .panel, article, .subpanel { display: grid; gap: 12px; padding: 24px; background: #171a1d; border: 1px solid #6b746f; border-radius: 8px; } article { background: #1d2124; min-width: 0; } article span { color: #aab2ae; font-size: .85rem; } article strong { font-size: 1.25rem; overflow-wrap: anywhere; } .attention-list, .check-list { display: grid; gap: 8px; } .check-list p { display: flex; justify-content: space-between; gap: 12px; margin: 0; padding: 10px 0; border-bottom: 1px solid #6b746f; } .check-list p > * { min-width: 0; overflow-wrap: anywhere; } .profile-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; } .profile-grid article { padding: 12px; }
   .alert, .notice, .attention { display: flex; gap: 12px; align-items: center; margin: 12px 0; padding: 12px 14px; border-radius: 6px; } .alert { color: #ff8a8a; border: 1px solid #ff8a8a; } .auth-error { max-width: 760px; } .notice { color: #76b900; border: 1px solid #76b900; } .attention { color: #ffd166; border: 1px solid #ffd166; } .attention > * { min-width: 0; overflow-wrap: anywhere; } .next-step { color: #ffd166; }
   .link-button { margin-left: auto; color: inherit; background: transparent; border: 1px solid currentColor; border-radius: 6px; padding: 8px 10px; min-height: 44px; cursor: pointer; }
   button { min-height: 44px; border: 0; border-radius: 6px; padding: 10px 14px; cursor: pointer; font: inherit; font-weight: 800; } button:disabled { opacity: .5; cursor: not-allowed; } .primary { background: #76b900; color: #091006; } .secondary { background: #262b2e; color: #f5f7f6; border: 1px solid #6b746f; } .danger { background: transparent; color: #ff8a8a; border: 1px solid #ff8a8a; }
@@ -1399,7 +1295,7 @@ onMount(() => {
   .subpanel { margin-top: 20px; } .facts, .model-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; } .facts span { padding: 12px; background: #1d2124; border-radius: 6px; } .facts strong { display: block; margin-top: 4px; } .model-list { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); } .model-list h3 { overflow-wrap: anywhere; word-break: break-word; } code { color: #b8a1ff; overflow-wrap: anywhere; word-break: break-word; } .event-detail { display: grid; gap: 10px; margin: 0; } .event-detail div { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; } .event-detail dt { color: #aab2ae; } .event-detail dd { margin: 0; overflow-wrap: anywhere; }
   dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid #6b746f; border-radius: 8px; background: #171a1d; color: #f5f7f6; box-shadow: 0 8px 24px rgb(0 0 0 / .28); } dialog::backdrop { background: rgb(0 0 0 / .7); } .dialog-card { display: grid; gap: 16px; padding: 24px; } .dialog-card textarea { color: #76b900; font-family: ui-monospace, monospace; }
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button { flex: 1; } .auth button, .form button { width: 100%; } .judgments { grid-template-columns: 1fr; } .panel { padding: 16px; } .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; flex-wrap: wrap; } .actions button { flex: 1 1 120px; } }
+  @media (max-width: 767px) { .shell { padding-inline: 16px; } .auth, .route-heading { align-items: stretch; flex-direction: column; } .topbar { align-items: flex-start; flex-direction: column; } .top-actions { width: 100%; justify-content: stretch; } .top-actions button { flex: 1; } .auth button, .form button { width: 100%; } .panel { padding: 16px; } .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } table { min-width: 0; } thead { display: none; } table, tbody, tr, th, td { display: block; width: 100%; } tr { padding: 12px 0; border-bottom: 1px solid #6b746f; } th, td { border: 0; padding: 5px 0; } td::before { content: attr(data-label); display: block; color: #aab2ae; font-size: .8rem; } .actions { justify-content: stretch; flex-wrap: wrap; } .actions button { flex: 1 1 120px; } }
   @media (forced-colors: active) { .panel, article, input, textarea, button, fieldset, dialog { border: 1px solid ButtonText; } .primary, .secondary, .danger { background: Canvas; color: ButtonText; } }
   @media (prefers-reduced-motion: reduce) { :global(*) { scroll-behavior: auto !important; transition: none !important; } }
 </style>

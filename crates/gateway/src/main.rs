@@ -837,11 +837,28 @@ async fn main() -> std::io::Result<()> {
     // The container listener is an internal contract.  The published host
     // port is used only for Host/Origin validation and must never move the
     // listener away from the compose target port.
-    let port = env::var("NVIDIA_BUILD_LB_BIND_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2456);
-    let state = web::Data::new(build_state().await.expect("gateway configuration"));
+    let port = match env::var("NVIDIA_BUILD_LB_BIND_PORT") {
+        Ok(value) => value.parse::<u16>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid NVIDIA_BUILD_LB_BIND_PORT: {error}"),
+            )
+        })?,
+        Err(env::VarError::NotPresent) => 2456,
+        Err(error) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cannot read NVIDIA_BUILD_LB_BIND_PORT: {error}"),
+            ));
+        }
+    };
+    let state = web::Data::new(build_state().await.map_err(|error| {
+        eprintln!("gateway configuration failed: {error:#}");
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "gateway configuration failed",
+        )
+    })?);
     let script_hashes = state
         .csp_hashes
         .iter()
@@ -1442,6 +1459,22 @@ struct PageQuery {
     limit: Option<u16>,
 }
 
+fn page_before(query: &PageQuery) -> Result<Option<chrono::DateTime<Utc>>, HttpResponse> {
+    query
+        .before
+        .as_deref()
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|parsed| parsed.with_timezone(&Utc))
+                .map_err(|_| {
+                    HttpResponse::BadRequest().json(json!({
+                        "error": {"code": "invalid_page_cursor", "message": "before must be an RFC3339 timestamp"}
+                    }))
+                })
+        })
+        .transpose()
+}
+
 fn admin_snapshot() -> Value {
     json!({"observed_at": Utc::now(), "generation": "0"})
 }
@@ -1565,18 +1598,44 @@ async fn operations(
     if !authorized(&req, &state) {
         return admin_unauthorized();
     }
-    let _before = query.before.as_deref();
+    let before = match page_before(&query) {
+        Ok(before) => before,
+        Err(response) => return response,
+    };
     let limit = query.limit.unwrap_or(50).clamp(1, 100) as i64;
-    let mut rows = Vec::new();
-    if let Some(pool) = &state.vault.database
-        && let Ok(attempts) = sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, Option<chrono::DateTime<Utc>>)>(
-            "SELECT id, request_id, profile_id, key_id, outcome, finished_at FROM nblb.request_attempts ORDER BY created_at DESC LIMIT $1"
-        ).bind(limit).fetch_all(pool).await {
-            rows = attempts.into_iter().map(|(id, request_id, profile_id, key_id, outcome, finished_at)| json!({"id":id,"request_id":request_id,"profile_id":profile_id,"key_id":key_id,"status":outcome,"finished_at":finished_at})).collect();
+    let Some(pool) = &state.vault.database else {
+        return HttpResponse::Ok()
+            .insert_header(("cache-control", "no-store"))
+            .json(json!({"snapshot":admin_snapshot(),"operations":[],"next_before":Value::Null}));
+    };
+    let attempts = match before {
+        Some(before) => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)>(
+            "SELECT id, request_id, profile_id, key_id, outcome, created_at, finished_at FROM nblb.request_attempts WHERE created_at < $1 ORDER BY created_at DESC, id DESC LIMIT $2"
+        ).bind(before).bind(limit).fetch_all(pool).await,
+        None => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)>(
+            "SELECT id, request_id, profile_id, key_id, outcome, created_at, finished_at FROM nblb.request_attempts ORDER BY created_at DESC, id DESC LIMIT $1"
+        ).bind(limit).fetch_all(pool).await,
+    };
+    let attempts = match attempts {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            eprintln!("admin operations query failed: {error:#}");
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error":{"code":"operations_unavailable"}}));
         }
+    };
+    let next_before = (attempts.len() as i64 == limit)
+        .then(|| attempts.last().map(|attempt| attempt.5.to_rfc3339()))
+        .flatten();
+    let rows = attempts
+        .into_iter()
+        .map(|(id, request_id, profile_id, key_id, outcome, created_at, finished_at)| {
+            json!({"id":id,"request_id":request_id,"profile_id":profile_id,"key_id":key_id,"status":outcome,"created_at":created_at,"finished_at":finished_at})
+        })
+        .collect::<Vec<_>>();
     HttpResponse::Ok()
         .insert_header(("cache-control", "no-store"))
-        .json(json!({"snapshot":admin_snapshot(),"operations":rows,"next_before":Value::Null}))
+        .json(json!({"snapshot":admin_snapshot(),"operations":rows,"next_before":next_before}))
 }
 
 async fn operation_detail(
@@ -1621,16 +1680,44 @@ async fn events(
     if !authorized(&req, &state) {
         return admin_unauthorized();
     }
-    let _before = query.before.as_deref();
+    let before = match page_before(&query) {
+        Ok(before) => before,
+        Err(response) => return response,
+    };
     let limit = query.limit.unwrap_or(50).clamp(1, 100) as i64;
-    let mut rows = Vec::new();
-    if let Some(pool) = &state.vault.database
-        && let Ok(attempts) = sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>)>("SELECT id, request_id, profile_id, key_id, outcome, created_at FROM nblb.request_attempts ORDER BY created_at DESC LIMIT $1").bind(limit).fetch_all(pool).await {
-            rows = attempts.into_iter().map(|(id, request_id, profile_id, key_id, outcome, created_at)| json!({"id":id,"kind":"request_attempt","request_id":request_id,"profile_id":profile_id,"key_id":key_id,"outcome":outcome,"created_at":created_at})).collect();
+    let Some(pool) = &state.vault.database else {
+        return HttpResponse::Ok()
+            .insert_header(("cache-control", "no-store"))
+            .json(json!({"snapshot":admin_snapshot(),"events":[],"next_before":Value::Null}));
+    };
+    let attempts = match before {
+        Some(before) => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>)>(
+            "SELECT id, request_id, profile_id, key_id, outcome, created_at FROM nblb.request_attempts WHERE created_at < $1 ORDER BY created_at DESC, id DESC LIMIT $2"
+        ).bind(before).bind(limit).fetch_all(pool).await,
+        None => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>)>(
+            "SELECT id, request_id, profile_id, key_id, outcome, created_at FROM nblb.request_attempts ORDER BY created_at DESC, id DESC LIMIT $1"
+        ).bind(limit).fetch_all(pool).await,
+    };
+    let attempts = match attempts {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            eprintln!("admin events query failed: {error:#}");
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error":{"code":"events_unavailable"}}));
         }
+    };
+    let next_before = (attempts.len() as i64 == limit)
+        .then(|| attempts.last().map(|attempt| attempt.5.to_rfc3339()))
+        .flatten();
+    let rows = attempts
+        .into_iter()
+        .map(|(id, request_id, profile_id, key_id, outcome, created_at)| {
+            json!({"id":id,"kind":"request_attempt","request_id":request_id,"profile_id":profile_id,"key_id":key_id,"outcome":outcome,"created_at":created_at})
+        })
+        .collect::<Vec<_>>();
     HttpResponse::Ok()
         .insert_header(("cache-control", "no-store"))
-        .json(json!({"snapshot":admin_snapshot(),"events":rows,"next_before":Value::Null}))
+        .json(json!({"snapshot":admin_snapshot(),"events":rows,"next_before":next_before}))
 }
 
 async fn event_detail(
@@ -4584,16 +4671,41 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        SseValidator, admin_host_allowed, bearer, eligible_key_count, format_origin_host,
-        host_authority_well_formed, inline_script_bodies, parse_multimodal_request,
-        percent_encode_userinfo, should_migrate_file_vault, upstream_endpoint,
-        upstream_endpoint_for, validate_admin_token, validate_chat_request, validate_chat_response,
+        PageQuery, SseValidator, admin_host_allowed, bearer, eligible_key_count,
+        format_origin_host, host_authority_well_formed, inline_script_bodies, page_before,
+        parse_multimodal_request, percent_encode_userinfo, should_migrate_file_vault,
+        upstream_endpoint, upstream_endpoint_for, validate_admin_token, validate_chat_request,
+        validate_chat_response,
     };
+    use actix_web::http::StatusCode;
     use actix_web::http::header;
     use actix_web::test::TestRequest;
     use chrono::{Duration, Utc};
     use nvidia_build_lb_core::KeySummary;
     use uuid::Uuid;
+
+    #[test]
+    fn page_cursor_is_explicit_and_fail_closed() {
+        let query = PageQuery {
+            before: Some("2026-07-19T12:34:56Z".to_owned()),
+            limit: Some(10),
+        };
+        assert_eq!(
+            page_before(&query)
+                .expect("valid cursor")
+                .expect("cursor value")
+                .to_rfc3339(),
+            "2026-07-19T12:34:56+00:00"
+        );
+        let invalid = PageQuery {
+            before: Some("not-a-timestamp".to_owned()),
+            limit: None,
+        };
+        assert_eq!(
+            page_before(&invalid).unwrap_err().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     #[test]
     fn modality_paths_replace_only_the_endpoint_suffix() {
