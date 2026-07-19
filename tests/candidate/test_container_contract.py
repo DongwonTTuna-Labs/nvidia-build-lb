@@ -71,7 +71,7 @@ def test_app_and_postgres_prestarts_copy_only_fixed_secret_names() -> None:
     assert "exec /bin/setpriv" in database
     assert "--clear-groups" in database
     assert "--bounding-set=-all" in database
-    assert "70:70:700" in database
+    assert 'chmod 0700 "$pgdata"' in database
     assert "0:0:444" in fake_upstream
     assert database_dockerfile.startswith("# syntax=docker/dockerfile:1.18@sha256:")
     for package in (
@@ -104,7 +104,9 @@ def test_qa_compose_is_labelled_bounded_and_does_not_publish_production_port() -
     assert "127.0.0.1:2456:2456" not in compose
     assert "cap_drop:" in compose
     assert "- ALL" in compose
-    assert compose.count("- SETPCAP") == 5
+    # db-init now runs the same fixed-identity bootstrap boundary as the
+    # database and application, so the capability is declared six times.
+    assert compose.count("- SETPCAP") == 6
     assert "read_only: true" in compose
     assert "tmpfs:" in compose
     assert "service_completed_successfully" in compose
@@ -115,9 +117,10 @@ def test_qa_compose_is_labelled_bounded_and_does_not_publish_production_port() -
     assert "nblb-loopback-entrypoint" in compose
     assert "--clear-groups" in _text("scripts/qa/loopback-entrypoint.sh")
     assert '"/bin/setpriv", "--reuid=70"' in compose
-    assert compose.count('"/bin/setpriv", "--reuid=65532"') == 2
-    assert '"65532", "65532", "fake"' in compose
-    assert '"65532", "65532", "loopback"' in compose
+    assert compose.count('"/bin/setpriv", "--reuid=65532"') == 0
+    assert '"/bin/setpriv", "--reuid=70"' in compose
+    assert '"/usr/local/bin/nblb-fake-healthcheck"' in compose
+    assert '"/usr/local/bin/nblb-qa-healthcheck"' in compose
     assert '"70", "70", "postgres"' in compose
     assert "CapEff:" in healthcheck
     assert "CapBnd:" in healthcheck
@@ -342,7 +345,7 @@ def test_build_candidate_recipe_owns_deterministic_runtime_gate() -> None:
     for name in ("admin_token", "vault_master_key", "db_password", "server_key"):
         assert f"source=$SECRET_DIR/{name},target=/canonical-secrets/{name},readonly" in script
     assert '--mount "type=bind,source=$metadata_file,target=/metadata/image.txt,readonly"' in script
-    assert 'for name in ("admin_token", "vault_master_key", "db_password", "server_key")' in script
+    assert "for name in admin_token vault_master_key db_password server_key" in script
     assert ".HostConfig.Tmpfs" in script
     assert "rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0" in script
     assert script.count("-eo uid,pid,comm") == 1

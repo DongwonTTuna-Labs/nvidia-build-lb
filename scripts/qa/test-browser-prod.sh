@@ -8,8 +8,9 @@ cd "$ROOT"
 EVIDENCE_DIR=${EVIDENCE_DIR:-.omo/evidence/task-6b-nvidia-build-lb}
 IMAGE_DIGEST=${IMAGE_DIGEST:-}
 POSTGRES_IMAGE_DIGEST=${POSTGRES_IMAGE_DIGEST:-}
+FIXTURE_IMAGE_DIGEST=${FIXTURE_IMAGE_DIGEST:-}
 SOURCE_MANIFEST=${SOURCE_MANIFEST:-}
-QA_PORT=2456
+QA_PORT=${NBLB_BROWSER_QA_PORT:-32457}
 TASK_LABEL=todo6b-browser-prod
 BASE_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 SECRET_DIR=""
@@ -70,6 +71,14 @@ assert_no_symlink_components "$EVIDENCE_DIR" || {
 }
 [[ "$POSTGRES_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
     printf '%s\n' 'invalid_postgres_image_digest' >&2
+    exit 64
+}
+[[ "$FIXTURE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf '%s\n' 'invalid_fixture_image_digest' >&2
+    exit 64
+}
+[[ "$QA_PORT" =~ ^[0-9]+$ ]] && [ "$QA_PORT" -ge 1024 ] && [ "$QA_PORT" -le 65535 ] || {
+    printf '%s\n' 'invalid_browser_qa_port' >&2
     exit 64
 }
 [ -f "$SOURCE_MANIFEST" ] && [ ! -L "$SOURCE_MANIFEST" ] \
@@ -560,9 +569,11 @@ if [ -e "$EVIDENCE_DIR" ]; then
     requested_source=$(jq -er .source_tree_sha256 "$EVIDENCE_DIR/review-request.json")
     requested_image=$(jq -er .image_digest "$EVIDENCE_DIR/review-request.json")
     requested_postgres=$(jq -er .postgres_image_digest "$EVIDENCE_DIR/review-request.json")
+    requested_fixture=$(jq -er .fixture_image_digest "$EVIDENCE_DIR/review-request.json")
     [ "$current_source" = "$requested_source" ] \
         && [ "$IMAGE_DIGEST" = "$requested_image" ] \
         && [ "$POSTGRES_IMAGE_DIGEST" = "$requested_postgres" ] \
+        && [ "$FIXTURE_IMAGE_DIGEST" = "$requested_fixture" ] \
         || exit 1
     materialize_source_snapshot "$resume_manifest" "$CLIENT_DIR/source-snapshot.json"
     cmp "$EVIDENCE_DIR/source-snapshot.json" "$CLIENT_DIR/source-snapshot.json"
@@ -612,6 +623,8 @@ materialize_source_snapshot "$source_manifest" "$EVIDENCE_DIR/source-snapshot.js
 [ "$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$IMAGE_DIGEST")" = "$source_hash" ]
 [ "$(docker image inspect --format '{{.Id}}' "$POSTGRES_IMAGE_DIGEST")" = "$POSTGRES_IMAGE_DIGEST" ]
 [ "$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$POSTGRES_IMAGE_DIGEST")" = "$source_hash" ]
+[ "$(docker image inspect --format '{{.Id}}' "$FIXTURE_IMAGE_DIGEST")" = "$FIXTURE_IMAGE_DIGEST" ]
+[ "$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$FIXTURE_IMAGE_DIGEST")" = "$source_hash" ]
 
 NODE_RUNTIME_DIR="$CLIENT_DIR/node-runtime"
 mkdir "$NODE_RUNTIME_DIR"
@@ -641,6 +654,7 @@ docker run --rm --network none \
 
 export NBLB_CANDIDATE_IMAGE=$IMAGE_DIGEST
 export NBLB_POSTGRES_IMAGE=$POSTGRES_IMAGE_DIGEST
+export NBLB_QA_FIXTURE_IMAGE=$FIXTURE_IMAGE_DIGEST
 export NBLB_QA_SECRET_DIR=$SECRET_DIR
 export NBLB_QA_PORT=$QA_PORT
 export NBLB_QA_TASK_LABEL=todo6b-browser-prod

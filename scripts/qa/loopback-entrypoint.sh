@@ -11,4 +11,4 @@ exec setpriv \
     --ambient-caps=-all \
     --bounding-set=-all \
     --no-new-privs \
-    /app/.venv/bin/python /qa/loopback_proxy.py
+    /usr/bin/python3 /qa/loopback_proxy.py

@@ -4,11 +4,12 @@ CREATE SCHEMA IF NOT EXISTS nblb;
 
 CREATE TABLE IF NOT EXISTS nblb.upstream_keys (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    label text NOT NULL CHECK (length(label) BETWEEN 1 AND 120),
+    label text NOT NULL CHECK (length(label) BETWEEN 1 AND 128),
     fingerprint bytea NOT NULL CHECK (octet_length(fingerprint) = 32),
     ciphertext bytea NOT NULL CHECK (octet_length(ciphertext) > 16),
     nonce bytea NOT NULL CHECK (octet_length(nonce) = 12),
     enabled boolean NOT NULL DEFAULT true,
+    verified boolean NOT NULL DEFAULT false,
     cooldown_until timestamptz,
     request_count bigint NOT NULL DEFAULT 0 CHECK (request_count >= 0),
     failure_count bigint NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
@@ -26,7 +27,7 @@ CREATE TABLE IF NOT EXISTS nblb.downstream_credentials (
 );
 
 CREATE TABLE IF NOT EXISTS nblb.routing_state (
-    profile_id text PRIMARY KEY CHECK (profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual')),
+    profile_id text PRIMARY KEY CHECK (profile_id IN ('z-ai/glm-5.2','microsoft/phi-4-multimodal-instruct','nvidia/vila','nvidia/nvclip','black-forest-labs/flux.1-kontext-dev','stabilityai/stable-video-diffusion','nvidia/magpie-tts-multilingual','nvidia/parakeet-ctc-1.1b')),
     next_slot smallint NOT NULL DEFAULT 1 CHECK (next_slot IN (1, 2)),
     generation bigint NOT NULL DEFAULT 0 CHECK (generation >= 0)
 );

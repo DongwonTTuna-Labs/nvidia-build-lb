@@ -20,6 +20,7 @@ VAULT_MASTER_KEY_SHA256=""
 DB_PASSWORD_SHA256=""
 IMAGE_TAG=""
 POSTGRES_TAG=""
+FIXTURE_TAG=""
 COMPOSE_STARTED=0
 
 command -v flock >/dev/null 2>&1 || {
@@ -161,20 +162,19 @@ assert_image_metadata_secret_free() {
         --label "nvidia-build-lb.run=$RUN_ID" \
         --cap-drop ALL \
         --security-opt no-new-privileges:true \
-        --entrypoint /app/.venv/bin/python \
+        --entrypoint /bin/sh \
         --mount "type=bind,source=$SECRET_DIR/admin_token,target=/canonical-secrets/admin_token,readonly" \
         --mount "type=bind,source=$SECRET_DIR/vault_master_key,target=/canonical-secrets/vault_master_key,readonly" \
         --mount "type=bind,source=$SECRET_DIR/db_password,target=/canonical-secrets/db_password,readonly" \
         --mount "type=bind,source=$SECRET_DIR/server_key,target=/canonical-secrets/server_key,readonly" \
         --mount "type=bind,source=$metadata_file,target=/metadata/image.txt,readonly" \
         "$image" -c '
-import pathlib
-
-metadata = pathlib.Path("/metadata/image.txt").read_bytes()
-for name in ("admin_token", "vault_master_key", "db_password", "server_key"):
-    secret = pathlib.Path("/canonical-secrets", name).read_bytes()
-    if not secret or secret in metadata:
-        raise SystemExit(1)
+metadata=$(cat /metadata/image.txt)
+for name in admin_token vault_master_key db_password server_key; do
+    secret=$(cat "/canonical-secrets/$name")
+    test -n "$secret"
+    case "$metadata" in *"$secret"*) exit 1 ;; esac
+done
 '
     rm -f "$metadata_file"
 }
@@ -325,8 +325,10 @@ before_hash=$(jq -er '.source_tree_sha256' "$CLIENT_DIR/source-manifest-before.j
 source_entry_count=$(jq -er '.entry_count' "$CLIENT_DIR/source-manifest-before.json")
 IMAGE_TAG="nvidia-build-lb:todo6a-${before_hash:0:16}"
 POSTGRES_TAG="nvidia-build-lb-postgres:todo6a-${before_hash:0:16}"
+FIXTURE_TAG="nvidia-build-lb-qa-fixtures:todo6a-${before_hash:0:16}"
 export NBLB_CANDIDATE_IMAGE=$IMAGE_TAG
 export NBLB_POSTGRES_IMAGE=$POSTGRES_TAG
+export NBLB_QA_FIXTURE_IMAGE=$FIXTURE_TAG
 
 uv run python -m scripts.qa.source_snapshot \
     --root "$ROOT" \
@@ -348,6 +350,7 @@ uv run ruff format --check \
 docker buildx build --pull --no-cache --provenance=false \
     --build-arg SOURCE_DATE_EPOCH=0 \
     --output "type=docker,dest=$CLIENT_DIR/candidate-image.tar,rewrite-timestamp=true" \
+    --file "$CLIENT_DIR/source-snapshot/Dockerfile.rust" \
     --label nvidia-build-lb.task=todo6a-candidate \
     --label "nvidia-build-lb.source-sha256=$before_hash" \
     --tag "$IMAGE_TAG" "$CLIENT_DIR/source-snapshot"
@@ -362,13 +365,25 @@ docker buildx build --pull --no-cache --provenance=false \
     --tag "$POSTGRES_TAG" "$CLIENT_DIR/source-snapshot"
 docker load --input "$CLIENT_DIR/postgres-image.tar" >/dev/null
 rm -f "$CLIENT_DIR/postgres-image.tar"
+docker buildx build --pull --no-cache --provenance=false \
+    --build-arg SOURCE_DATE_EPOCH=0 \
+    --output "type=docker,dest=$CLIENT_DIR/fixture-image.tar,rewrite-timestamp=true" \
+    --file "$CLIENT_DIR/source-snapshot/Dockerfile.qa-fixtures" \
+    --label nvidia-build-lb.task=todo6a-candidate-fixtures \
+    --label "nvidia-build-lb.source-sha256=$before_hash" \
+    --tag "$FIXTURE_TAG" "$CLIENT_DIR/source-snapshot"
+docker load --input "$CLIENT_DIR/fixture-image.tar" >/dev/null
+rm -f "$CLIENT_DIR/fixture-image.tar"
 
 image_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG")
 postgres_image_digest=$(docker image inspect --format '{{.Id}}' "$POSTGRES_TAG")
+fixture_image_digest=$(docker image inspect --format '{{.Id}}' "$FIXTURE_TAG")
 image_source=$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$IMAGE_TAG")
 postgres_image_source=$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$POSTGRES_TAG")
+fixture_image_source=$(docker image inspect --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' "$FIXTURE_TAG")
 [ "$image_source" = "$before_hash" ] || exit 1
 [ "$postgres_image_source" = "$before_hash" ] || exit 1
+[ "$fixture_image_source" = "$before_hash" ] || exit 1
 assert_image_metadata_secret_free "$IMAGE_TAG"
 compose config --quiet
 
@@ -687,16 +702,18 @@ jq -n \
     --arg source_sha256 "$before_hash" \
     --arg image_digest "$image_digest" \
     --arg postgres_image_digest "$postgres_image_digest" \
+    --arg fixture_image_digest "$fixture_image_digest" \
     --arg source_snapshot_receipt_sha256 "$source_snapshot_receipt_sha256" \
     --argjson source_entry_count "$source_entry_count" \
-    '{schema_version:2,status:"PASS",source_tree_sha256:$source_sha256,source_manifest_algorithm:"git-files-type-canonical-mode-path-payload-sha256-v2",source_manifest_entry_count:$source_entry_count,source_snapshot_receipt_sha256:$source_snapshot_receipt_sha256,build_context:"manifest-bound-read-only-snapshot",build_cache_disabled:true,source_date_epoch:0,layer_timestamps_rewritten:true,deterministic_archive_loaded:true,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,image_reference_kind:"local immutable image id pair",metadata_filtered:true,secrets_in_metadata:false}' \
+    '{schema_version:2,status:"PASS",source_tree_sha256:$source_sha256,source_manifest_algorithm:"git-files-type-canonical-mode-path-payload-sha256-v2",source_manifest_entry_count:$source_entry_count,source_snapshot_receipt_sha256:$source_snapshot_receipt_sha256,build_context:"manifest-bound-read-only-snapshot",build_cache_disabled:true,source_date_epoch:0,layer_timestamps_rewritten:true,deterministic_archive_loaded:true,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,fixture_image_digest:$fixture_image_digest,image_reference_kind:"local immutable image triplet",metadata_filtered:true,secrets_in_metadata:false}' \
     > "$EVIDENCE_DIR/candidate.json"
 jq -n \
     --arg source_sha256 "$before_hash" \
     --arg image_digest "$image_digest" \
     --arg postgres_image_digest "$postgres_image_digest" \
+    --arg fixture_image_digest "$fixture_image_digest" \
     --arg key_id "$key_id" \
-    '{schema_version:2,status:"PASS",source_tree_sha256:$source_sha256,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,checks:{candidate_build:true,postgres_candidate_build:true,compose_render:true,migration:true,admin_upstream_create_contract:true,admin_upstream_probe_contract:true,admin_upstream_enable_contract:true,admin_stage_evidence_persisted:true,app_healthy:true,database_healthy:true,fake_upstream_healthy:true,loopback_proxy_healthy:true,healthcheck_identity_self_verified:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,synthetic_internal_key_id:$key_id,app_uid:65532,database_uid:70,fake_upstream_uid:65532,loopback_proxy_uid:65532,capabilities_effective_cleared:true,capabilities_bounding_cleared:true,steady_state_no_new_privileges:true,supplementary_groups_cleared:true,runtime_secret_mode_0400:true,runtime_secret_content_exact:true,canonical_secret_mode_0600:true,tmpfs_runtime:true,app_internal_network_only:true,loopback_proxy_dual_homed:true,restart_persistence:true,tmpfs_repopulated:true,restart_runtime_secret_content_exact:true}}' \
+    '{schema_version:2,status:"PASS",source_tree_sha256:$source_sha256,image_digest:$image_digest,postgres_image_digest:$postgres_image_digest,fixture_image_digest:$fixture_image_digest,checks:{candidate_build:true,postgres_candidate_build:true,fixture_candidate_build:true,compose_render:true,migration:true,admin_upstream_create_contract:true,admin_upstream_probe_contract:true,admin_upstream_enable_contract:true,admin_stage_evidence_persisted:true,app_healthy:true,database_healthy:true,fake_upstream_healthy:true,loopback_proxy_healthy:true,healthcheck_identity_self_verified:true,health:true,models:true,nonstream_chat:true,stream_chat_done_once:true,synthetic_internal_key_id:$key_id,app_uid:65532,database_uid:70,fake_upstream_uid:65532,loopback_proxy_uid:65532,capabilities_effective_cleared:true,capabilities_bounding_cleared:true,steady_state_no_new_privileges:true,supplementary_groups_cleared:true,runtime_secret_mode_0400:true,runtime_secret_content_exact:true,canonical_secret_mode_0600:true,tmpfs_runtime:true,app_internal_network_only:true,loopback_proxy_dual_homed:true,restart_persistence:true,tmpfs_repopulated:true,restart_runtime_secret_content_exact:true}}' \
     > "$EVIDENCE_DIR/manual-qa.json"
 jq -n \
     --argjson missing_admin "$missing_admin_status" \

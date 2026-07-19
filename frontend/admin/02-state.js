@@ -1,5 +1,9 @@
 const byId = (id) => document.getElementById(id);
-const loginTemplate = byId("login-form").cloneNode(true);
+// Keep the pure DTO helpers importable by the contract harness, which runs
+// without a browser DOM. The template is materialized only in the browser.
+const loginTemplate = typeof document === "undefined"
+  ? null
+  : byId("login-form")?.cloneNode(true);
 const apiRoot = "/admin/api/v1";
 const snapshotTtlMs = 60_000;
 const readDeadlineMs = 8_000;

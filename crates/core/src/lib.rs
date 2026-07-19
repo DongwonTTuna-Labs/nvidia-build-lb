@@ -10,16 +10,20 @@ use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{BTreeMap, HashSet},
     fs,
     fs::OpenOptions,
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
+
+/// The hosted deployment intentionally has two independent upstream slots.
+pub const MAX_UPSTREAM_KEYS: usize = 2;
 use uuid::Uuid;
 
 /// Advertised profile IDs in their stable manifest order.
-pub const PROFILES: [&str; 7] = [
+pub const PROFILES: [&str; 8] = [
     "z-ai/glm-5.2",
     "microsoft/phi-4-multimodal-instruct",
     "nvidia/vila",
@@ -27,6 +31,7 @@ pub const PROFILES: [&str; 7] = [
     "black-forest-labs/flux.1-kontext-dev",
     "stabilityai/stable-video-diffusion",
     "nvidia/magpie-tts-multilingual",
+    "nvidia/parakeet-ctc-1.1b",
 ];
 
 /// A redacted credential summary.
@@ -40,6 +45,8 @@ pub struct KeySummary {
     pub fingerprint: String,
     /// Whether routing may select this key.
     pub enabled: bool,
+    /// Whether the provider probe receipt is durable and current.
+    pub verified: bool,
     /// Current cooldown deadline, if any.
     pub cooldown_until: Option<DateTime<Utc>>,
     /// Successful request count.
@@ -96,6 +103,8 @@ pub struct VaultKeyRecord {
     pub ciphertext: Vec<u8>,
     /// Whether routing may select this key.
     pub enabled: bool,
+    /// Whether a provider probe has verified this credential after custody.
+    pub verified: bool,
     /// Current cooldown deadline, if any.
     pub cooldown_until: Option<DateTime<Utc>>,
     /// Successful request count.
@@ -136,6 +145,8 @@ struct StoredKey {
     nonce: String,
     ciphertext: String,
     enabled: bool,
+    #[serde(default)]
+    verified: bool,
     cooldown_until: Option<DateTime<Utc>>,
     request_count: u64,
     failure_count: u64,
@@ -162,10 +173,12 @@ struct VaultFile {
     downstream: Vec<StoredDownstream>,
     #[serde(default)]
     router_cursor: usize,
+    #[serde(default)]
+    router_cursors: BTreeMap<String, usize>,
 }
 
 /// AES-256-GCM encrypted file-backed vault.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Vault {
     path: PathBuf,
     master_key: [u8; 32],
@@ -185,10 +198,20 @@ impl Vault {
                 keys: Vec::new(),
                 downstream: Vec::new(),
                 router_cursor: 0,
+                router_cursors: BTreeMap::new(),
             }
         };
         if state.version != 1 {
             bail!("unsupported vault version")
+        }
+        if state.keys.len() > MAX_UPSTREAM_KEYS {
+            bail!("at most two upstream credentials are supported")
+        }
+        let mut fingerprints = HashSet::with_capacity(state.keys.len());
+        for key in &state.keys {
+            if !fingerprints.insert(key.fingerprint.clone()) {
+                bail!("upstream credentials must have distinct fingerprints")
+            }
         }
         Ok(Self {
             path,
@@ -209,6 +232,30 @@ impl Vault {
         downstream: Vec<VaultDownstreamRecord>,
         router_cursor: usize,
     ) -> Result<Self> {
+        let mut cursors = BTreeMap::new();
+        cursors.insert("__legacy__".to_owned(), router_cursor);
+        Self::from_records_with_cursors(path, master_key, keys, downstream, cursors)
+    }
+
+    /// Reconstructs an in-memory vault with one durable cursor per routing
+    /// profile. The legacy scalar cursor is retained only as a migration
+    /// fallback for vault files written by the first release.
+    pub fn from_records_with_cursors(
+        path: impl AsRef<Path>,
+        master_key: [u8; 32],
+        keys: Vec<VaultKeyRecord>,
+        downstream: Vec<VaultDownstreamRecord>,
+        router_cursors: BTreeMap<String, usize>,
+    ) -> Result<Self> {
+        if keys.len() > MAX_UPSTREAM_KEYS {
+            bail!("at most two upstream credentials are supported")
+        }
+        let mut fingerprints = HashSet::with_capacity(keys.len());
+        for key in &keys {
+            if key.fingerprint.len() != 32 || !fingerprints.insert(key.fingerprint.clone()) {
+                bail!("upstream credentials must have distinct fingerprints")
+            }
+        }
         let keys = keys
             .into_iter()
             .map(|key| {
@@ -225,6 +272,7 @@ impl Vault {
                     nonce: URL_SAFE_NO_PAD.encode(key.nonce),
                     ciphertext: URL_SAFE_NO_PAD.encode(key.ciphertext),
                     enabled: key.enabled,
+                    verified: key.verified,
                     cooldown_until: key.cooldown_until,
                     request_count: key.request_count,
                     failure_count: key.failure_count,
@@ -257,7 +305,11 @@ impl Vault {
                 version: 1,
                 keys,
                 downstream,
-                router_cursor,
+                router_cursor: router_cursors
+                    .get("__legacy__")
+                    .copied()
+                    .unwrap_or_default(),
+                router_cursors,
             },
         })
     }
@@ -279,6 +331,7 @@ impl Vault {
                         .decode(&key.ciphertext)
                         .context("decode key ciphertext")?,
                     enabled: key.enabled,
+                    verified: key.verified,
                     cooldown_until: key.cooldown_until,
                     request_count: key.request_count,
                     failure_count: key.failure_count,
@@ -316,7 +369,26 @@ impl Vault {
         if !valid_upstream_credential(credential) {
             bail!("credential shape is invalid")
         }
-        let id = Uuid::new_v4();
+        let credential_fingerprint = fingerprint(credential.as_bytes());
+        if self
+            .state
+            .keys
+            .iter()
+            .any(|key| key.fingerprint == credential_fingerprint)
+        {
+            bail!("upstream credential already exists")
+        }
+        // Reuse a disabled slot for rotation so request-attempt foreign keys
+        // remain valid while an operator replaces a failed credential.
+        let replacement = (self.state.keys.len() >= MAX_UPSTREAM_KEYS)
+            .then(|| self.state.keys.iter().position(|key| !key.enabled))
+            .flatten();
+        if self.state.keys.len() >= MAX_UPSTREAM_KEYS && replacement.is_none() {
+            bail!("at most two upstream credentials are supported")
+        }
+        let id = replacement
+            .map(|index| self.state.keys[index].id)
+            .unwrap_or_else(Uuid::new_v4);
         let mut nonce_bytes = [0_u8; 12];
         rng().fill(&mut nonce_bytes);
         let cipher = Aes256Gcm::new_from_slice(&self.master_key).context("cipher init")?;
@@ -327,15 +399,22 @@ impl Vault {
         let entry = StoredKey {
             id,
             label,
-            fingerprint: fingerprint(credential.as_bytes()),
+            fingerprint: credential_fingerprint,
             nonce: URL_SAFE_NO_PAD.encode(nonce_bytes),
             ciphertext: URL_SAFE_NO_PAD.encode(payload),
-            enabled: true,
+            // A newly stored credential is not eligible until an operator
+            // explicitly probes it against the configured provider.
+            enabled: false,
+            verified: false,
             cooldown_until: None,
             request_count: 0,
             failure_count: 0,
         };
-        self.state.keys.push(entry.clone());
+        if let Some(index) = replacement {
+            self.state.keys[index] = entry.clone();
+        } else {
+            self.state.keys.push(entry.clone());
+        }
         self.persist()?;
         Ok(summary(&entry))
     }
@@ -347,12 +426,36 @@ impl Vault {
 
     /// Returns the persisted routing cursor used for restart continuity.
     pub fn router_cursor(&self) -> usize {
-        self.state.router_cursor
+        self.state
+            .router_cursors
+            .get("__legacy__")
+            .copied()
+            .unwrap_or(self.state.router_cursor)
     }
 
     /// Stores the next routing cursor atomically with vault state.
     pub fn set_router_cursor(&mut self, cursor: usize) -> Result<()> {
         self.state.router_cursor = cursor;
+        self.state
+            .router_cursors
+            .insert("__legacy__".to_owned(), cursor);
+        self.persist()
+    }
+
+    /// Returns a profile-local cursor, defaulting to the legacy cursor for
+    /// old vault files and to slot zero for a new profile.
+    pub fn router_cursor_for(&self, profile: &str) -> usize {
+        self.state
+            .router_cursors
+            .get(profile)
+            .copied()
+            .or_else(|| self.state.router_cursors.get("__legacy__").copied())
+            .unwrap_or(self.state.router_cursor)
+    }
+
+    /// Stores one profile-local cursor atomically with vault state.
+    pub fn set_router_cursor_for(&mut self, profile: &str, cursor: usize) -> Result<()> {
+        self.state.router_cursors.insert(profile.to_owned(), cursor);
         self.persist()
     }
 
@@ -362,7 +465,7 @@ impl Vault {
         label: &str,
         requested_scopes: &[String],
     ) -> Result<IssuedDownstream> {
-        validate_label(label)?;
+        validate_downstream_label(label)?;
         let scopes = canonical_scopes(requested_scopes)?;
         if self
             .state
@@ -461,7 +564,25 @@ impl Vault {
             .iter_mut()
             .find(|key| key.id == id)
             .ok_or_else(|| anyhow!("key not found"))?;
+        if enabled && !key.verified {
+            bail!("provider probe is required before enabling key")
+        }
         key.enabled = enabled;
+        let result = summary(key);
+        self.persist()?;
+        Ok(result)
+    }
+
+    /// Records a successful provider probe without enabling routing. Enabling
+    /// remains an explicit operator action after the probe receipt is durable.
+    pub fn mark_verified(&mut self, id: Uuid) -> Result<KeySummary> {
+        let key = self
+            .state
+            .keys
+            .iter_mut()
+            .find(|key| key.id == id)
+            .ok_or_else(|| anyhow!("key not found"))?;
+        key.verified = true;
         let result = summary(key);
         self.persist()?;
         Ok(result)
@@ -475,6 +596,24 @@ impl Vault {
             bail!("key not found")
         }
         self.persist()
+    }
+
+    /// Permanently excludes a credential from routing after authentication or
+    /// entitlement failure. Operators must explicitly re-enable it after
+    /// rotating or repairing the provider credential.
+    pub fn quarantine(&mut self, id: Uuid) -> Result<KeySummary> {
+        let key = self
+            .state
+            .keys
+            .iter_mut()
+            .find(|key| key.id == id)
+            .ok_or_else(|| anyhow!("key not found"))?;
+        key.enabled = false;
+        key.verified = false;
+        key.cooldown_until = None;
+        let result = summary(key);
+        self.persist()?;
+        Ok(result)
     }
 
     /// Decrypts one key for one outbound request.
@@ -521,7 +660,7 @@ impl Vault {
             .ok_or_else(|| anyhow!("key not found"))?;
         key.failure_count = key.failure_count.saturating_add(1);
         let delay = retry_after
-            .map(|value| value.clamp(Duration::zero(), Duration::hours(1)))
+            .map(|value| value.clamp(Duration::zero(), Duration::seconds(300)))
             .unwrap_or_else(|| Duration::seconds(1_i64 << key.failure_count.min(6)));
         let until = Utc::now() + delay;
         key.cooldown_until = Some(key.cooldown_until.map_or(until, |old| old.max(until)));
@@ -552,6 +691,12 @@ impl Vault {
         }
         Ok(())
     }
+
+    /// Rewrites the encrypted file after a failed PostgreSQL synchronization.
+    /// The gateway uses this only while restoring a previously cloned state.
+    pub fn persist_for_rollback(&self) -> Result<()> {
+        self.persist()
+    }
 }
 
 /// Round-robin selector that excludes disabled and cooling keys.
@@ -569,6 +714,11 @@ impl Router {
     /// Returns the next cursor after the most recent selection.
     pub fn next_slot(&self) -> usize {
         self.next_slot
+    }
+
+    /// Restores a cursor when durable synchronization rejects a selection.
+    pub fn set_next_slot(&mut self, next_slot: usize) {
+        self.next_slot = next_slot;
     }
 
     /// Selects the next key, returning `None` when all are unavailable.
@@ -595,6 +745,7 @@ fn summary(key: &StoredKey) -> KeySummary {
         label: key.label.clone(),
         fingerprint: key.fingerprint.clone(),
         enabled: key.enabled,
+        verified: key.verified,
         cooldown_until: key.cooldown_until,
         request_count: key.request_count,
         failure_count: key.failure_count,
@@ -632,6 +783,14 @@ fn validate_label(label: &str) -> Result<()> {
     let count = label.chars().count();
     if !(1..=128).contains(&count) || label.trim() != label || label.chars().any(char::is_control) {
         bail!("label is invalid")
+    }
+    Ok(())
+}
+
+fn validate_downstream_label(label: &str) -> Result<()> {
+    validate_label(label)?;
+    if label.chars().count() > 120 {
+        bail!("downstream label is invalid")
     }
     Ok(())
 }
@@ -696,6 +855,7 @@ mod tests {
                 label: "a".into(),
                 fingerprint: "a".into(),
                 enabled: true,
+                verified: true,
                 cooldown_until: None,
                 request_count: 0,
                 failure_count: 0,
@@ -705,6 +865,7 @@ mod tests {
                 label: "b".into(),
                 fingerprint: "b".into(),
                 enabled: true,
+                verified: true,
                 cooldown_until: None,
                 request_count: 0,
                 failure_count: 0,
@@ -712,6 +873,80 @@ mod tests {
         ];
         assert_eq!(router.select(&keys), Some(keys[0].id));
         assert_eq!(router.select(&keys), Some(keys[1].id));
+    }
+
+    #[test]
+    fn router_skips_cooling_or_disabled_keys_for_failover() {
+        let mut router = Router::default();
+        let keys = [
+            KeySummary {
+                id: Uuid::from_u128(1),
+                label: "cooling".into(),
+                fingerprint: "a".into(),
+                enabled: true,
+                verified: true,
+                cooldown_until: Some(Utc::now() + Duration::seconds(30)),
+                request_count: 0,
+                failure_count: 1,
+            },
+            KeySummary {
+                id: Uuid::from_u128(2),
+                label: "healthy".into(),
+                fingerprint: "b".into(),
+                enabled: true,
+                verified: true,
+                cooldown_until: None,
+                request_count: 0,
+                failure_count: 0,
+            },
+            KeySummary {
+                id: Uuid::from_u128(3),
+                label: "disabled".into(),
+                fingerprint: "c".into(),
+                enabled: false,
+                verified: false,
+                cooldown_until: None,
+                request_count: 0,
+                failure_count: 0,
+            },
+        ];
+        assert_eq!(router.select(&keys), Some(keys[1].id));
+        assert_eq!(router.select(&keys), Some(keys[1].id));
+        assert_eq!(router.select(&keys[..1]), None);
+    }
+
+    #[test]
+    fn failure_cooldown_and_profile_cursor_survive_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.json");
+        let credential = "nvapi-abcdefghijklmnopqrstuvwxyz123456";
+        let mut vault = Vault::open(&path, [11; 32]).expect("open");
+        let key = vault.add("one", credential).expect("add");
+        vault
+            .record_failure(key.id, Some(Duration::seconds(30)))
+            .expect("failure");
+        vault
+            .set_router_cursor_for("nvidia/vila", 1)
+            .expect("cursor");
+        let reopened = Vault::open(&path, [11; 32]).expect("reopen");
+        let summary = &reopened.list()[0];
+        assert!(summary.cooldown_until.is_some());
+        assert_eq!(reopened.router_cursor_for("nvidia/vila"), 1);
+        assert_eq!(reopened.credential(key.id).expect("decrypt"), credential);
+    }
+
+    #[test]
+    fn quarantine_disables_invalid_credentials_across_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.json");
+        let mut vault = Vault::open(&path, [12; 32]).expect("open");
+        let key = vault
+            .add("invalid", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .expect("add");
+        let summary = vault.quarantine(key.id).expect("quarantine");
+        assert!(!summary.enabled);
+        assert!(summary.cooldown_until.is_none());
+        assert!(!Vault::open(&path, [12; 32]).expect("reopen").list()[0].enabled);
     }
 
     #[test]
@@ -767,6 +1002,60 @@ mod tests {
         assert_eq!(
             restored.credential(summary.id).expect("decrypt"),
             credential
+        );
+    }
+
+    #[test]
+    fn upstream_slots_are_limited_to_two_distinct_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut vault = Vault::open(dir.path().join("vault.json"), [5; 32]).expect("open");
+        let one = vault
+            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .expect("first");
+        vault.mark_verified(one.id).expect("probe first");
+        vault.set_enabled(one.id, true).expect("enable first");
+        assert!(
+            vault
+                .add("duplicate", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+                .is_err()
+        );
+        let two = vault
+            .add("two", "nvapi-zyxwvutsrqponmlkjihgfedcba654321")
+            .expect("second");
+        vault.mark_verified(two.id).expect("probe second");
+        vault.set_enabled(two.id, true).expect("enable second");
+        assert!(
+            vault
+                .add("three", "nvapi-0123456789abcdefghijklmnopqrstuvwxyz")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn enabling_requires_probe_and_disabled_slot_can_rotate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut vault = Vault::open(dir.path().join("vault.json"), [6; 32]).expect("open");
+        let first = vault
+            .add("first", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .expect("first");
+        assert!(vault.set_enabled(first.id, true).is_err());
+        vault.mark_verified(first.id).expect("probe");
+        vault.set_enabled(first.id, true).expect("enable");
+        let second = vault
+            .add("second", "nvapi-zyxwvutsrqponmlkjihgfedcba654321")
+            .expect("second");
+        vault.mark_verified(second.id).expect("probe second");
+        vault.set_enabled(second.id, true).expect("enable second");
+        vault.quarantine(first.id).expect("quarantine");
+        let replacement = vault
+            .add("replacement", "nvapi-0123456789abcdefghijklmnopqrstuvwxyz")
+            .expect("replace disabled slot");
+        assert_eq!(replacement.id, first.id);
+        assert!(!replacement.enabled);
+        assert!(!vault.key_records().expect("records")[0].verified);
+        assert_eq!(
+            vault.credential(first.id).expect("decrypt replacement"),
+            "nvapi-0123456789abcdefghijklmnopqrstuvwxyz"
         );
     }
 }

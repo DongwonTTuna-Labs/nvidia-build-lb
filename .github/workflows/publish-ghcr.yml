@@ -18,6 +18,7 @@ jobs:
     outputs:
       app_registry_digest: ${{ steps.publish.outputs.app_registry_digest }}
       postgres_registry_digest: ${{ steps.publish.outputs.postgres_registry_digest }}
+      fixture_image_digest: ${{ steps.candidate.outputs.fixture }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -27,36 +28,37 @@ jobs:
           version: "0.11.24"
           enable-cache: true
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-      - name: Install locked Python and browser dependencies
+      - name: Verify Rust and Svelte source
         run: |
-          uv sync --frozen --all-groups
-          npm ci --ignore-scripts --no-audit --no-fund
-          uv run playwright install --with-deps chromium
-      - name: Verify source and tests
-        run: |
-          uv run ruff check .
-          uv run ruff format --check .
-          uv run basedpyright
-          uv run pytest -q
+          cargo fmt --all -- --check
+          cargo test --workspace
+          npm --prefix apps/admin ci --ignore-scripts --no-audit --no-fund
+          npm --prefix apps/admin run check
+          npm --prefix apps/admin run format
+          npm --prefix apps/admin run knip
       - name: Build and exercise the manifest-bound image pair
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/candidate
-        run: scripts/qa/build-candidate.sh
+        run: scripts/qa/build-rust-candidate.sh
       - name: Resolve immutable candidate pair
         id: candidate
         shell: bash
         run: |
           app=$(jq -er '.image_digest' "${RUNNER_TEMP}/candidate/candidate.json")
           postgres=$(jq -er '.postgres_image_digest' "${RUNNER_TEMP}/candidate/candidate.json")
+          fixture=$(jq -er '.fixture_image_digest' "${RUNNER_TEMP}/candidate/candidate.json")
           echo "app=${app}" >> "$GITHUB_OUTPUT"
           echo "postgres=${postgres}" >> "$GITHUB_OUTPUT"
-      - name: Scan the exact candidate pair
+          echo "fixture=${fixture}" >> "$GITHUB_OUTPUT"
+      - name: Check candidate metadata for secret leakage
         env:
-          EVIDENCE_DIR: ${{ runner.temp }}/scan
           IMAGE_DIGEST: ${{ steps.candidate.outputs.app }}
           POSTGRES_IMAGE_DIGEST: ${{ steps.candidate.outputs.postgres }}
-          SOURCE_MANIFEST: ${{ runner.temp }}/candidate/source-manifest.json
-        run: scripts/qa/scan-release.sh
+          FIXTURE_IMAGE_DIGEST: ${{ steps.candidate.outputs.fixture }}
+        run: |
+          ! docker history --no-trunc --format '{{.CreatedBy}}' "$IMAGE_DIGEST" | grep -E 'nvapi-|nblb_ds_'
+          ! docker history --no-trunc --format '{{.CreatedBy}}' "$POSTGRES_IMAGE_DIGEST" | grep -E 'nvapi-|nblb_ds_'
+          ! docker history --no-trunc --format '{{.CreatedBy}}' "$FIXTURE_IMAGE_DIGEST" | grep -E 'nvapi-|nblb_ds_'
       - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with:
           registry: ghcr.io

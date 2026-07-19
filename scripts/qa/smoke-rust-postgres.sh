@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 port=${NBLB_SMOKE_PORT:-32464}
 pg_port=${NBLB_PG_SMOKE_PORT:-35440}
+postgres_image=${NBLB_SMOKE_POSTGRES_IMAGE:-postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193}
 work=$(mktemp -d)
 name="nblb-pg-smoke-$$"
 master=$(printf '0a%.0s' $(seq 1 32))
@@ -19,7 +20,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ ! -x target/debug/nblb-migrate || ! -x target/debug/nvidia-build-lb-gateway ]] \
-  || find crates migrations Cargo.toml Cargo.lock -type f -newer target/debug/nvidia-build-lb-gateway -print -quit 2>/dev/null | grep -q .; then
+  || find crates migrations Cargo.toml Cargo.lock -type f \( -newer target/debug/nvidia-build-lb-gateway -o -newer target/debug/nblb-migrate \) -print -quit 2>/dev/null | grep -q .; then
   cargo build -p nvidia-build-lb-gateway --bins
 fi
 
@@ -28,7 +29,7 @@ docker run --rm -d --name "$name" \
   -e POSTGRES_PASSWORD=targeted-pass \
   -e POSTGRES_DB=nvidia_build_lb \
   -p "127.0.0.1:${pg_port}:5432" \
-  postgres:17-alpine >/dev/null
+  "$postgres_image" >/dev/null
 for _ in $(seq 1 80); do
   if docker exec "$name" pg_isready -h 127.0.0.1 -U nvidia_build_lb -d nvidia_build_lb >/dev/null 2>&1; then
     break
@@ -54,24 +55,41 @@ test "$(curl -sS -o "$work/health" -w '%{http_code}' "http://127.0.0.1:$port/hea
 
 for pair in aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb; do
   first=${pair:0:1}
-  curl -fsS -H 'Authorization: Bearer targeted-admin' -H 'Content-Type: application/json' \
+  key_id=$(curl -fsS -H 'Authorization: Bearer targeted-admin' -H 'Content-Type: application/json' \
     -d "{\"label\":\"key-$first\",\"credential\":\"nvapi-$pair\"}" \
-    "http://127.0.0.1:$port/admin/api/v1/upstream-keys" >/dev/null
+    "http://127.0.0.1:$port/admin/api/v1/upstream-keys" | jq -er .id)
+  curl -fsS -H 'Authorization: Bearer targeted-admin' -X POST \
+    "http://127.0.0.1:$port/admin/api/v1/upstream-keys/$key_id/probe" \
+    | jq -e '.probe_status == "valid"' >/dev/null
+  curl -fsS -H 'Authorization: Bearer targeted-admin' -H 'Content-Type: application/json' \
+    -d '{"enabled":true}' "http://127.0.0.1:$port/admin/api/v1/upstream-keys/$key_id/state" >/dev/null
 done
+curl -fsS "http://127.0.0.1:$port/health" | jq -e '.ready == true and .traffic_ready == true and .eligible_keys == 2' >/dev/null
 client=$(curl -fsS -H 'Authorization: Bearer targeted-admin' -H 'Content-Type: application/json' \
   -d '{"label":"targeted","scopes":["models:read","chat:write"]}' \
   "http://127.0.0.1:$port/admin/api/v1/downstream-credentials")
 token=$(printf '%s' "$client" | jq -er .token)
 curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:$port/v1/models" \
-  | jq -e '.data|length == 7' >/dev/null
+  | jq -e '.data|length == 8' >/dev/null
 curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-  -d '{"model":"z-ai/glm-5.2","messages":[]}' \
+  -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"smoke"}]}' \
   "http://127.0.0.1:$port/v1/chat/completions" | jq -e '.object == "chat.completion"' >/dev/null
 curl -fsS -H 'Authorization: Bearer targeted-admin' "http://127.0.0.1:$port/admin/api/v1/evidence" \
-  | jq -e '.source_of_truth == "postgresql" and .persisted_routing_profiles == 7' >/dev/null
+  | jq -e '.source_of_truth == "postgresql" and .persisted_routing_profiles == 8' >/dev/null
 counts=$(docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atc \
-  'select (select count(*) from nblb.upstream_keys),(select count(*) from nblb.downstream_credentials),(select count(*) from nblb.routing_state)')
-test "$counts" = '2|1|7'
+  'select (select count(*) from nblb.upstream_keys),(select count(*) from nblb.downstream_credentials),(select count(*) from nblb.routing_state),(select count(*) from nblb.request_attempts)')
+IFS='|' read -r key_count downstream_count profile_count attempt_count <<<"$counts"
+test "$key_count" = 2
+test "$downstream_count" = 1
+test "$profile_count" = 8
+test "$attempt_count" -ge 1
+key_id=$(docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atc \
+  'select id from nblb.upstream_keys order by created_at limit 1')
+cancelled_id=$(docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atqc \
+  "insert into nblb.request_attempts(request_id,profile_id,key_id,outcome,finished_at) values (gen_random_uuid(),'z-ai/glm-5.2','$key_id','cancelled',now()) returning id")
+test -n "$cancelled_id"
+docker exec "$name" psql -U nvidia_build_lb -d nvidia_build_lb -Atc \
+  "select outcome from nblb.request_attempts where id='$cancelled_id'" | grep -Fx cancelled >/dev/null
 
 kill "$gateway_pid"
 wait "$gateway_pid" 2>/dev/null || true

@@ -173,7 +173,15 @@ def build_manifest(root: Path) -> SourceManifest:
     entries: list[ManifestEntry] = []
     for relative in paths:
         relative_text = os.fsdecode(relative)
-        payload = read_candidate_entry(root, relative_text)
+        # `git ls-files` includes tracked-but-deleted paths.  A candidate
+        # manifest describes the checkout that will be built, so an absent
+        # path is intentionally omitted instead of turning a legitimate
+        # workflow removal into a false QA failure.  Other read errors remain
+        # fail-closed below.
+        try:
+            payload = read_candidate_entry(root, relative_text)
+        except FileNotFoundError:
+            continue
         payload_digest = hashlib.sha256(payload.payload).hexdigest()
         canonical_mode = canonical_source_mode(payload.kind, payload.mode)
 

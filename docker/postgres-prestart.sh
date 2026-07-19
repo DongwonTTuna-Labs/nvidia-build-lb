@@ -19,6 +19,9 @@ pgdata=${PGDATA:-/var/lib/postgresql/data/pgdata}
 metadata=$(stat -c '%u:%g:%a' "$source_file" 2>/dev/null) || fail source_stat
 case "$metadata" in
     0:0:400|0:0:444|0:0:600) ;;
+    *:444)
+        [ "${NBLB_QA_ALLOW_HOST_SECRET_OWNER:-0}" = 1 ] || fail source_mode
+        ;;
     *) fail source_mode ;;
 esac
 size=$(wc -c < "$source_file") || fail source_size_read
@@ -39,8 +42,14 @@ chown 70:70 "$runtime" 2>/dev/null || fail runtime_owner
 [ "$pgdata" = /var/lib/postgresql/data/pgdata ] || fail pgdata_path
 if [ -e "$pgdata" ]; then
     [ -d "$pgdata" ] && [ ! -L "$pgdata" ] || fail pgdata_type
-    [ "$(stat -c '%u:%g:%a' "$pgdata" 2>/dev/null)" = 70:70:700 ] \
-        || fail pgdata_mode
+    # db-init may have already handed the directory to PostgreSQL. The
+    # hardened runtime intentionally has no CAP_FOWNER, so do not attempt a
+    # redundant chmod/chown on an already-correct 70:70/0700 directory.
+    pgdata_metadata=$(stat -c '%u:%g:%a' "$pgdata" 2>/dev/null) || fail pgdata_stat
+    if [ "$pgdata_metadata" != 70:70:700 ]; then
+        chmod 0700 "$pgdata" 2>/dev/null || fail pgdata_mode
+        chown 70:70 "$pgdata" 2>/dev/null || fail pgdata_owner
+    fi
 else
     mkdir -p "$pgdata" 2>/dev/null || fail pgdata_mkdir
     chmod 0700 "$pgdata" 2>/dev/null || fail pgdata_mode

@@ -1,9 +1,6 @@
 """Secret-free fixed-target TCP relay for host-side candidate QA."""
 
-from contextlib import suppress
-
-import anyio
-from anyio.abc import ByteStream
+import asyncio
 
 _BIND_HOST = "0.0.0.0"  # noqa: S104 - published on host loopback only.
 _TARGET_HOST = "app"
@@ -11,31 +8,34 @@ _PORT = 2456
 _BUFFER_BYTES = 65_536
 
 
-async def _pipe(source: ByteStream, destination: ByteStream) -> None:
+async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
-        while True:
-            await destination.send(await source.receive(_BUFFER_BYTES))
-    except (anyio.BrokenResourceError, anyio.ClosedResourceError, anyio.EndOfStream):
-        with suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
-            await destination.send_eof()
+        while chunk := await reader.read(_BUFFER_BYTES):
+            writer.write(chunk)
+            await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 
-async def _relay(client: ByteStream) -> None:
+async def _relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
-        upstream = await anyio.connect_tcp(_TARGET_HOST, _PORT)
+        upstream_reader, upstream_writer = await asyncio.open_connection(_TARGET_HOST, _PORT)
     except OSError:
-        await client.aclose()
+        writer.close()
         return
-    async with client, upstream, anyio.create_task_group() as tasks:
-        _ = tasks.start_soon(_pipe, client, upstream)
-        _ = tasks.start_soon(_pipe, upstream, client)
+    await asyncio.gather(
+        _pipe(reader, upstream_writer),
+        _pipe(upstream_reader, writer),
+        return_exceptions=True,
+    )
 
 
 async def _serve() -> None:
-    listener = await anyio.create_tcp_listener(local_host=_BIND_HOST, local_port=_PORT)
-    async with listener:
-        await listener.serve(_relay)
+    server = await asyncio.start_server(_relay, _BIND_HOST, _PORT)
+    async with server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
-    anyio.run(_serve)
+    asyncio.run(_serve())

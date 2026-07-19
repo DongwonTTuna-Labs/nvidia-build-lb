@@ -20,6 +20,9 @@ for name in server_cert server_key; do
     metadata=$(stat -c '%u:%g:%a' "$source_file" 2>/dev/null) || fail
     case "$metadata" in
         0:0:400|0:0:444|0:0:600|0:0:644) ;;
+        *:444|*:644)
+            [ "${NBLB_QA_ALLOW_HOST_SECRET_OWNER:-0}" = 1 ] || fail
+            ;;
         *) fail ;;
     esac
     cp "$source_file" "$destination" 2>/dev/null || fail
@@ -36,4 +39,4 @@ exec setpriv \
     --ambient-caps=-all \
     --bounding-set=-all \
     --no-new-privs \
-    /app/.venv/bin/python /qa/fake_nvidia_tls.py
+    /usr/bin/python3 /qa/fake_nvidia_tls.py

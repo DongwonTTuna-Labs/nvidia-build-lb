@@ -11,6 +11,7 @@ source "$ROOT/scripts/qa/admin-stage-evidence.sh"
 EVIDENCE_DIR=${EVIDENCE_DIR:-.omo/evidence/task-7-nvidia-build-lb}
 IMAGE_DIGEST=${IMAGE_DIGEST:-}
 POSTGRES_IMAGE_DIGEST=${POSTGRES_IMAGE_DIGEST:-}
+FIXTURE_IMAGE_DIGEST=${FIXTURE_IMAGE_DIGEST:-}
 SOURCE_MANIFEST=${SOURCE_MANIFEST:-}
 PRIMARY_PORT=${NBLB_VERIFY_PRIMARY_PORT:-32456}
 RESTORE_PORT=${NBLB_VERIFY_RESTORE_PORT:-32457}
@@ -42,6 +43,7 @@ primary_compose() {
     NBLB_QA_PUBLIC_PORT="$PRIMARY_PORT" \
     NBLB_POSTGRES_IMAGE="$POSTGRES_IMAGE_DIGEST" \
     NBLB_CANDIDATE_IMAGE="$IMAGE_DIGEST" \
+    NBLB_QA_FIXTURE_IMAGE="$FIXTURE_IMAGE_DIGEST" \
     NBLB_BACKUP_SOURCE=true \
     NBLB_RESTORE_ISOLATED=false \
     docker compose -f compose.qa.yml -p "$PROJECT_PRIMARY" "$@"
@@ -54,6 +56,7 @@ restore_compose() {
     NBLB_QA_PUBLIC_PORT="$RESTORE_PORT" \
     NBLB_POSTGRES_IMAGE="$POSTGRES_IMAGE_DIGEST" \
     NBLB_CANDIDATE_IMAGE="$IMAGE_DIGEST" \
+    NBLB_QA_FIXTURE_IMAGE="$FIXTURE_IMAGE_DIGEST" \
     NBLB_BACKUP_SOURCE=false \
     NBLB_RESTORE_ISOLATED=true \
     docker compose -f compose.qa.yml -p "$PROJECT_RESTORE" "$@"
@@ -302,6 +305,8 @@ done
 [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || fail image_digest_invalid
 [[ "$POSTGRES_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || fail postgres_image_digest_invalid
+[[ "$FIXTURE_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail fixture_image_digest_invalid
 [ -f "$SOURCE_MANIFEST" ] && [ ! -L "$SOURCE_MANIFEST" ] \
     || fail source_manifest_invalid
 SOURCE_MANIFEST=$(realpath -e "$SOURCE_MANIFEST")
@@ -312,6 +317,10 @@ observed_postgres_image=$(docker image inspect --format '{{.Id}}' \
     "$POSTGRES_IMAGE_DIGEST" 2>/dev/null) || fail postgres_image_unavailable
 [ "$observed_postgres_image" = "$POSTGRES_IMAGE_DIGEST" ] \
     || fail postgres_image_digest_mismatch
+observed_fixture_image=$(docker image inspect --format '{{.Id}}' \
+    "$FIXTURE_IMAGE_DIGEST" 2>/dev/null) || fail fixture_image_unavailable
+[ "$observed_fixture_image" = "$FIXTURE_IMAGE_DIGEST" ] \
+    || fail fixture_image_digest_mismatch
 [ "$(port_count "$PRIMARY_PORT")" -eq 0 ] || fail primary_port_busy
 [ "$(port_count "$RESTORE_PORT")" -eq 0 ] || fail restore_port_busy
 CODEX_BEFORE=$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -387,6 +396,11 @@ postgres_source_sha256=$(docker image inspect \
     "$POSTGRES_IMAGE_DIGEST")
 [ "$source_sha256" = "$postgres_source_sha256" ] \
     || fail postgres_image_source_mismatch
+fixture_source_sha256=$(docker image inspect \
+    --format '{{index .Config.Labels "nvidia-build-lb.source-sha256"}}' \
+    "$FIXTURE_IMAGE_DIGEST") || fail fixture_image_source_unavailable
+[ "$source_sha256" = "$fixture_source_sha256" ] \
+    || fail fixture_image_source_mismatch
 
 uv run ruff check .
 uv run ruff format --check .

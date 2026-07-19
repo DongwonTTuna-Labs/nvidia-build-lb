@@ -3,6 +3,7 @@ SHELL := /bin/sh
 
 IMAGE_DIGEST ?=
 POSTGRES_IMAGE_DIGEST ?=
+FIXTURE_IMAGE_DIGEST ?=
 SOURCE_MANIFEST ?=
 MODE ?=
 
@@ -30,9 +31,10 @@ help:
 		'  test-nvidia-routing Todo 3 pytest marker: nvidia_routing' \
 		'  test-ui-fake       Todo 4 pytest marker: ui_fake' \
 		'  test-api           Todo 5 pytest marker: api' \
-		'  build-candidate    Todo 6A candidate image and compose gate' \
-		'  test-browser-prod  Todo 6B browser gate; requires app/PG digests and source manifest' \
-		'  verify-local       Todo 7 local gate; requires app/PG digests and source manifest' \
+		'  build-candidate    Rust/Svelte candidate image and Compose gate' \
+		'                    NBLB_FAST=1 keeps local iteration targeted; release CI uses the full gate' \
+		'  test-browser-prod  Todo 6B browser gate; requires app/PG/fixture digests and source manifest' \
+		'  verify-local       Todo 7 local gate; requires app/PG/fixture digests and source manifest' \
 		'  scan-release       Todo 7 scans; requires app/PG digests and source manifest' \
 		'  smoke-live         Live matrix; exactly 2 registered rows, MODE selects 1 or 2 eligible' \
 		'  smoke-hermes       Hermes cutover cycle; requires IMAGE_DIGEST' \
@@ -43,7 +45,7 @@ help:
 		'  rust-smoke-postgres PostgreSQL source-of-truth and restart smoke' \
 		'  docker-rust-build Build the Rust/Svelte production image locally' \
 		'' \
-		'Build candidate.json records IMAGE_DIGEST and POSTGRES_IMAGE_DIGEST.' \
+		'Build candidate.json records IMAGE_DIGEST, POSTGRES_IMAGE_DIGEST, and FIXTURE_IMAGE_DIGEST.' \
 		'Reuse those values and the same source-manifest.json for 6B and 7.' \
 		'' \
 		'All targets accept EVIDENCE_DIR and use their own task-scoped default.'
@@ -64,22 +66,24 @@ test-api:
 	EVIDENCE_DIR="$(EVIDENCE_DIR)" uv run pytest -m api -q
 
 build-candidate:
-	@test -x scripts/qa/build-candidate.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 6A owns scripts/qa/build-candidate.sh'; exit 78; }
-	EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/build-candidate.sh
+	@test -x scripts/qa/build-rust-candidate.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Rust candidate gate is missing'; exit 78; }
+	EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/build-rust-candidate.sh
 
 test-browser-prod:
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
 	@test -n "$(POSTGRES_IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: POSTGRES_IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(FIXTURE_IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: FIXTURE_IMAGE_DIGEST is required'; exit 64; }
 	@test -n "$(SOURCE_MANIFEST)" || { printf '%s\n' 'INPUT[64]: SOURCE_MANIFEST is required'; exit 64; }
 	@test -x scripts/qa/test-browser-prod.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 6B owns scripts/qa/test-browser-prod.sh'; exit 78; }
-	IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/test-browser-prod.sh
+	IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" FIXTURE_IMAGE_DIGEST="$(FIXTURE_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/test-browser-prod.sh
 
 verify-local:
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
 	@test -n "$(POSTGRES_IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: POSTGRES_IMAGE_DIGEST is required'; exit 64; }
+	@test -n "$(FIXTURE_IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: FIXTURE_IMAGE_DIGEST is required'; exit 64; }
 	@test -n "$(SOURCE_MANIFEST)" || { printf '%s\n' 'INPUT[64]: SOURCE_MANIFEST is required'; exit 64; }
 	@test -x scripts/qa/verify-local.sh || { printf '%s\n' 'UNIMPLEMENTED[78]: Todo 7 owns scripts/qa/verify-local.sh'; exit 78; }
-	IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/verify-local.sh
+	IMAGE_DIGEST="$(IMAGE_DIGEST)" POSTGRES_IMAGE_DIGEST="$(POSTGRES_IMAGE_DIGEST)" FIXTURE_IMAGE_DIGEST="$(FIXTURE_IMAGE_DIGEST)" SOURCE_MANIFEST="$(SOURCE_MANIFEST)" EVIDENCE_DIR="$(EVIDENCE_DIR)" scripts/qa/verify-local.sh
 
 scan-release:
 	@test -n "$(IMAGE_DIGEST)" || { printf '%s\n' 'INPUT[64]: IMAGE_DIGEST is required'; exit 64; }
@@ -104,8 +108,11 @@ rust-check:
 	cargo check -p nvidia-build-lb-gateway --bins
 
 admin-check:
-	npm run admin:check
-	npm run admin:build
+	npm ci --prefix apps/admin --ignore-scripts --no-audit --no-fund
+	npm --prefix apps/admin run check
+	npm --prefix apps/admin run build
+	npm --prefix apps/admin run format
+	npm --prefix apps/admin run knip
 
 rust-smoke:
 	scripts/qa/smoke-rust.sh

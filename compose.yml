@@ -19,12 +19,17 @@ services:
     volumes:
       - db-data:/var/lib/postgresql/data
     tmpfs:
+      - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0
       - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16m,mode=0775,uid=70,gid=70
       - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
     read_only: true
     cap_drop:
       - ALL
-    user: "70:70"
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - SETPCAP
     security_opt:
       - no-new-privileges:true
     healthcheck:
@@ -41,6 +46,7 @@ services:
     image: ghcr.io/dongwonttuna-labs/nvidia-build-lb@sha256:${NBLB_APP_REGISTRY_DIGEST:?raw application registry digest required}
     command: ["/usr/local/bin/nblb-migrate"]
     environment:
+      NVIDIA_BUILD_LB_MODE: migrate
       NBLB_DATABASE_URL: postgres://nvidia_build_lb@db/nvidia_build_lb
     labels:
       nvidia-build-lb.component: migration
@@ -75,6 +81,8 @@ services:
     environment:
       NBLB_DATABASE_URL: postgres://nvidia_build_lb@db/nvidia_build_lb
       NBLB_VAULT_MASTER_KEY_FILE: /run/nvidia-build-lb/secrets/vault_master_key
+      NBLB_UPSTREAM_URL: ${NBLB_UPSTREAM_URL:-https://integrate.api.nvidia.com/v1/chat/completions}
+      NBLB_REQUIRE_DOWNSTREAM_TOKEN: ${NBLB_REQUIRE_DOWNSTREAM_TOKEN:-1}
       NVIDIA_BUILD_LB_PUBLIC_PORT: ${NBLB_PORT:-2456}
       NVIDIA_BUILD_LB_ADMIN_EVENT_MAX_ROWS: ${NBLB_ADMIN_EVENT_MAX_ROWS:-100000}
       NVIDIA_BUILD_LB_ADMIN_ATTEMPT_MAX_ROWS: ${NBLB_ADMIN_ATTEMPT_MAX_ROWS:-40000}
@@ -93,14 +101,6 @@ services:
         target: /run/canonical-secrets/db_password
         mode: 0400
     volumes:
-      - type: bind
-        source: /run/nvidia-build-lb
-        target: /run/nvidia-build-lb
-        read_only: true
-      - type: bind
-        source: /run/nvidia-build-lb-control
-        target: /run/nvidia-build-lb-control
-        read_only: false
       - vault-data:/var/lib/nvidia-build-lb
     tmpfs:
       - /run/nvidia-build-lb/secrets:rw,noexec,nosuid,nodev,size=64k,mode=0700,uid=0,gid=0

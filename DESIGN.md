@@ -418,7 +418,7 @@ restored|failed_attention
 Every requested phase is durable before its one side effect and every completed
 phase requires exact file, effective-unit, mask, container, and process
 readback. `hermes_binding_verified` is impossible until the v3 production
-generation is active, both fresh keys and all seven profiles are proved, the
+generation is active, both fresh keys and all eight profiles are proved, the
 new downstream token digest/scopes match the live Hermes `.env` and DB row,
 `active.json.bound_generation_id` matches the active pointer, and the initial
 Hermes health plus real task E2E have passed. Until that phase, both persistent
@@ -1155,14 +1155,15 @@ not secrets but are compacted only for L1 display.
 | `POST /v1/embeddings` | loopback + public | `embeddings:write` | OpenAI embedding JSON |
 | `POST /v1/images/generations` | loopback + public | `images:write` | OpenAI image JSON |
 | `POST /v1/audio/speech` | loopback + public | `audio:write` | `audio/wav` bytes |
+| `POST /v1/audio/transcriptions` | loopback + public | `audio:write` | OpenAI transcription JSON |
 | `POST /v1/nvidia/inference` | loopback + public | `media:write` | NVIDIA-native video JSON |
 | `GET /admin` | loopback only | none | prerendered login shell |
 | `GET /showcase` | loopback only | none | real UI primitive showcase |
 | `GET /assets/<manifest-entry>` | loopback only | none | exact embedded asset |
 | `/admin/api/v1/*` | loopback only | admin bearer | closed admin JSON |
 
-`ProfileId` is the closed seven-value enum
-`"z-ai/glm-5.2"|"microsoft/phi-4-multimodal-instruct"|"nvidia/vila"|"nvidia/nvclip"|"black-forest-labs/flux.1-kontext-dev"|"stabilityai/stable-video-diffusion"|"nvidia/magpie-tts-multilingual"`.
+`ProfileId` is the closed eight-value enum
+`"z-ai/glm-5.2"|"microsoft/phi-4-multimodal-instruct"|"nvidia/vila"|"nvidia/nvclip"|"black-forest-labs/flux.1-kontext-dev"|"stabilityai/stable-video-diffusion"|"nvidia/magpie-tts-multilingual"|"nvidia/parakeet-ctc-1.1b"`.
 The downstream scope allowlist is exactly `models:read`, `chat:write`,
 `embeddings:write`, `images:write`, `audio:write`, and `media:write`. Hermes gets
 only the first two. `/v1/models` returns `{object:"list",data:[...]}` and only
@@ -1170,7 +1171,7 @@ advertised profiles in this exact order: `z-ai/glm-5.2`,
 `microsoft/phi-4-multimodal-instruct`, `nvidia/vila`, `nvidia/nvclip`,
 `black-forest-labs/flux.1-kontext-dev`,
 `stabilityai/stable-video-diffusion`, and
-`nvidia/magpie-tts-multilingual`. Every object has exact `id`,
+`nvidia/magpie-tts-multilingual`, and `nvidia/parakeet-ctc-1.1b`. Every object has exact `id`,
 `object:"model"`, `created:1784332800` (2026-07-18 00:00:00 UTC), and
 `owned_by:"nvidia"`; temporary eligibility never reorders the surviving rows.
 The database CHECK calls the immutable helper
@@ -1375,7 +1376,7 @@ management_ready,traffic_ready}`, with the UUID and six Booleans; it performs
 no mutation or provider call. `management_ready` is exactly tuple, schema, DB,
 vault binding/decrypt-all, admin-token, and embedded-asset-manifest readiness,
 independent of key count. `traffic_ready` is management readiness plus a
-configured two-key pair, all seven current proof/advertisement contracts, and
+configured two-key pair, all eight current proof/advertisement contracts, and
 no intake drain; it deliberately ignores temporary cooldown, in-flight
 capacity, and manual disable, which are exposed separately as current
 eligibility. Secret-free row
@@ -1681,7 +1682,7 @@ one cleanup-only key. The two additional closed projections are:
 
 `currently_eligible_key_profiles` is the count 0..14 of assigned
 `(key_id,profile_id)` rows whose `eligible_now` is true at `snapshot.observed_at`;
-`currently_available_profiles` is the count 0..7 of profile rows with at least
+`currently_available_profiles` is the count 0..8 of profile rows with at least
 one such eligible slot. Both use the same repeatable-read snapshot and exact
 cooldown/capacity/manual/proof predicates as Models, so they cannot disagree
 with its seven rows.
@@ -1855,7 +1856,7 @@ KeyProfile = {
 }
 ```
 
-Every `profiles` array has all seven rows in manifest order, including staged
+Every `profiles` array has all eight rows in manifest order, including staged
 keys. Null cooldown timestamps correspond exactly to inactive cooldowns;
 `cooldown_kind` is derived from unexpired timestamps at `observed_at`.
 
@@ -1874,7 +1875,7 @@ keys. Null cooldown timestamps correspond exactly to inactive cooldowns;
 Scopes use the section 5 allowlist order. Active means `revoked_at:null`;
 inactive means nonnull. No digest or plaintext field exists.
 
-`GET /model-capabilities` returns exactly `{snapshot,models}` with seven rows in
+`GET /model-capabilities` returns exactly `{snapshot,models}` with eight rows in
 manifest order:
 
 ```text
@@ -1943,6 +1944,7 @@ The route and modality arrays are not inferred at runtime; their exact rows are:
 | `black-forest-labs/flux.1-kontext-dev` | `images` | `["text"]` | `["image"]` |
 | `stabilityai/stable-video-diffusion` | `nvidia_native` | `["image"]` | `["video"]` |
 | `nvidia/magpie-tts-multilingual` | `speech` | `["text"]` | `["audio"]` |
+| `nvidia/parakeet-ctc-1.1b` | `transcriptions` | `["audio"]` | `["text"]` |
 
 `GET /events?before=<cursor>&limit=<n>` requires decimal `limit` 1..100 and an
 optional cursor. Events sort by `(occurred_at,id)` descending. The cursor is
@@ -7105,7 +7107,7 @@ receipts are progressively disclosed.
 
 The first judgment never equates structural `traffic_ready` with momentary
 routability. It labels the former `readiness.traffic_ready|traffic_not_ready`,
-then immediately renders `현재 요청 가능 모델 <currently_available_profiles>/7`
+then immediately renders `현재 요청 가능 모델 <currently_available_profiles>/8`
 with `availability.some|none`. A structurally ready installation with every key
 cooling, capacity-bound, or manually disabled therefore says “검증 완료” and
 “현재 요청 가능한 모델이 없습니다” together, never `API 사용 가능`. Public
@@ -9053,3 +9055,15 @@ checks, compromised-hold journal/receipts, secret-free admin-token handoff
 receipt, `codex-lb` before/after health, and Hermes task/tool evidence. It contains
 no bearer, plaintext key/token, ciphertext, nonce, media, prompt, raw provider
 body, query, secret path content, HAR, trace, or authenticated video.
+
+### 15.1 Release-recovery timing and capacity invariants
+
+The release checker is fail-closed and uses one stable runtime lock. There is
+**No intermediate cap value**: a forward recovery either commits the complete
+requested capacity tuple or leaves intake withdrawn. **Permanent evidence blockers never enter this path**, and the recovery decision is **independent of eligible-key readiness**. The checker covers an **empty first-run** and is a
+**target-image-independent host checker**; it never relies on a
+**legacy-overview fallback**.
+
+The first host health sample has a **two-second absolute deadline**. The second exact sample 30 seconds later must agree with the same
+container generation before operational evidence is accepted. This timing
+contract applies to the Rust image as well as the retained QA surface.

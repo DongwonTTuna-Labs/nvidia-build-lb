@@ -92,10 +92,12 @@ done
 make build-candidate EVIDENCE_DIR="$BUILD_EVIDENCE"
 APP_IMAGE_ID="$(jq -er .image_digest "$BUILD_EVIDENCE/candidate.json")"
 POSTGRES_IMAGE_ID="$(jq -er .postgres_image_digest "$BUILD_EVIDENCE/candidate.json")"
+FIXTURE_IMAGE_ID="$(jq -er .fixture_image_digest "$BUILD_EVIDENCE/candidate.json")"
 SOURCE_MANIFEST="$BUILD_EVIDENCE/source-manifest.json"
 
 set +e
 IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" \
+  FIXTURE_IMAGE_DIGEST="$FIXTURE_IMAGE_ID" \
   SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR="$BROWSER_EVIDENCE" \
   scripts/qa/test-browser-prod.sh
 BROWSER_FRESH_STATUS=$?
@@ -130,12 +132,14 @@ uv run python scripts/qa/record_visual_review.py \
   --verdict lgtm
 
 IMAGE_DIGEST="$APP_IMAGE_ID" POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" \
+  FIXTURE_IMAGE_DIGEST="$FIXTURE_IMAGE_ID" \
   SOURCE_MANIFEST="$SOURCE_MANIFEST" EVIDENCE_DIR="$BROWSER_EVIDENCE" \
   scripts/qa/test-browser-prod.sh
 jq -e '.status == "PASS" and .visual_reviews.pass_a and .visual_reviews.pass_b' \
   "$BROWSER_EVIDENCE/candidate.json" >/dev/null
 make verify-local IMAGE_DIGEST="$APP_IMAGE_ID" \
-  POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" \
+  POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" FIXTURE_IMAGE_DIGEST="$FIXTURE_IMAGE_ID" \
+  SOURCE_MANIFEST="$SOURCE_MANIFEST" \
   EVIDENCE_DIR="$VERIFY_EVIDENCE"
 make scan-release IMAGE_DIGEST="$APP_IMAGE_ID" \
   POSTGRES_IMAGE_DIGEST="$POSTGRES_IMAGE_ID" SOURCE_MANIFEST="$SOURCE_MANIFEST" \
