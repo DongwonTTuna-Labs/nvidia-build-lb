@@ -8,6 +8,7 @@ use actix_web::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::{Bytes, BytesMut};
 use chrono::{Duration, Utc};
 use futures_util::{Stream, StreamExt, stream};
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env,
     pin::Pin,
     sync::{
@@ -365,6 +366,16 @@ impl VaultStore {
         let Some(pool) = &self.database else {
             return Ok(());
         };
+        let profile = sqlx::query_scalar::<_, String>(
+            "SELECT profile_id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$3 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(request_id)
+        .bind(key_id)
+        .bind(self.owner_id)
+        .fetch_optional(pool)
+        .await
+        .context("load request profile")?
+        .ok_or_else(|| anyhow!("request attempt terminal row is missing"))?;
         let result = sqlx::query(
             "UPDATE nblb.request_attempts SET outcome=$3, finished_at=now() WHERE id = (SELECT id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$4 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1)",
         )
@@ -378,6 +389,31 @@ impl VaultStore {
         if result.rows_affected() != 1 {
             bail!("request attempt terminal row is missing")
         }
+        if outcome == "succeeded" {
+            sqlx::query(
+                "INSERT INTO nblb.profile_probe_receipts (profile_id, key_id) VALUES ($1, $2) ON CONFLICT (profile_id, key_id) DO UPDATE SET verified_at=now()",
+            )
+            .bind(profile)
+            .bind(key_id)
+            .execute(pool)
+            .await
+            .context("persist profile provider receipt")?;
+        }
+        Ok(())
+    }
+
+    async fn record_profile_proof(&self, profile: &str, key_id: Uuid) -> Result<()> {
+        let Some(pool) = &self.database else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO nblb.profile_probe_receipts (profile_id, key_id) VALUES ($1, $2) ON CONFLICT (profile_id, key_id) DO UPDATE SET verified_at=now()",
+        )
+        .bind(profile)
+        .bind(key_id)
+        .execute(pool)
+        .await
+        .context("persist profile provider receipt")?;
         Ok(())
     }
 
@@ -1348,6 +1384,28 @@ async fn operator_readiness(req: HttpRequest, state: web::Data<AppState>) -> imp
         }))
 }
 
+/// Returns the durable profile/key provider receipts.  A successful key-level
+/// probe alone must never make every modality appear ready.
+async fn profile_proof_keys(state: &AppState) -> Result<HashMap<String, HashSet<Uuid>>> {
+    let Some(pool) = &state.vault.database else {
+        return Ok(HashMap::new());
+    };
+    let rows = sqlx::query_as::<_, (String, Uuid)>(
+        "SELECT profile_id, key_id FROM nblb.profile_probe_receipts",
+    )
+    .fetch_all(pool)
+    .await
+    .context("load profile provider receipts")?;
+    let mut proofs = HashMap::new();
+    for (profile, key_id) in rows {
+        proofs
+            .entry(profile)
+            .or_insert_with(HashSet::new)
+            .insert(key_id);
+    }
+    Ok(proofs)
+}
+
 async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if let Some(response) = public_guard_response(&req) {
         return response;
@@ -1355,8 +1413,30 @@ async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl Responder 
     if let Err(response) = authorize_scope(&req, &state, "models:read").await {
         return response;
     }
+    let keys = state.vault.list();
+    let eligible = keys
+        .iter()
+        .filter(|key| {
+            key.enabled
+                && key.verified
+                && key.cooldown_until.is_none_or(|until| until <= Utc::now())
+        })
+        .map(|key| key.id)
+        .collect::<HashSet<_>>();
+    let proofs = match profile_proof_keys(&state).await {
+        Ok(proofs) => proofs,
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error":{"code":"capability_state_unavailable"}}));
+        }
+    };
     let data: Vec<Value> = PROFILES
         .iter()
+        .filter(|id| {
+            proofs
+                .get(**id)
+                .is_some_and(|key_ids| key_ids.iter().any(|key_id| eligible.contains(key_id)))
+        })
         .map(|id| json!({"id": id, "object": "model", "owned_by": "nvidia", "created": 1784332800}))
         .collect();
     HttpResponse::Ok().json(json!({"object":"list","data":data}))
@@ -1459,24 +1539,34 @@ struct PageQuery {
     limit: Option<u16>,
 }
 
-fn page_before(query: &PageQuery) -> Result<Option<chrono::DateTime<Utc>>, HttpResponse> {
-    query
-        .before
-        .as_deref()
-        .map(|value| {
-            chrono::DateTime::parse_from_rfc3339(value)
-                .map(|parsed| parsed.with_timezone(&Utc))
-                .map_err(|_| {
-                    HttpResponse::BadRequest().json(json!({
-                        "error": {"code": "invalid_page_cursor", "message": "before must be an RFC3339 timestamp"}
-                    }))
-                })
+#[derive(Debug, Deserialize, Serialize)]
+struct PageCursor {
+    created_at: chrono::DateTime<Utc>,
+    id: Uuid,
+}
+
+fn encode_page_cursor(cursor: &PageCursor) -> Result<String> {
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(cursor)?))
+}
+
+fn page_before(query: &PageQuery) -> Result<Option<PageCursor>, HttpResponse> {
+    query.before.as_deref().map(|value| {
+        let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
+            HttpResponse::BadRequest().json(json!({
+                "error": {"code": "invalid_page_cursor", "message": "before is not a valid page cursor"}
+            }))
+        })?;
+        serde_json::from_slice(&decoded).map_err(|_| {
+            HttpResponse::BadRequest().json(json!({
+                "error": {"code": "invalid_page_cursor", "message": "before is not a valid page cursor"}
+            }))
         })
-        .transpose()
+    }).transpose()
 }
 
 fn admin_snapshot() -> Value {
-    json!({"observed_at": Utc::now(), "generation": "0"})
+    let observed_at = Utc::now();
+    json!({"observed_at": observed_at, "generation": observed_at.to_rfc3339()})
 }
 
 async fn upstream_slots(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
@@ -1484,6 +1574,13 @@ async fn upstream_slots(req: HttpRequest, state: web::Data<AppState>) -> impl Re
         return admin_unauthorized();
     }
     let keys = state.vault.list();
+    let proofs = match profile_proof_keys(&state).await {
+        Ok(proofs) => proofs,
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error":{"code":"capability_state_unavailable"}}));
+        }
+    };
     let slots = keys
         .iter()
         .enumerate()
@@ -1497,12 +1594,15 @@ async fn upstream_slots(req: HttpRequest, state: web::Data<AppState>) -> impl Re
                 "request_count": key.request_count,
                 "failure_count": key.failure_count,
                 "cooldown_until": key.cooldown_until,
-                "profiles": PROFILES.iter().map(|profile| json!({
-                    "profile_id": profile,
-                    "proof_revision": "0",
-                    "eligible_now": eligible,
-                    "reason": if eligible { Value::Null } else if !key.verified { json!("missing_proof") } else if key.cooldown_until.is_some() { json!("cooldown") } else { json!("manual_disabled") }
-                })).collect::<Vec<_>>()
+                "profiles": PROFILES.iter().map(|profile| {
+                    let proof = proofs.get(*profile).is_some_and(|key_ids| key_ids.contains(&key.id));
+                    json!({
+                        "profile_id": profile,
+                        "proof_revision": if proof { "durable" } else { "missing" },
+                        "eligible_now": eligible && proof,
+                        "reason": if !eligible { if !key.verified { json!("missing_key_probe") } else if key.cooldown_until.is_some() { json!("cooldown") } else { json!("manual_disabled") } } else if !proof { json!("missing_profile_proof") } else { Value::Null }
+                    })
+                }).collect::<Vec<_>>()
             })
         })
         .collect::<Vec<_>>();
@@ -1515,31 +1615,57 @@ async fn model_capabilities(req: HttpRequest, state: web::Data<AppState>) -> imp
     if !authorized(&req, &state) {
         return admin_unauthorized();
     }
-    // Credential readiness is not provider/model proof.  Until a profile has
-    // a durable successful provider receipt, advertise its route but keep
-    // `available_now` false so the admin surface cannot promise unsupported
-    // modalities merely because two encrypted credentials are eligible.
-    let pair_ready =
-        eligible_key_count(&state.vault.list()) == nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
-    let models = PROFILES.iter().map(|profile| {
-        let route = match *profile {
-            "z-ai/glm-5.2" | "microsoft/phi-4-multimodal-instruct" | "nvidia/vila" => "/v1/chat/completions",
-            "nvidia/nvclip" => "/v1/embeddings",
-            "black-forest-labs/flux.1-kontext-dev" => "/v1/images/generations",
-            "stabilityai/stable-video-diffusion" => "/v1/videos/generations",
-            "nvidia/magpie-tts-multilingual" => "/v1/audio/speech",
-            "nvidia/parakeet-ctc-1.1b" => "/v1/audio/transcriptions",
-            _ => "/v1/nvidia/inference",
-        };
-        json!({
-            "id":profile,
-            "route":route,
-            "advertised":true,
-            "available_now":false,
-            "proof_status": if pair_ready { "provider_proof_required" } else { "pair_not_ready" },
-            "modalities":model_modalities(profile)
+    let keys = state.vault.list();
+    let eligible = keys
+        .iter()
+        .filter(|key| {
+            key.enabled
+                && key.verified
+                && key.cooldown_until.is_none_or(|until| until <= Utc::now())
         })
-    }).collect::<Vec<_>>();
+        .map(|key| key.id)
+        .collect::<HashSet<_>>();
+    let proofs = match profile_proof_keys(&state).await {
+        Ok(proofs) => proofs,
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error":{"code":"capability_state_unavailable"}}));
+        }
+    };
+    let models = PROFILES
+        .iter()
+        .map(|profile| {
+            let route = match *profile {
+                "z-ai/glm-5.2" | "microsoft/phi-4-multimodal-instruct" | "nvidia/vila" => {
+                    "/v1/chat/completions"
+                }
+                "nvidia/nvclip" => "/v1/embeddings",
+                "black-forest-labs/flux.1-kontext-dev" => "/v1/images/generations",
+                "stabilityai/stable-video-diffusion" => "/v1/videos/generations",
+                "nvidia/magpie-tts-multilingual" => "/v1/audio/speech",
+                "nvidia/parakeet-ctc-1.1b" => "/v1/audio/transcriptions",
+                _ => "/v1/nvidia/inference",
+            };
+            let available_now = proofs
+                .get(*profile)
+                .is_some_and(|key_ids| key_ids.iter().any(|key_id| eligible.contains(key_id)));
+            let proof_status = if available_now {
+                "provider_proof_verified"
+            } else if eligible.is_empty() {
+                "pair_not_ready"
+            } else {
+                "provider_proof_required"
+            };
+            json!({
+                "id":profile,
+                "route":route,
+                "advertised":true,
+                "available_now":available_now,
+                "proof_status":proof_status,
+                "modalities":model_modalities(profile)
+            })
+        })
+        .collect::<Vec<_>>();
     HttpResponse::Ok()
         .insert_header(("cache-control", "no-store"))
         .json(json!({"snapshot":admin_snapshot(),"models":models}))
@@ -1567,9 +1693,34 @@ async fn generation_readiness(req: HttpRequest, state: web::Data<AppState>) -> i
     let configured = keys.len();
     let verified = keys.iter().filter(|key| key.verified).count();
     let eligible = eligible_key_count(&keys);
+    let proofs = match profile_proof_keys(&state).await {
+        Ok(proofs) => proofs,
+        Err(_) => {
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({"error":{"code":"capability_state_unavailable"}}));
+        }
+    };
+    let eligible_ids = keys
+        .iter()
+        .filter(|key| {
+            key.enabled
+                && key.verified
+                && key.cooldown_until.is_none_or(|until| until <= Utc::now())
+        })
+        .map(|key| key.id)
+        .collect::<HashSet<_>>();
+    let available_profiles = PROFILES
+        .iter()
+        .filter(|profile| {
+            proofs
+                .get(**profile)
+                .is_some_and(|key_ids| key_ids.iter().any(|key_id| eligible_ids.contains(key_id)))
+        })
+        .count();
     let ready = configured == nvidia_build_lb_core::MAX_UPSTREAM_KEYS
         && verified == nvidia_build_lb_core::MAX_UPSTREAM_KEYS
-        && eligible == nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
+        && eligible == nvidia_build_lb_core::MAX_UPSTREAM_KEYS
+        && available_profiles == PROFILES.len();
     let reasons = if ready {
         Vec::new()
     } else {
@@ -1583,10 +1734,13 @@ async fn generation_readiness(req: HttpRequest, state: web::Data<AppState>) -> i
         if eligible < nvidia_build_lb_core::MAX_UPSTREAM_KEYS {
             reasons.push("slot_unavailable");
         }
+        if available_profiles < PROFILES.len() {
+            reasons.push("provider_proof_required");
+        }
         reasons
     };
     HttpResponse::Ok().insert_header(("cache-control", "no-store")).json(json!({
-        "snapshot":admin_snapshot(),"ready":ready,"configured_slots":configured,"verified_slots":verified,"eligible_slots":eligible,"advertised_profiles":PROFILES.len(),"available_profiles":0,"reasons":reasons
+        "snapshot":admin_snapshot(),"ready":ready,"configured_slots":configured,"verified_slots":verified,"eligible_slots":eligible,"advertised_profiles":PROFILES.len(),"available_profiles":available_profiles,"reasons":reasons
     }))
 }
 
@@ -1610,8 +1764,8 @@ async fn operations(
     };
     let attempts = match before {
         Some(before) => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)>(
-            "SELECT id, request_id, profile_id, key_id, outcome, created_at, finished_at FROM nblb.request_attempts WHERE created_at < $1 ORDER BY created_at DESC, id DESC LIMIT $2"
-        ).bind(before).bind(limit).fetch_all(pool).await,
+            "SELECT id, request_id, profile_id, key_id, outcome, created_at, finished_at FROM nblb.request_attempts WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT $3"
+        ).bind(before.created_at).bind(before.id).bind(limit).fetch_all(pool).await,
         None => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>)>(
             "SELECT id, request_id, profile_id, key_id, outcome, created_at, finished_at FROM nblb.request_attempts ORDER BY created_at DESC, id DESC LIMIT $1"
         ).bind(limit).fetch_all(pool).await,
@@ -1624,9 +1778,17 @@ async fn operations(
                 .json(json!({"error":{"code":"operations_unavailable"}}));
         }
     };
-    let next_before = (attempts.len() as i64 == limit)
-        .then(|| attempts.last().map(|attempt| attempt.5.to_rfc3339()))
-        .flatten();
+    let next_before = if attempts.len() as i64 == limit {
+        attempts.last().and_then(|attempt| {
+            encode_page_cursor(&PageCursor {
+                created_at: attempt.5,
+                id: attempt.0,
+            })
+            .ok()
+        })
+    } else {
+        None
+    };
     let rows = attempts
         .into_iter()
         .map(|(id, request_id, profile_id, key_id, outcome, created_at, finished_at)| {
@@ -1692,8 +1854,8 @@ async fn events(
     };
     let attempts = match before {
         Some(before) => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>)>(
-            "SELECT id, request_id, profile_id, key_id, outcome, created_at FROM nblb.request_attempts WHERE created_at < $1 ORDER BY created_at DESC, id DESC LIMIT $2"
-        ).bind(before).bind(limit).fetch_all(pool).await,
+            "SELECT id, request_id, profile_id, key_id, outcome, created_at FROM nblb.request_attempts WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT $3"
+        ).bind(before.created_at).bind(before.id).bind(limit).fetch_all(pool).await,
         None => sqlx::query_as::<_, (Uuid, Uuid, String, Uuid, String, chrono::DateTime<Utc>)>(
             "SELECT id, request_id, profile_id, key_id, outcome, created_at FROM nblb.request_attempts ORDER BY created_at DESC, id DESC LIMIT $1"
         ).bind(limit).fetch_all(pool).await,
@@ -1706,9 +1868,17 @@ async fn events(
                 .json(json!({"error":{"code":"events_unavailable"}}));
         }
     };
-    let next_before = (attempts.len() as i64 == limit)
-        .then(|| attempts.last().map(|attempt| attempt.5.to_rfc3339()))
-        .flatten();
+    let next_before = if attempts.len() as i64 == limit {
+        attempts.last().and_then(|attempt| {
+            encode_page_cursor(&PageCursor {
+                created_at: attempt.5,
+                id: attempt.0,
+            })
+            .ok()
+        })
+    } else {
+        None
+    };
     let rows = attempts
         .into_iter()
         .map(|(id, request_id, profile_id, key_id, outcome, created_at)| {
@@ -1815,6 +1985,22 @@ async fn disable_key_alias(
 /// Verifies one stored credential without changing its routing state.  The
 /// response is deliberately reduced to a status class; provider bodies and
 /// credential material never cross the admin boundary.
+async fn record_probe_receipt(
+    state: &web::Data<AppState>,
+    key_id: Uuid,
+) -> Result<(), HttpResponse> {
+    state
+        .vault
+        .record_profile_proof("z-ai/glm-5.2", key_id)
+        .await
+        .map_err(|_| {
+            HttpResponse::ServiceUnavailable().json(json!({
+                "probe_status": "unavailable",
+                "error": {"code": "probe_persistence_failed"}
+            }))
+        })
+}
+
 async fn probe_key(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -1838,7 +2024,10 @@ async fn probe_key(
             }));
         }
         return match state.vault.mutate(|vault| vault.mark_verified(id)).await {
-            Ok(_) => HttpResponse::Ok().json(json!({"probe_status":"valid","status":200})),
+            Ok(_) => match record_probe_receipt(&state, id).await {
+                Ok(()) => HttpResponse::Ok().json(json!({"probe_status":"valid","status":200})),
+                Err(response) => response,
+            },
             Err(_) => HttpResponse::ServiceUnavailable().json(
                 json!({"probe_status":"unavailable","error":{"code":"probe_persistence_failed"}}),
             ),
@@ -1910,7 +2099,12 @@ async fn probe_key(
         }));
     }
     match state.vault.mutate(|vault| vault.mark_verified(id)).await {
-        Ok(_) => HttpResponse::Ok().json(json!({"probe_status":"valid","status":status.as_u16()})),
+        Ok(_) => match record_probe_receipt(&state, id).await {
+            Ok(()) => {
+                HttpResponse::Ok().json(json!({"probe_status":"valid","status":status.as_u16()}))
+            }
+            Err(response) => response,
+        },
         Err(_) => HttpResponse::ServiceUnavailable().json(
             json!({"probe_status":"unavailable","error":{"code":"probe_persistence_failed"}}),
         ),
@@ -4671,9 +4865,9 @@ async fn attempt_finished(
 #[cfg(test)]
 mod tests {
     use super::{
-        PageQuery, SseValidator, admin_host_allowed, bearer, eligible_key_count,
-        format_origin_host, host_authority_well_formed, inline_script_bodies, page_before,
-        parse_multimodal_request, percent_encode_userinfo, should_migrate_file_vault,
+        PageCursor, PageQuery, SseValidator, admin_host_allowed, bearer, eligible_key_count,
+        encode_page_cursor, format_origin_host, host_authority_well_formed, inline_script_bodies,
+        page_before, parse_multimodal_request, percent_encode_userinfo, should_migrate_file_vault,
         upstream_endpoint, upstream_endpoint_for, validate_admin_token, validate_chat_request,
         validate_chat_response,
     };
@@ -4686,17 +4880,22 @@ mod tests {
 
     #[test]
     fn page_cursor_is_explicit_and_fail_closed() {
+        let id = Uuid::new_v4();
         let query = PageQuery {
-            before: Some("2026-07-19T12:34:56Z".to_owned()),
+            before: Some(
+                encode_page_cursor(&PageCursor {
+                    created_at: "2026-07-19T12:34:56Z".parse().expect("timestamp"),
+                    id,
+                })
+                .expect("encode cursor"),
+            ),
             limit: Some(10),
         };
-        assert_eq!(
-            page_before(&query)
-                .expect("valid cursor")
-                .expect("cursor value")
-                .to_rfc3339(),
-            "2026-07-19T12:34:56+00:00"
-        );
+        let parsed = page_before(&query)
+            .expect("valid cursor")
+            .expect("cursor value");
+        assert_eq!(parsed.created_at.to_rfc3339(), "2026-07-19T12:34:56+00:00");
+        assert_eq!(parsed.id, id);
         let invalid = PageQuery {
             before: Some("not-a-timestamp".to_owned()),
             limit: None,
