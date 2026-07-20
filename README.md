@@ -13,7 +13,9 @@ load balancer입니다. PostgreSQL(SQLx migration)이 운영 상태의 권위 �
   `main.rs`는 bootstrap/공통 경계, `admin.rs`는 운영 API, `proxy.rs`는
   OpenAI·멀티모달 orchestration, `provider.rs`는 endpoint/response contract,
   `streaming.rs`는 SSE·바이너리 검증을 담당합니다.
-- `apps/admin`: 접근성·반응형 SvelteKit 관리자 UI (`/admin`)
+- `apps/public`: 인증 없이 aggregate health와 지원 API를 보여주는 공개 SvelteKit
+  상태 대시보드 (`/`)
+- `apps/admin`: 접근성·반응형 SvelteKit 관리자 UI (`/admin`, loopback 전용)
 - `migrations/sqlx`: SQLx 단일 migration 원본
 - `compose.yml`: PostgreSQL + migration + gateway 독립 스택
 
@@ -59,4 +61,6 @@ Magpie TTS의 NVCF invocation endpoint를 교체해야 하는 배포는
 ## 관리자 UI 보안
 
 Svelte static HTML의 inline bootstrap hash를 Rust가 기동 시 계산해 CSP
-`script-src`에 추가합니다. 운영 관리자 화면은 `/admin` 한 경로로 제공합니다.
+`script-src`에 추가합니다. 공개 운영 상태는 `/`에서 제공하고, 운영 관리자 화면은
+`/admin` 한 경로로 loopback에서만 제공합니다. 공개 대시보드는 upstream key,
+credential, request evidence를 읽지 않습니다.

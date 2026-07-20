@@ -6,6 +6,13 @@ RUN bun install --cwd apps/admin --frozen-lockfile --ignore-scripts --no-progres
 COPY apps/admin ./apps/admin
 RUN bun run --cwd apps/admin build
 
+FROM oven/bun:1.3.14@sha256:50317d83cd5a5ae1d8b35b3379c69f57ce1a0dbf4def91f0965653d767851834 AS public-dashboard
+WORKDIR /src
+COPY apps/public/package.json apps/public/bun.lock ./apps/public/
+RUN bun install --cwd apps/public --frozen-lockfile --ignore-scripts --no-progress
+COPY apps/public ./apps/public
+RUN bun run --cwd apps/public build
+
 FROM rust:1.96-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
@@ -26,6 +33,7 @@ COPY --from=build /src/target/release/nblb-prestart /usr/local/bin/nblb-prestart
 COPY --from=build /src/target/release/nblb-healthcheck /usr/local/bin/nblb-healthcheck
 COPY migrations/sqlx /app/migrations/sqlx
 COPY --from=admin /src/apps/admin/build /app/static
+COPY --from=public-dashboard /src/apps/public/build /app/public
 RUN chmod 0555 /usr/local/bin/nblb-prestart /usr/local/bin/nblb-healthcheck
 WORKDIR /app
 ENV NVIDIA_BUILD_LB_PUBLIC_PORT=2456 NVIDIA_BUILD_LB_STAGE=production

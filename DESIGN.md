@@ -5,12 +5,13 @@ Svelte/TypeScript로만 유지하며, 폐기된 레거시 계약을 복구하지
 
 ## 사용자 여정
 
-1. `/admin`에서 현재 readiness와 다음 조치를 한 화면에서 확인한다.
-2. upstream 키를 한 번만 입력하고, 저장·probe·enable 순서가 명시적으로 보인다.
-3. `/v1/models`에서 제공 가능한 profile과 modality를 확인한다.
-4. OpenAI 호환 chat/streaming 및 embeddings·images·videos·audio 요청은 downstream
+1. `/`에서 공개 상태·지원 API·운영 경계를 한눈에 확인한다.
+2. `/admin`에서 현재 readiness와 다음 조치를 한 화면에서 확인한다.
+3. upstream 키를 한 번만 입력하고, 저장·probe·enable 순서가 명시적으로 보인다.
+4. `/v1/models`에서 제공 가능한 profile과 modality를 확인한다.
+5. OpenAI 호환 chat/streaming 및 embeddings·images·videos·audio 요청은 downstream
    scope와 profile compatibility를 검증한 후 두 키에 공정하게 분산한다.
-5. 실패 시 민감한 본문/키는 노출하지 않고 cooldown·failover·재시도 결과만 evidence로
+6. 실패 시 민감한 본문/키는 노출하지 않고 cooldown·failover·재시도 결과만 evidence로
    남긴다.
 
 ## 경계와 권위
@@ -30,7 +31,9 @@ Svelte/TypeScript로만 유지하며, 폐기된 레거시 계약을 복구하지
 
 정보 우선순위는 `지금 상태 → 막힌 이유 → 다음 조치 → 상세 evidence` 순서다.
 모든 상태는 텍스트와 색 대비를 함께 제공하고, 키 plaintext는 발급 응답 한 번에서만
-보인다. SvelteKit generated JS는 브라우저 실행 artifact이며 소스 계약이 아니다.
+보인다. 공개 `/` 대시보드는 health aggregate만 읽고 operator credential이나
+upstream 식별자를 요청하지 않는다. `/admin` static artifact와 API는 loopback host
+경계 뒤에 둔다. SvelteKit generated JS는 브라우저 실행 artifact이며 소스 계약이 아니다.
 
 ## 검증 계약
 

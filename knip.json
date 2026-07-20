@@ -17,6 +17,16 @@
         "src/lib/**/*.ts"
       ],
       "project": ["src/**/*.{ts,svelte}", "*.config.ts"]
+    },
+    "apps/public": {
+      "sveltekit": "svelte.config.ts",
+      "entry": [
+        "svelte.config.ts",
+        "vite.config.ts",
+        "src/routes/**/*.svelte",
+        "src/routes/**/*.ts"
+      ],
+      "project": ["src/**/*.{ts,svelte}", "*.config.ts"]
     }
   }
 }
