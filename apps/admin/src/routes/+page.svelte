@@ -311,9 +311,10 @@ async function refresh() {
     const health = (await healthResponse.json().catch(() => ({}))) as {
       ready?: boolean;
       traffic_ready?: boolean;
+      pair_ready?: boolean;
       eligible_keys?: number;
     };
-    const healthReady = health.ready === true;
+    const healthPairReady = health.pair_ready === true;
     const healthTrafficReady = health.traffic_ready === true;
     const healthEligibleKeys = Number.isInteger(health.eligible_keys)
       ? Number(health.eligible_keys)
@@ -341,7 +342,7 @@ async function refresh() {
       snapshot_observed_at?: string;
     };
     if (epoch !== refreshEpoch || currentAuthEpoch !== authEpoch) return;
-    structuralReady = healthReady;
+    structuralReady = healthPairReady;
     trafficReady = healthTrafficReady;
     eligibleKeys = healthEligibleKeys;
     keys = Array.isArray(snapshot.upstream_keys?.items)
@@ -362,7 +363,7 @@ async function refresh() {
     lastOperation = snapshot.snapshot_observed_at
       ? formatDateTime(snapshot.snapshot_observed_at)
       : updatedAt;
-    structuralReady = healthReady && snapshot.runtime?.ready === true;
+    structuralReady = healthPairReady && snapshot.runtime?.ready === true;
     trafficReady = healthTrafficReady && snapshot.runtime?.traffic_ready === true;
     eligibleKeys = Math.min(
       healthEligibleKeys,

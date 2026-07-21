@@ -3,12 +3,14 @@
 
 mod admin;
 mod errors;
+mod health;
 mod provider;
 mod proxy;
+mod request_id;
 mod streaming;
 #[cfg(test)]
 mod tests;
-pub(crate) use errors::invalid_request;
+pub(crate) use errors::{invalid_request, openai_error, operations_error};
 pub(crate) use provider::{
     prepare_modality_request, upstream_endpoint_for, validate_chat_response,
 };
@@ -19,7 +21,9 @@ pub(crate) use streaming::{
 
 use actix_files::Files;
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, guard, http::header, middleware::DefaultHeaders,
+    App, HttpRequest, HttpResponse, HttpServer, guard,
+    http::{StatusCode, header},
+    middleware::{DefaultHeaders, from_fn},
     web,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -30,7 +34,7 @@ use futures_util::stream;
 use nvidia_build_lb_core::{
     DownstreamSummary, PROFILES, Router, Vault, VaultDownstreamRecord, VaultKeyRecord,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use std::{
@@ -881,14 +885,6 @@ struct DownstreamInput {
     scopes: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct Health {
-    status: &'static str,
-    ready: bool,
-    traffic_ready: bool,
-    eligible_keys: usize,
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // The container listener is an internal contract.  The published host
@@ -927,6 +923,8 @@ async fn main() -> std::io::Result<()> {
     spawn_database_watchdog(state.clone());
     HttpServer::new(move || {
         App::new()
+            .wrap(from_fn(request_id::assign_request_id))
+            .wrap(from_fn(request_id::enforce_admin_boundary))
             .wrap(
                 DefaultHeaders::new()
                     .add((header::CACHE_CONTROL, "no-store"))
@@ -980,7 +978,9 @@ fn spawn_database_watchdog(state: web::Data<AppState>) {
 }
 
 fn routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/health", web::get().to(admin::health))
+    cfg.route("/health/live", web::get().to(health::liveness))
+        .route("/health/ready", web::get().to(health::readiness))
+        .route("/health", web::get().to(health::readiness))
         .route(
             "/admin/api/v1/operator-readiness",
             web::get().to(admin::operator_readiness),
@@ -1329,19 +1329,25 @@ fn public_guard_response(req: &HttpRequest) -> Option<HttpResponse> {
     let mut hosts = req.headers().get_all(header::HOST);
     let raw_host = hosts.next().and_then(|value| value.to_str().ok());
     if hosts.next().is_some() {
-        return Some(HttpResponse::Forbidden().json(json!({
-            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
-        })));
+        return Some(guard_error(
+            req,
+            "host_forbidden",
+            "The request host is not allowed.",
+        ));
     }
     let Some(raw_host) = raw_host else {
-        return Some(HttpResponse::Forbidden().json(json!({
-            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
-        })));
+        return Some(guard_error(
+            req,
+            "host_forbidden",
+            "The request host is not allowed.",
+        ));
     };
     if raw_host.contains(',') || raw_host.is_empty() || !host_authority_well_formed(raw_host) {
-        return Some(HttpResponse::Forbidden().json(json!({
-            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
-        })));
+        return Some(guard_error(
+            req,
+            "host_forbidden",
+            "The request host is not allowed.",
+        ));
     }
     let (host, port) = parse_host_authority(raw_host);
     let local = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
@@ -1353,16 +1359,28 @@ fn public_guard_response(req: &HttpRequest) -> Option<HttpResponse> {
     let authority_ok =
         (local && port == Some(local_port)) || (public && port.is_none_or(|value| value == 443));
     if !authority_ok {
-        return Some(HttpResponse::Forbidden().json(json!({
-            "error": {"message": "The request host is not allowed.", "type": "permission_error", "code": "host_forbidden"}
-        })));
+        return Some(guard_error(
+            req,
+            "host_forbidden",
+            "The request host is not allowed.",
+        ));
     }
     if req.headers().contains_key(header::ORIGIN) {
-        return Some(HttpResponse::Forbidden().json(json!({
-            "error": {"message": "Cross-origin requests are not allowed.", "type": "permission_error", "code": "origin_forbidden"}
-        })));
+        return Some(guard_error(
+            req,
+            "origin_forbidden",
+            "Cross-origin requests are not allowed.",
+        ));
     }
     None
+}
+
+fn guard_error(req: &HttpRequest, code: &str, message: &str) -> HttpResponse {
+    if req.path().starts_with("/v1/") {
+        openai_error(StatusCode::FORBIDDEN, message, "permission_error", code)
+    } else {
+        operations_error(req, StatusCode::FORBIDDEN, code, message, false, None)
+    }
 }
 
 async fn poll_nvcf(
@@ -1632,9 +1650,12 @@ async fn authorize_scope(
         Err(error) if error.to_string() == "invalid downstream credential" => {
             Err(downstream_unauthorized())
         }
-        Err(_) => Err(HttpResponse::ServiceUnavailable().json(json!({
-            "error": {"code": "credential_store_unavailable", "message": "Credential store is temporarily unavailable."}
-        }))),
+        Err(_) => Err(openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Credential store is temporarily unavailable.",
+            "service_unavailable_error",
+            "credential_store_unavailable",
+        )),
     }
 }
 
@@ -1646,6 +1667,10 @@ fn authorized(req: &HttpRequest, state: &AppState) -> bool {
 }
 
 fn admin_surface_allowed(req: &HttpRequest, state: &AppState) -> bool {
+    admin_surface_allowed_for_port(req, state.public_port)
+}
+
+fn admin_surface_allowed_for_port(req: &HttpRequest, public_port: u16) -> bool {
     let mut hosts = req.headers().get_all(header::HOST);
     let Some(raw_host) = hosts.next().and_then(|value| value.to_str().ok()) else {
         return false;
@@ -1658,8 +1683,8 @@ fn admin_surface_allowed(req: &HttpRequest, state: &AppState) -> bool {
     }
     let (host, port) = parse_host_authority(raw_host);
     if !admin_host_allowed(&host)
-        || port.is_some_and(|port| port != state.public_port)
-        || port.is_none() && state.public_port != 80 && state.public_port != 443
+        || port.is_some_and(|port| port != public_port)
+        || port.is_none() && public_port != 80 && public_port != 443
     {
         return false;
     }
@@ -1670,10 +1695,10 @@ fn admin_surface_allowed(req: &HttpRequest, state: &AppState) -> bool {
         return false;
     };
     let origin_host = format_origin_host(&host);
-    origin == format!("https://{origin_host}:{}", state.public_port)
-        || origin == format!("http://{origin_host}:{}", state.public_port)
-        || (state.public_port == 80 && origin == format!("http://{origin_host}"))
-        || (state.public_port == 443 && origin == format!("https://{origin_host}"))
+    origin == format!("https://{origin_host}:{public_port}")
+        || origin == format!("http://{origin_host}:{public_port}")
+        || (public_port == 80 && origin == format!("http://{origin_host}"))
+        || (public_port == 443 && origin == format!("https://{origin_host}"))
 }
 
 fn parse_host_authority(raw: &str) -> (String, Option<u16>) {
@@ -1761,18 +1786,50 @@ fn bearer(req: &HttpRequest) -> Option<&str> {
     }
     value.to_str().ok().and_then(|v| v.strip_prefix("Bearer "))
 }
-fn admin_unauthorized() -> HttpResponse {
+fn admin_unauthorized(_req: &HttpRequest) -> HttpResponse {
+    // v1 is a compatibility adapter. Keep its exact body/status while the
+    // request-ID middleware adds correlation in the response header. New v2
+    // handlers use `operations_error` for the canonical operations envelope.
     HttpResponse::Unauthorized()
-        .insert_header(("www-authenticate", "Bearer realm=\"nvidia-build-lb-admin\""))
-        .json(json!({"error":{"code":"invalid_admin_token","message":"Invalid admin token."}}))
+        .insert_header((
+            header::WWW_AUTHENTICATE,
+            "Bearer realm=\"nvidia-build-lb-admin\"",
+        ))
+        .json(json!({
+            "error": {
+                "code": "invalid_admin_token",
+                "message": "Invalid admin token."
+            }
+        }))
 }
 fn downstream_unauthorized() -> HttpResponse {
-    HttpResponse::Unauthorized().insert_header(("www-authenticate", "Bearer realm=\"nvidia-build-lb\"")).json(json!({"error":{"code":"invalid_downstream_token","message":"Invalid downstream credential or scope."}}))
+    let mut response = openai_error(
+        StatusCode::UNAUTHORIZED,
+        "Invalid downstream credential or scope.",
+        "authentication_error",
+        "invalid_downstream_token",
+    );
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static("Bearer realm=\"nvidia-build-lb\""),
+    );
+    response
 }
 fn downstream_forbidden(scope: &str) -> HttpResponse {
-    HttpResponse::Forbidden()
-        .insert_header(("www-authenticate", format!("Bearer realm=\"nvidia-build-lb\", error=\"insufficient_scope\", scope=\"{scope}\"")))
-        .json(json!({"error":{"code":"insufficient_scope","message":"The downstream credential lacks the required scope."}}))
+    let mut response = openai_error(
+        StatusCode::FORBIDDEN,
+        "The downstream credential lacks the required scope.",
+        "permission_error",
+        "insufficient_scope",
+    );
+    if let Ok(value) = header::HeaderValue::from_str(&format!(
+        "Bearer realm=\"nvidia-build-lb\", error=\"insufficient_scope\", scope=\"{scope}\""
+    )) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
 }
 
 fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
@@ -1825,9 +1882,12 @@ async fn record_request(state: &web::Data<AppState>, id: Uuid) -> Result<(), Htt
         .mutate(|vault| vault.record_request(id))
         .await
         .map_err(|_| {
-            HttpResponse::InternalServerError().json(json!({
-                "error": {"message": "request accounting unavailable", "type": "ledger_unavailable"}
-            }))
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request accounting unavailable",
+                "service_unavailable_error",
+                "ledger_unavailable",
+            )
         })
 }
 async fn record_failure(
@@ -1840,9 +1900,12 @@ async fn record_failure(
         .mutate(|vault| vault.record_failure(id, retry_after))
         .await
         .map_err(|_| {
-            HttpResponse::ServiceUnavailable().json(json!({
-                "error": {"message": "upstream health state unavailable", "type": "ledger_unavailable"}
-            }))
+            openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream health state unavailable",
+                "service_unavailable_error",
+                "ledger_unavailable",
+            )
         })
 }
 
@@ -1853,9 +1916,12 @@ async fn quarantine_key(state: &web::Data<AppState>, id: Uuid) -> Result<(), Htt
         .await
         .map(|_| ())
         .map_err(|_| {
-            HttpResponse::ServiceUnavailable().json(json!({
-                "error": {"message": "upstream health state unavailable", "type": "ledger_unavailable"}
-            }))
+            openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream health state unavailable",
+                "service_unavailable_error",
+                "ledger_unavailable",
+            )
         })
 }
 
@@ -1870,9 +1936,12 @@ async fn attempt_started(
         .attempt_started(request_id, profile, key_id)
         .await
         .map_err(|_| {
-            HttpResponse::InternalServerError().json(json!({
-                "error": {"message": "request attempt ledger unavailable", "type": "ledger_unavailable"}
-            }))
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request attempt ledger unavailable",
+                "service_unavailable_error",
+                "ledger_unavailable",
+            )
         })
 }
 
@@ -1887,8 +1956,11 @@ async fn attempt_finished(
         .attempt_finished(request_id, key_id, outcome)
         .await
         .map_err(|_| {
-            HttpResponse::InternalServerError().json(json!({
-                "error": {"message": "request attempt ledger unavailable", "type": "ledger_unavailable"}
-            }))
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request attempt ledger unavailable",
+                "service_unavailable_error",
+                "ledger_unavailable",
+            )
         })
 }

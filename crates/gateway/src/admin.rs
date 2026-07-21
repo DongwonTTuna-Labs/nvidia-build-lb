@@ -9,49 +9,17 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::{
-    AppState, DownstreamInput, Health, KeyInput, PROFILES, ToggleInput, UPSTREAM_REQUEST_TIMEOUT,
+    AppState, DownstreamInput, KeyInput, PROFILES, ToggleInput, UPSTREAM_REQUEST_TIMEOUT,
     admin_unauthorized, authorize_scope, authorized, eligible_key_count, public_guard_response,
     quarantine_key, upstream_endpoint_for, validate_chat_response,
 };
-
-pub(crate) async fn health(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
-    if let Some(response) = public_guard_response(&req) {
-        return response;
-    }
-    let database_ready = match &state.vault.database {
-        Some(pool) => sqlx::query_scalar::<_, i32>("SELECT 1")
-            .fetch_one(pool)
-            .await
-            .is_ok(),
-        None => true,
-    };
-    let keys = state.vault.list();
-    let eligible_keys = eligible_key_count(&keys);
-    let ready = database_ready && keys.len() == nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
-    // One healthy upstream can still serve traffic; the second slot is the
-    // failover/distribution objective, not a hard availability requirement.
-    let traffic_ready = database_ready && eligible_keys > 0;
-    let mut response = if traffic_ready {
-        HttpResponse::Ok()
-    } else {
-        HttpResponse::ServiceUnavailable()
-    };
-    response
-        .insert_header(("cache-control", "no-store"))
-        .json(Health {
-            status: if traffic_ready { "ok" } else { "degraded" },
-            ready,
-            traffic_ready,
-            eligible_keys,
-        })
-}
 
 pub(crate) async fn operator_readiness(
     req: HttpRequest,
     state: web::Data<AppState>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let database_ready = match &state.vault.database {
         Some(pool) => sqlx::query_scalar::<_, i32>("SELECT 1")
@@ -122,7 +90,7 @@ pub(crate) async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl
 
 pub(crate) async fn list_keys(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let items = state.vault.list();
     HttpResponse::Ok().json(json!({"items": items}))
@@ -130,7 +98,7 @@ pub(crate) async fn list_keys(req: HttpRequest, state: web::Data<AppState>) -> i
 
 pub(crate) async fn overview(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let keys = state.vault.list();
     let downstream = state.vault.list_downstream();
@@ -200,7 +168,7 @@ pub(crate) async fn overview(req: HttpRequest, state: web::Data<AppState>) -> im
 
 pub(crate) async fn evidence(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     match state.vault.evidence().await {
         Ok(value) => HttpResponse::Ok()
@@ -249,7 +217,7 @@ fn admin_snapshot() -> Value {
 
 pub(crate) async fn upstream_slots(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let keys = state.vault.list();
     let proofs = match profile_proof_keys(&state).await {
@@ -294,7 +262,7 @@ pub(crate) async fn model_capabilities(
     state: web::Data<AppState>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let keys = state.vault.list();
     let eligible = keys
@@ -371,7 +339,7 @@ pub(crate) async fn generation_readiness(
     state: web::Data<AppState>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let keys = state.vault.list();
     let configured = keys.len();
@@ -434,7 +402,7 @@ pub(crate) async fn operations(
     query: web::Query<PageQuery>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let before = match page_before(&query) {
         Ok(before) => before,
@@ -490,7 +458,7 @@ pub(crate) async fn operation_detail(
     path: web::Path<Uuid>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let id = path.into_inner();
     let Some(pool) = &state.vault.database else {
@@ -505,7 +473,7 @@ pub(crate) async fn operation_detail(
 
 pub(crate) async fn attentions(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let items = state.vault.list().into_iter().filter(|key| !key.enabled || !key.verified || key.cooldown_until.is_some()).map(|key| json!({"id":key.id,"code":if key.cooldown_until.is_some(){"upstream_cooldown"}else if !key.verified{"probe_required"}else{"upstream_disabled"},"resource":{"kind":"upstream_key","id":key.id},"label":key.label,"next_action":if !key.verified{"probe"}else{"inspect_routing"},"expires_at":key.cooldown_until})).collect::<Vec<_>>();
     HttpResponse::Ok()
@@ -519,7 +487,7 @@ pub(crate) async fn events(
     query: web::Query<PageQuery>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let before = match page_before(&query) {
         Ok(before) => before,
@@ -583,7 +551,7 @@ pub(crate) async fn evidence_detail(
     path: web::Path<Uuid>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let id = path.into_inner();
     let Some(pool) = &state.vault.database else {
@@ -607,7 +575,7 @@ pub(crate) async fn add_key(
     payload: web::Json<KeyInput>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     match state
         .vault
@@ -630,7 +598,7 @@ pub(crate) async fn toggle_key(
     payload: web::Json<ToggleInput>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     match state
         .vault
@@ -686,7 +654,7 @@ pub(crate) async fn probe_key(
     path: web::Path<Uuid>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let id = path.into_inner();
     let credential = match state.vault.credential_for_probe(id) {
@@ -799,7 +767,7 @@ pub(crate) async fn delete_key(
     path: web::Path<Uuid>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     match state
         .vault
@@ -820,7 +788,7 @@ pub(crate) async fn list_downstream(
     state: web::Data<AppState>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let items = state.vault.list_downstream();
     HttpResponse::Ok().json(json!({"items": items}))
@@ -832,7 +800,7 @@ pub(crate) async fn add_downstream(
     payload: web::Json<DownstreamInput>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     let keys = state.vault.list();
     let ready = keys.len() == nvidia_build_lb_core::MAX_UPSTREAM_KEYS
@@ -894,7 +862,7 @@ pub(crate) async fn revoke_downstream(
     path: web::Path<Uuid>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     match state
         .vault
@@ -912,7 +880,7 @@ pub(crate) async fn revoke_downstream_legacy(
     path: web::Path<Uuid>,
 ) -> impl Responder {
     if !authorized(&req, &state) {
-        return admin_unauthorized();
+        return admin_unauthorized(&req);
     }
     match state
         .vault

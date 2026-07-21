@@ -64,3 +64,14 @@ Svelte static HTML의 inline bootstrap hash를 Rust가 기동 시 계산해 CSP
 `script-src`에 추가합니다. 공개 운영 상태는 `/`에서 제공하고, 운영 관리자 화면은
 `/admin` 한 경로로 loopback에서만 제공합니다. 공개 대시보드는 upstream key,
 credential, request evidence를 읽지 않습니다.
+
+## Health 계약
+
+- `/health/live`: HTTP process liveness. DB나 NVIDIA key를 읽지 않으며 컨테이너
+  healthcheck가 사용합니다.
+- `/health/ready`: DB와 최소 한 개의 eligible upstream이 있을 때만 `200`입니다.
+- `/health`: 기존 monitor 호환 alias로 `/health/ready`와 같은 status/body를 반환합니다.
+
+응답의 `ready`와 `traffic_ready`는 실제 요청 가능 여부이고, `pair_ready`는 두 slot
+모두 분산·장애 전환에 참여할 수 있는지를 뜻합니다. key가 0개인 초기 설정 상태에서는
+컨테이너는 healthy지만 readiness endpoint는 `503`입니다.

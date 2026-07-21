@@ -8,8 +8,17 @@ use std::{env, fs, time::Duration};
 
 #[derive(Debug, Deserialize)]
 struct Health {
-    ready: bool,
-    traffic_ready: bool,
+    live: bool,
+}
+
+fn validate_health(status: reqwest::StatusCode, health: &Health) -> Result<()> {
+    if !status.is_success() {
+        bail!("gateway health returned {status}")
+    }
+    if !health.live {
+        bail!("gateway is not live")
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -28,17 +37,30 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(1))
         .build()
         .context("build health client")?
-        .get(format!("http://127.0.0.1:{bind_port}/health"))
+        .get(format!("http://127.0.0.1:{bind_port}/health/live"))
         .header("Host", format!("127.0.0.1:{host_port}"))
         .send()
         .await
         .context("request gateway health")?;
-    if !response.status().is_success() {
-        bail!("gateway health returned {}", response.status())
-    }
+    let status = response.status();
     let health = response.json::<Health>().await.context("decode health")?;
-    if !health.ready || !health.traffic_ready {
-        bail!("gateway is not traffic-ready")
+    validate_health(status, &health)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Health, validate_health};
+
+    #[test]
+    fn pr1_healthcheck_accepts_liveness_without_traffic_readiness() {
+        assert!(validate_health(reqwest::StatusCode::OK, &Health { live: true }).is_ok());
+        assert!(validate_health(reqwest::StatusCode::OK, &Health { live: false }).is_err());
+        assert!(
+            validate_health(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                &Health { live: true }
+            )
+            .is_err()
+        );
     }
-    Ok(())
 }
