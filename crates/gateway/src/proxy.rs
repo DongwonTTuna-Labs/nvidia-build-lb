@@ -1,16 +1,20 @@
-use actix_web::{HttpRequest, HttpResponse, Responder, http::header, web};
+use actix_web::{
+    HttpRequest, HttpResponse, Responder,
+    http::{StatusCode, header},
+    web,
+};
 use bytes::{Bytes, BytesMut};
 use chrono::{Duration, Utc};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use super::{
     AppState, PROFILES, STREAM_PRIME_TIMEOUT, StreamAttemptGuard, UPSTREAM_REQUEST_TIMEOUT,
     attempt_finished, attempt_started, authorize_scope, chat_response_stream, invalid_request,
-    mock_modality, mock_response, mock_stream_response, normalize_modality_response, poll_nvcf,
-    prepare_modality_request, prime_stream, public_guard_response, quarantine_key, record_failure,
-    record_request, select_key, upstream_endpoint_for, valid_data_url, validate_chat_response,
+    mock_modality, mock_response, mock_stream_response, normalize_modality_response, openai_error,
+    poll_nvcf, prepare_modality_request, prime_stream, public_guard_response, quarantine_key,
+    record_failure, record_request, request_id::request_id, select_key, upstream_endpoint_for,
+    valid_data_url, validate_chat_response,
 };
 
 pub(crate) async fn chat_completions(
@@ -35,7 +39,7 @@ pub(crate) async fn chat_completions(
     if let Err(response) = validate_chat_request(&request) {
         return response;
     }
-    let request_id = Uuid::new_v4();
+    let request_id = request_id(&req);
     let profile = request
         .get("model")
         .and_then(Value::as_str)
@@ -126,24 +130,26 @@ pub(crate) async fn chat_completions(
             {
                 let chat_endpoint =
                     upstream_endpoint_for(&state.upstream_url, "/v1/chat/completions", profile);
-                let response = match poll_nvcf(&state.client, response, &chat_endpoint, &credential)
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(_) => {
-                        if let Err(response) = record_failure(&state, id, None).await {
-                            return response;
+                let response =
+                    match poll_nvcf(&state.client, response, &chat_endpoint, &credential).await {
+                        Ok(response) => response,
+                        Err(_) => {
+                            if let Err(response) = record_failure(&state, id, None).await {
+                                return response;
+                            }
+                            if let Err(response) =
+                                attempt_finished(&state, request_id, id, "failed").await
+                            {
+                                return response;
+                            }
+                            return openai_error(
+                                StatusCode::BAD_GATEWAY,
+                                "NVIDIA accepted the request but polling did not complete",
+                                "upstream_error",
+                                "upstream_poll_error",
+                            );
                         }
-                        if let Err(response) =
-                            attempt_finished(&state, request_id, id, "failed").await
-                        {
-                            return response;
-                        }
-                        return HttpResponse::BadGateway().json(json!({
-                                "error": {"message": "NVIDIA accepted the request but polling did not complete", "type": "upstream_poll_error"}
-                            }));
-                    }
-                };
+                    };
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
                 let bytes = match response.bytes().await {
@@ -165,9 +171,12 @@ pub(crate) async fn chat_completions(
                     {
                         return response;
                     }
-                    return HttpResponse::BadGateway().json(json!({
-                        "error": {"message": "provider returned an invalid chat response", "type": "upstream_protocol_error"}
-                    }));
+                    return openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        "provider returned an invalid chat response",
+                        "upstream_error",
+                        "upstream_protocol_error",
+                    );
                 }
                 if let Err(response) = record_request(&state, id).await {
                     return response;
@@ -183,7 +192,12 @@ pub(crate) async fn chat_completions(
                 if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
                 }
-                return HttpResponse::BadGateway().json(json!({"error":{"message":"NVIDIA returned an unsupported asynchronous response","type":"upstream_protocol_error"}}));
+                return openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "NVIDIA returned an unsupported asynchronous response",
+                    "upstream_error",
+                    "upstream_protocol_error",
+                );
             }
             Ok(response) if response.status().is_success() => {
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
@@ -269,9 +283,12 @@ pub(crate) async fn chat_completions(
                     {
                         return response;
                     }
-                    return HttpResponse::BadGateway().json(json!({
-                        "error": {"message": "provider returned an invalid chat response", "type": "upstream_protocol_error"}
-                    }));
+                    return openai_error(
+                        StatusCode::BAD_GATEWAY,
+                        "provider returned an invalid chat response",
+                        "upstream_error",
+                        "upstream_protocol_error",
+                    );
                 }
                 if let Err(response) = record_request(&state, id).await {
                     return response;
@@ -315,7 +332,12 @@ pub(crate) async fn chat_completions(
                 if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
                 }
-                return HttpResponse::build(status).json(json!({"error":{"message":"NVIDIA rejected the request","type":"upstream_request_rejected"}}));
+                return openai_error(
+                    status,
+                    "NVIDIA rejected the request",
+                    "upstream_error",
+                    "upstream_request_rejected",
+                );
             }
             Err(_) => {
                 if let Err(response) = record_failure(&state, id, None).await {
@@ -332,11 +354,25 @@ pub(crate) async fn chat_completions(
         && !attempted.is_empty()
         && let Some(seconds) = retry_after_for_keys(&state.vault.list())
     {
-        return HttpResponse::TooManyRequests()
-            .insert_header(("retry-after", seconds.to_string()))
-            .json(json!({"error":{"message":"All NVIDIA upstream keys are rate limited","type":"upstream_rate_limited"}}));
+        let mut response = openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "All NVIDIA upstream keys are rate limited",
+            "rate_limit_error",
+            "upstream_rate_limited",
+        );
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            header::HeaderValue::from_str(&seconds.to_string())
+                .expect("cooldown seconds are a valid HTTP header value"),
+        );
+        return response;
     }
-    HttpResponse::ServiceUnavailable().json(json!({"error":{"message":"No eligible NVIDIA upstream key","type":"upstream_unavailable"}}))
+    openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No eligible NVIDIA upstream is available.",
+        "service_unavailable_error",
+        "no_eligible_upstream",
+    )
 }
 
 /// Handles the non-chat OpenAI/NVIDIA representations through the same
@@ -370,9 +406,12 @@ pub(crate) async fn multimodal(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
     if body.len() > modality_body_limit(req.path()) {
-        return HttpResponse::PayloadTooLarge().json(json!({
-            "error": {"message": "request body exceeds the endpoint limit", "type": "request_too_large"}
-        }));
+        return openai_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the endpoint limit",
+            "invalid_request_error",
+            "request_too_large",
+        );
     }
     let request = match parse_multimodal_request(req.path(), &body, content_type) {
         Ok(request) => request,
@@ -382,7 +421,7 @@ pub(crate) async fn multimodal(
         Ok(request) => request,
         Err(response) => return response,
     };
-    let request_id = Uuid::new_v4();
+    let request_id = request_id(&req);
     let profile = request
         .get("model")
         .and_then(Value::as_str)
@@ -420,18 +459,18 @@ pub(crate) async fn multimodal(
                 return response;
             }
             let (body, content_type) = mock_modality(req.path(), &request);
-            let (body, content_type) = match normalize_modality_response(
-                req.path(),
-                &body,
-                content_type,
-            ) {
-                Ok(value) => value,
-                Err(_) => {
-                    return HttpResponse::BadGateway().json(json!({
-                        "error": {"message": "mock provider fixture failed the modality contract", "type": "mock_contract_invalid"}
-                    }));
-                }
-            };
+            let (body, content_type) =
+                match normalize_modality_response(req.path(), &body, content_type) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return openai_error(
+                            StatusCode::BAD_GATEWAY,
+                            "mock provider fixture failed the modality contract",
+                            "upstream_error",
+                            "mock_contract_invalid",
+                        );
+                    }
+                };
             return HttpResponse::Ok()
                 .insert_header(("content-type", content_type))
                 .body(body);
@@ -510,9 +549,12 @@ pub(crate) async fn multimodal(
                             {
                                 return response;
                             }
-                            return HttpResponse::BadGateway().json(json!({
-                                "error": {"message": "NVIDIA accepted the media request but polling did not complete", "type": "upstream_poll_error"}
-                            }));
+                            return openai_error(
+                                StatusCode::BAD_GATEWAY,
+                                "NVIDIA accepted the media request but polling did not complete",
+                                "upstream_error",
+                                "upstream_poll_error",
+                            );
                         }
                     }
                 } else {
@@ -540,26 +582,26 @@ pub(crate) async fn multimodal(
                         continue;
                     }
                 };
-                let (bytes, content_type) = match normalize_modality_response(
-                    req.path(),
-                    &bytes,
-                    &content_type,
-                ) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        if let Err(response) = quarantine_key(&state, id).await {
-                            return response;
+                let (bytes, content_type) =
+                    match normalize_modality_response(req.path(), &bytes, &content_type) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            if let Err(response) = quarantine_key(&state, id).await {
+                                return response;
+                            }
+                            if let Err(response) =
+                                attempt_finished(&state, request_id, id, "failed").await
+                            {
+                                return response;
+                            }
+                            return openai_error(
+                                StatusCode::BAD_GATEWAY,
+                                "provider returned an invalid modality response",
+                                "upstream_error",
+                                "upstream_protocol_error",
+                            );
                         }
-                        if let Err(response) =
-                            attempt_finished(&state, request_id, id, "failed").await
-                        {
-                            return response;
-                        }
-                        return HttpResponse::BadGateway().json(json!({
-                                "error": {"message": "provider returned an invalid modality response", "type": "upstream_protocol_error"}
-                            }));
-                    }
-                };
+                    };
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
@@ -599,8 +641,13 @@ pub(crate) async fn multimodal(
                 if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
                 }
-                return HttpResponse::build(actix_web::http::StatusCode::from_u16(response.status().as_u16()).unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY))
-                    .json(json!({"error":{"message":"NVIDIA rejected the request","type":"upstream_request_rejected"}}));
+                return openai_error(
+                    StatusCode::from_u16(response.status().as_u16())
+                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                    "NVIDIA rejected the request",
+                    "upstream_error",
+                    "upstream_request_rejected",
+                );
             }
             Err(_) => {
                 if let Err(response) = record_failure(&state, id, None).await {
@@ -617,11 +664,25 @@ pub(crate) async fn multimodal(
         && !attempted.is_empty()
         && let Some(seconds) = retry_after_for_keys(&state.vault.list())
     {
-        return HttpResponse::TooManyRequests()
-            .insert_header(("retry-after", seconds.to_string()))
-            .json(json!({"error":{"message":"All NVIDIA upstream keys are rate limited","type":"upstream_rate_limited"}}));
+        let mut response = openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "All NVIDIA upstream keys are rate limited",
+            "rate_limit_error",
+            "upstream_rate_limited",
+        );
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            header::HeaderValue::from_str(&seconds.to_string())
+                .expect("cooldown seconds are a valid HTTP header value"),
+        );
+        return response;
     }
-    HttpResponse::ServiceUnavailable().json(json!({"error":{"message":"No eligible NVIDIA upstream key","type":"upstream_unavailable"}}))
+    openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No eligible NVIDIA upstream is available.",
+        "service_unavailable_error",
+        "no_eligible_upstream",
+    )
 }
 
 pub(crate) fn parse_multimodal_request(
@@ -674,9 +735,12 @@ pub(crate) fn parse_multimodal_request(
             return Err(model_not_found());
         }
         if !profile_supports_path(path, model) {
-            return Err(HttpResponse::UnprocessableEntity().json(json!({
-                "error": {"message": "model is not compatible with this endpoint", "type": "model_route_mismatch"}
-            })));
+            return Err(openai_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "model is not compatible with this endpoint",
+                "invalid_request_error",
+                "model_route_mismatch",
+            ));
         }
         return Ok(json!({"model": model, "__nblb_multipart": true}));
     }
@@ -700,9 +764,12 @@ pub(crate) fn parse_multimodal_request(
         return Err(model_not_found());
     }
     if !profile_supports_path(path, model) {
-        return Err(HttpResponse::UnprocessableEntity().json(json!({
-            "error": {"message": "model is not compatible with this endpoint", "type": "model_route_mismatch"}
-        })));
+        return Err(openai_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model is not compatible with this endpoint",
+            "invalid_request_error",
+            "model_route_mismatch",
+        ));
     }
     validate_modality_fields(path, object)?;
     let required_field = match path {
@@ -729,15 +796,14 @@ async fn read_request_body(
 ) -> Result<Bytes, HttpResponse> {
     let mut body = BytesMut::new();
     while let Some(chunk) = payload.next().await {
-        let chunk = chunk.map_err(|_| {
-            HttpResponse::BadRequest().json(json!({
-                "error": {"message": "request body could not be read", "type": "invalid_request"}
-            }))
-        })?;
+        let chunk = chunk.map_err(|_| invalid_request("request body could not be read"))?;
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(HttpResponse::PayloadTooLarge().json(json!({
-                "error": {"message": "request body exceeds the endpoint limit", "type": "request_too_large"}
-            })));
+            return Err(openai_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the endpoint limit",
+                "invalid_request_error",
+                "request_too_large",
+            ));
         }
         body.extend_from_slice(&chunk);
     }
@@ -801,9 +867,12 @@ fn retry_after_for_keys(keys: &[nvidia_build_lb_core::KeySummary]) -> Option<u64
 }
 
 fn model_not_found() -> HttpResponse {
-    HttpResponse::NotFound().json(json!({
-        "error": {"message": "model is not advertised", "type": "model_not_found"}
-    }))
+    openai_error(
+        StatusCode::NOT_FOUND,
+        "model is not advertised",
+        "invalid_request_error",
+        "model_not_found",
+    )
 }
 
 fn validate_modality_fields(
@@ -1018,9 +1087,12 @@ pub(crate) fn validate_chat_request(request: &Value) -> Result<(), HttpResponse>
         return Err(model_not_found());
     }
     if !profile_supports_path("/v1/chat/completions", model) {
-        return Err(HttpResponse::UnprocessableEntity().json(json!({
-            "error": {"message": "model is not compatible with this endpoint", "type": "model_route_mismatch"}
-        })));
+        return Err(openai_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "model is not compatible with this endpoint",
+            "invalid_request_error",
+            "model_route_mismatch",
+        ));
     }
     const GLM_ALLOWED: &[&str] = &[
         "model",

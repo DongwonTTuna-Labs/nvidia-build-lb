@@ -17,6 +17,17 @@ docker compose -f compose.yml logs --since 10m app migrate db
 curl -fsS https://nvidia-lb.dongwontuna.net/health
 ```
 
+컨테이너 상태와 traffic readiness는 분리합니다.
+
+```bash
+curl -fsS http://127.0.0.1:2456/health/live
+curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:2456/health/ready
+```
+
+첫 명령은 process가 살아 있으면 key 수와 무관하게 `200`입니다. 두 번째와 호환
+`/health`는 DB와 eligible upstream이 있어야 `200`이며 초기 설정 중에는 `503`이
+정상입니다.
+
 gateway readiness가 false면 `/admin/api/v1/operator-readiness`를 admin bearer로
 조회해 `readiness_cause`와 다음 조치를 확인한다. 키 plaintext를 로그·명령행·스크린샷에
 넣지 않는다.

@@ -21,7 +21,9 @@ Actix Rust gateway :2456 ── HTTPS ── NVIDIA hosted API
 database lifecycle과 cross-cutting authorization만 소유한다. HTTP 책임은 다음
 모듈로 분리한다.
 
-- `admin.rs`: readiness, evidence, key/client mutation과 운영 pagination DTO
+- `health.rs`: provider와 분리된 liveness 및 DB/eligible traffic readiness
+- `request_id.rs`: dynamic API correlation과 public-host admin 차단 middleware
+- `admin.rs`: evidence, key/client mutation과 운영 pagination DTO
 - `proxy.rs`: OpenAI chat와 multimodal transport/failover orchestration
 - `provider.rs`: upstream endpoint mapping, modality preparation과 response contract
 - `streaming.rs`: SSE priming/terminal accounting과 이미지·오디오·비디오 payload 검증
@@ -31,7 +33,8 @@ durable ledger 같은 공통 권위는 `AppState`를 통해서만 공유한다.
 
 ## HTTP surface
 
-- `/health`: readiness와 eligible upstream 수를 secret 없이 반환
+- `/health/live`: DB/provider와 독립적인 process liveness
+- `/health/ready`, `/health`: DB와 eligible upstream traffic readiness
 - `/v1/models`, `/v1/chat/completions`: OpenAI 호환 text/vision/streaming
 - `/v1/embeddings`, `/v1/images/generations`, `/v1/videos/generations`,
   `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/nvidia/inference`: profile별

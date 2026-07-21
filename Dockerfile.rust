@@ -18,7 +18,18 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
 COPY migrations/sqlx ./migrations/sqlx
-RUN cargo build --locked --release -p nvidia-build-lb-gateway --bins
+RUN --mount=type=cache,id=nblb-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=nblb-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=nblb-cargo-target,target=/src/target,sharing=locked \
+    cargo build --locked --release -p nvidia-build-lb-gateway --bins \
+    && install -d /out \
+    && install -m 0755 \
+        target/release/nvidia-build-lb-gateway \
+        target/release/nblb-pg-bootstrap \
+        target/release/nblb-migrate \
+        target/release/nblb-prestart \
+        target/release/nblb-healthcheck \
+        /out/
 
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 RUN apt-get update \
@@ -26,11 +37,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --no-create-home --shell /usr/sbin/nologin nblb \
     && install -d -o 65532 -g 65532 -m 0755 /var/lib/nvidia-build-lb /app
-COPY --from=build /src/target/release/nvidia-build-lb-gateway /usr/local/bin/nvidia-build-lb-gateway
-COPY --from=build /src/target/release/nblb-pg-bootstrap /usr/local/bin/nblb-pg-bootstrap
-COPY --from=build /src/target/release/nblb-migrate /usr/local/bin/nblb-migrate
-COPY --from=build /src/target/release/nblb-prestart /usr/local/bin/nblb-prestart
-COPY --from=build /src/target/release/nblb-healthcheck /usr/local/bin/nblb-healthcheck
+COPY --from=build /out/nvidia-build-lb-gateway /usr/local/bin/nvidia-build-lb-gateway
+COPY --from=build /out/nblb-pg-bootstrap /usr/local/bin/nblb-pg-bootstrap
+COPY --from=build /out/nblb-migrate /usr/local/bin/nblb-migrate
+COPY --from=build /out/nblb-prestart /usr/local/bin/nblb-prestart
+COPY --from=build /out/nblb-healthcheck /usr/local/bin/nblb-healthcheck
 COPY migrations/sqlx /app/migrations/sqlx
 COPY --from=admin /src/apps/admin/build /app/static
 COPY --from=public-dashboard /src/apps/public/build /app/public
