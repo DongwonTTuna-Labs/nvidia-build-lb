@@ -1870,6 +1870,7 @@ async fn mock_stream_response(
             }
         };
     let ttfb_ms = stream_guard.request_elapsed_ms();
+    stream_guard.arm_evidence_failure(Some(ttfb_ms), 0);
     if let Err(response) = attempt_response_started(&state, request_id, key_id, ttfb_ms).await {
         return response;
     }

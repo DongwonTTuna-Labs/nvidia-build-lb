@@ -82,6 +82,7 @@ pub(crate) async fn chat_completions(
             Ok(value) => value,
             Err(_) => {
                 all_attempts_rate_limited = false;
+                evidence.arm_evidence_failure(None, 0);
                 if let Err(response) = attempt_finished(
                     &state,
                     request_id,
@@ -92,6 +93,7 @@ pub(crate) async fn chat_completions(
                 {
                     return response;
                 }
+                evidence.reset_drop_recovery();
                 continue;
             }
         };
@@ -105,6 +107,7 @@ pub(crate) async fn chat_completions(
                 .unwrap_or(false)
                 && attempted.len() == 1;
             if credential.contains("fail") || force_first_failure {
+                evidence.arm_evidence_failure(None, 0);
                 let cooldown = match record_failure(&state, id, Some(Duration::seconds(2))).await {
                     Ok(cooldown) => cooldown,
                     Err(response) => return response,
@@ -119,12 +122,14 @@ pub(crate) async fn chat_completions(
                 {
                     return response;
                 }
+                evidence.reset_drop_recovery();
                 continue;
             }
             if stream {
                 return mock_stream_response(&request, state.clone(), request_id, id, evidence)
                     .await;
             }
+            evidence.arm_evidence_failure(None, 0);
             if let Err(response) = record_request(&state, id).await {
                 return response;
             }
@@ -173,6 +178,7 @@ pub(crate) async fn chat_completions(
                 {
                     Ok(response) => response,
                     Err(_) => {
+                        evidence.arm_evidence_failure(None, 0);
                         let cooldown = match record_failure(&state, id, None).await {
                             Ok(cooldown) => cooldown,
                             Err(response) => return response,
@@ -203,6 +209,7 @@ pub(crate) async fn chat_completions(
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(_) => {
+                        evidence.arm_evidence_failure(None, 0);
                         let cooldown = match record_failure(&state, id, None).await {
                             Ok(cooldown) => cooldown,
                             Err(response) => return response,
@@ -221,10 +228,12 @@ pub(crate) async fn chat_completions(
                         {
                             return response;
                         }
+                        evidence.reset_drop_recovery();
                         continue;
                     }
                 };
                 if validate_chat_response(&bytes, false).is_err() {
+                    evidence.arm_evidence_failure(None, bytes.len());
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
                     }
@@ -253,6 +262,7 @@ pub(crate) async fn chat_completions(
                         "upstream_protocol_error",
                     );
                 }
+                evidence.arm_evidence_failure(None, bytes.len());
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
@@ -306,6 +316,7 @@ pub(crate) async fn chat_completions(
                         .next()
                         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
                     {
+                        evidence.arm_evidence_failure(None, 0);
                         let cooldown = match record_failure(&state, id, None).await {
                             Ok(cooldown) => cooldown,
                             Err(response) => return response,
@@ -324,6 +335,7 @@ pub(crate) async fn chat_completions(
                         {
                             return response;
                         }
+                        evidence.reset_drop_recovery();
                         continue;
                     }
                     let upstream = Box::pin(response.bytes_stream());
@@ -337,6 +349,7 @@ pub(crate) async fn chat_completions(
                         {
                             Ok(Ok(value)) => value,
                             _ => {
+                                stream_guard.arm_evidence_failure(None, 0);
                                 let cooldown = match record_failure(&state, id, None).await {
                                     Ok(cooldown) => cooldown,
                                     Err(response) => return response,
@@ -360,6 +373,7 @@ pub(crate) async fn chat_completions(
                             }
                         };
                     let ttfb_ms = stream_guard.request_elapsed_ms();
+                    stream_guard.arm_evidence_failure(Some(ttfb_ms), 0);
                     if let Err(response) =
                         attempt_response_started(&state, request_id, id, ttfb_ms).await
                     {
@@ -384,6 +398,7 @@ pub(crate) async fn chat_completions(
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(_) => {
+                        evidence.arm_evidence_failure(None, 0);
                         let cooldown = match record_failure(&state, id, None).await {
                             Ok(cooldown) => cooldown,
                             Err(response) => return response,
@@ -402,10 +417,12 @@ pub(crate) async fn chat_completions(
                         {
                             return response;
                         }
+                        evidence.reset_drop_recovery();
                         continue;
                     }
                 };
                 if validate_chat_response(&bytes, stream).is_err() {
+                    evidence.arm_evidence_failure(None, bytes.len());
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
                     }
@@ -434,6 +451,7 @@ pub(crate) async fn chat_completions(
                         "upstream_protocol_error",
                     );
                 }
+                evidence.arm_evidence_failure(None, bytes.len());
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
@@ -465,6 +483,7 @@ pub(crate) async fn chat_completions(
                 let provider_status = response.status().as_u16();
                 let error_class = retryable_error_class(provider_status);
                 let auth_failure = matches!(provider_status, 401 | 403);
+                evidence.arm_evidence_failure(None, 0);
                 let cooldown = if auth_failure {
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
@@ -487,6 +506,7 @@ pub(crate) async fn chat_completions(
                 {
                     return response;
                 }
+                evidence.reset_drop_recovery();
             }
             Ok(response) => {
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
@@ -513,6 +533,7 @@ pub(crate) async fn chat_completions(
                 );
             }
             Err(_) => {
+                evidence.arm_evidence_failure(None, 0);
                 let cooldown = match record_failure(&state, id, None).await {
                     Ok(cooldown) => cooldown,
                     Err(response) => return response,
@@ -527,6 +548,7 @@ pub(crate) async fn chat_completions(
                 {
                     return response;
                 }
+                evidence.reset_drop_recovery();
             }
         }
     }
@@ -653,6 +675,7 @@ pub(crate) async fn multimodal(
             Some(value) => value,
             None => {
                 all_attempts_rate_limited = false;
+                evidence.arm_evidence_failure(None, 0);
                 if let Err(response) = attempt_finished(
                     &state,
                     request_id,
@@ -663,10 +686,12 @@ pub(crate) async fn multimodal(
                 {
                     return response;
                 }
+                evidence.reset_drop_recovery();
                 continue;
             }
         };
         if state.upstream_url.starts_with("mock://") {
+            evidence.arm_evidence_failure(None, 0);
             if let Err(response) = record_request(&state, id).await {
                 return response;
             }
@@ -776,6 +801,7 @@ pub(crate) async fn multimodal(
                     match poll_nvcf(&state.client, response, &endpoint, &credential).await {
                         Ok(response) => response,
                         Err(_) => {
+                            evidence.arm_evidence_failure(None, 0);
                             let cooldown = match record_failure(&state, id, None).await {
                                 Ok(cooldown) => cooldown,
                                 Err(response) => return response,
@@ -819,6 +845,7 @@ pub(crate) async fn multimodal(
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(_) => {
+                        evidence.arm_evidence_failure(None, 0);
                         let cooldown = match record_failure(&state, id, None).await {
                             Ok(cooldown) => cooldown,
                             Err(response) => return response,
@@ -837,6 +864,7 @@ pub(crate) async fn multimodal(
                         {
                             return response;
                         }
+                        evidence.reset_drop_recovery();
                         continue;
                     }
                 };
@@ -844,6 +872,7 @@ pub(crate) async fn multimodal(
                     match normalize_modality_response(req.path(), &bytes, &content_type) {
                         Ok(value) => value,
                         Err(_) => {
+                            evidence.arm_evidence_failure(None, bytes.len());
                             if let Err(response) = quarantine_key(&state, id).await {
                                 return response;
                             }
@@ -873,6 +902,7 @@ pub(crate) async fn multimodal(
                             );
                         }
                     };
+                evidence.arm_evidence_failure(None, bytes.len());
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
@@ -903,6 +933,7 @@ pub(crate) async fn multimodal(
                 let provider_status = response.status().as_u16();
                 let error_class = retryable_error_class(provider_status);
                 let auth_failure = matches!(provider_status, 401 | 403);
+                evidence.arm_evidence_failure(None, 0);
                 let cooldown = if auth_failure {
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
@@ -925,6 +956,7 @@ pub(crate) async fn multimodal(
                 {
                     return response;
                 }
+                evidence.reset_drop_recovery();
             }
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
@@ -951,6 +983,7 @@ pub(crate) async fn multimodal(
                 );
             }
             Err(_) => {
+                evidence.arm_evidence_failure(None, 0);
                 let cooldown = match record_failure(&state, id, None).await {
                     Ok(cooldown) => cooldown,
                     Err(response) => return response,
@@ -965,6 +998,7 @@ pub(crate) async fn multimodal(
                 {
                     return response;
                 }
+                evidence.reset_drop_recovery();
             }
         }
     }

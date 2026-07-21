@@ -77,6 +77,20 @@ impl RequestEvidence {
         i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX)
     }
 
+    pub(crate) fn arm_evidence_failure(&mut self, ttfb_ms: Option<i64>, bytes_out: usize) {
+        self.arm_drop_recovery(
+            "failed",
+            Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+            "evidence_unavailable",
+            ttfb_ms,
+            bytes_out,
+        );
+    }
+
+    pub(crate) fn reset_drop_recovery(&mut self) {
+        self.drop_recovery = DropRecovery::default();
+    }
+
     pub(crate) async fn fail(
         &mut self,
         status: StatusCode,
@@ -95,13 +109,7 @@ impl RequestEvidence {
         attempt: AttemptTerminal,
         request: RequestTerminal,
     ) -> Result<(), HttpResponse> {
-        self.arm_drop_recovery(
-            "failed",
-            Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
-            "evidence_unavailable",
-            request.ttfb_ms(),
-            terminal_bytes_out(attempt),
-        );
+        self.arm_evidence_failure(request.ttfb_ms(), terminal_bytes_out(attempt));
         self.state
             .vault
             .request_and_attempt_finished(self.request_id, key_id, attempt, request)
@@ -173,13 +181,7 @@ impl RequestEvidence {
         error_class: Option<&'static str>,
         ttfb_ms: Option<i64>,
     ) -> Result<(), HttpResponse> {
-        self.arm_drop_recovery(
-            "failed",
-            Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
-            "evidence_unavailable",
-            ttfb_ms,
-            0,
-        );
+        self.arm_evidence_failure(ttfb_ms, 0);
         self.state
             .vault
             .proxy_request_finished(self.request_id, outcome, status_code, error_class, ttfb_ms)
@@ -1028,6 +1030,83 @@ mod tests {
             public_port: 2456,
             csp_hashes: Vec::new(),
         });
+
+        sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 1")
+            .execute(&pool)
+            .await
+            .expect("reset one-shot stream auxiliary failpoint");
+        let stream_auxiliary_id = Uuid::new_v4();
+        let mut stream_auxiliary_guard =
+            start_test_stream(&state, stream_auxiliary_id, key_id).await;
+        stream_auxiliary_guard.arm_evidence_failure(Some(35), 23);
+        drop(stream_auxiliary_guard);
+        assert_eq!(
+            wait_for_terminal_pair(&pool, stream_auxiliary_id).await,
+            (
+                "failed".into(),
+                "failed".into(),
+                Some("evidence_unavailable".into()),
+                Some("evidence_unavailable".into()),
+            ),
+            "pre-handoff auxiliary failure must survive a failed first Drop update"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+                "SELECT request.ttfb_ms,attempt.bytes_out FROM nblb.proxy_requests AS request JOIN nblb.request_attempts AS attempt ON attempt.proxy_request_id=request.id WHERE request.request_id=$1",
+            )
+            .bind(stream_auxiliary_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load stream auxiliary failure accounting"),
+            (Some(35), Some(23)),
+        );
+
+        sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 2")
+            .execute(&pool)
+            .await
+            .expect("disable one-shot non-stream auxiliary failpoint");
+        let request_auxiliary_id = Uuid::new_v4();
+        let mut request_auxiliary_evidence = match RequestEvidence::start(
+            state.clone(),
+            request_auxiliary_id,
+            None,
+            "/v1/chat/completions",
+            "z-ai/glm-5.2",
+            false,
+            "text",
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(_) => panic!("start non-stream auxiliary evidence"),
+        };
+        state
+            .vault
+            .attempt_started(request_auxiliary_id, "z-ai/glm-5.2", key_id)
+            .await
+            .expect("start non-stream auxiliary attempt");
+        request_auxiliary_evidence.arm_evidence_failure(None, 41);
+        drop(request_auxiliary_evidence);
+        assert_eq!(
+            wait_for_terminal_pair(&pool, request_auxiliary_id).await,
+            (
+                "failed".into(),
+                "failed".into(),
+                Some("evidence_unavailable".into()),
+                Some("evidence_unavailable".into()),
+            ),
+            "post-provider auxiliary failure must not become handler abandonment"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT attempt.bytes_out FROM nblb.request_attempts AS attempt WHERE attempt.request_id=$1",
+            )
+            .bind(request_auxiliary_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load non-stream auxiliary byte accounting"),
+            Some(41),
+        );
 
         sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 1")
             .execute(&pool)

@@ -105,6 +105,18 @@ impl StreamAttemptGuard {
         self.ttfb_ms = Some(ttfb_ms);
     }
 
+    /// Arms a fail-closed terminal before an auxiliary accounting/health
+    /// update that follows a conclusive provider observation. If that update
+    /// fails, Drop preserves the observation as an evidence failure instead
+    /// of relabeling it as handler abandonment.
+    pub(crate) fn arm_evidence_failure(&mut self, ttfb_ms: Option<i64>, bytes_out: usize) {
+        self.ttfb_ms = ttfb_ms;
+        self.bytes_out = bytes_out;
+        self.drop_outcome = "failed";
+        self.drop_status_code = Some(500);
+        self.drop_error_class = "evidence_unavailable";
+    }
+
     /// Marks the point after which Actix owns the response body. Only drops
     /// after this handoff are evidence of a downstream cancellation.
     pub(crate) fn mark_response_committed(&mut self, status_code: u16) {
