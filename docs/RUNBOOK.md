@@ -32,6 +32,29 @@ gateway readiness가 false면 `/admin/api/v1/operator-readiness`를 admin bearer
 조회해 `readiness_cause`와 다음 조치를 확인한다. 키 plaintext를 로그·명령행·스크린샷에
 넣지 않는다.
 
+## 운영 증거와 보존
+
+gateway는 5초마다 terminal `proxy_requests`를 `metric_buckets_minute`에 batch로
+집계하고, 한 시간마다 retention을 적용한다. 두 worker는 PostgreSQL transaction-scoped
+advisory lock을 사용하므로 여러 gateway instance가 동시에 떠 있어도 한 instance만
+작업한다. 정상 상태에서는 완료된 request의 `rolled_up_at`이 채워지고 동일 request를
+다시 집계해도 bucket count가 늘지 않는다. rollup과 retention은 같은 maintenance
+lock을 사용하며, 30일이 지난 request도 `rolled_up_at`이 비어 있으면 90일 metric
+보존 경계까지 삭제하지 않는다.
+
+- terminal request와 attempt: 30일
+- minute metric과 완료 probe: 90일
+- audit event와 완료 QA run: 180일
+
+열린 row는 retention 대상이 아니다. owner heartbeat가 30초보다 오래 끊긴 gateway의
+열린 request와 attempt는 watchdog이 `abandoned_after_restart`로 닫는다. 이 정리가
+반복 실패하면 gateway는 fail-closed로 종료한다.
+
+장애 조사에는 request UUID, endpoint/profile, outcome/status/error class, timing과
+attempt 순번만 사용한다. prompt, media, tool argument, body/header, plaintext credential을
+SQL, 로그, incident update 또는 QA evidence에 복사하지 않는다. DB dump나 log scan에서
+이 값이 발견되면 운영 증거를 공유하지 말고 즉시 노출 사고로 취급한다.
+
 ## 장애
 
 - DB unhealthy: app은 watchdog으로 종료된다. DB를 먼저 복구하고 `migrate` 완료 후

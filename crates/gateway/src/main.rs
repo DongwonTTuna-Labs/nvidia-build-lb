@@ -3,6 +3,7 @@
 
 mod admin;
 mod errors;
+mod evidence;
 mod health;
 mod provider;
 mod proxy;
@@ -11,6 +12,7 @@ mod streaming;
 #[cfg(test)]
 mod tests;
 pub(crate) use errors::{invalid_request, openai_error, operations_error};
+pub(crate) use evidence::{RequestEvidence, modality_for_path};
 pub(crate) use provider::{
     prepare_modality_request, upstream_endpoint_for, validate_chat_response,
 };
@@ -38,7 +40,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap},
     env,
     sync::Mutex,
     time::{Duration as StdDuration, Instant},
@@ -60,6 +62,104 @@ struct AppState {
     require_downstream_token: bool,
     public_port: u16,
     csp_hashes: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttemptTerminal {
+    outcome: &'static str,
+    status_code: Option<u16>,
+    error_class: Option<&'static str>,
+    cooldown_applied_until: Option<chrono::DateTime<chrono::Utc>>,
+    bytes_out: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestTerminal {
+    outcome: &'static str,
+    status_code: Option<u16>,
+    error_class: Option<&'static str>,
+    ttfb_ms: Option<i64>,
+}
+
+impl RequestTerminal {
+    pub(crate) fn succeeded(status_code: u16) -> Self {
+        Self {
+            outcome: "succeeded",
+            status_code: Some(status_code),
+            error_class: None,
+            ttfb_ms: None,
+        }
+    }
+
+    pub(crate) fn failed(status_code: u16, error_class: &'static str) -> Self {
+        Self {
+            outcome: "failed",
+            status_code: Some(status_code),
+            error_class: Some(error_class),
+            ttfb_ms: None,
+        }
+    }
+
+    pub(crate) fn rejected(status_code: u16, error_class: &'static str) -> Self {
+        Self {
+            outcome: "rejected",
+            status_code: Some(status_code),
+            error_class: Some(error_class),
+            ttfb_ms: None,
+        }
+    }
+
+    pub(crate) fn with_ttfb(mut self, ttfb_ms: Option<i64>) -> Self {
+        self.ttfb_ms = ttfb_ms;
+        self
+    }
+
+    pub(crate) fn status_code(self) -> Option<u16> {
+        self.status_code
+    }
+
+    pub(crate) fn ttfb_ms(self) -> Option<i64> {
+        self.ttfb_ms
+    }
+}
+
+impl AttemptTerminal {
+    pub(crate) fn succeeded(status_code: u16, bytes_out: Option<usize>) -> Self {
+        Self {
+            outcome: "succeeded",
+            status_code: Some(status_code),
+            error_class: None,
+            cooldown_applied_until: None,
+            bytes_out: bytes_out.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        }
+    }
+
+    pub(crate) fn failed(
+        status_code: Option<u16>,
+        error_class: &'static str,
+        cooldown_applied_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        Self {
+            outcome: "failed",
+            status_code,
+            error_class: Some(error_class),
+            cooldown_applied_until,
+            bytes_out: None,
+        }
+    }
+
+    pub(crate) fn with_bytes_out(mut self, bytes_out: usize) -> Self {
+        self.bytes_out = Some(i64::try_from(bytes_out).unwrap_or(i64::MAX));
+        self
+    }
+
+    pub(crate) fn with_cooldown(
+        mut self,
+        cooldown_applied_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Self {
+        self.cooldown_applied_until = cooldown_applied_until;
+        self
+    }
 }
 
 #[derive(Debug, FromRow)]
@@ -126,6 +226,15 @@ impl VaultStore {
             .execute(&mut *tx)
             .await
             .context("close attempts from expired gateway owners")?;
+            // Close parent rows while their stale owner identity is still
+            // available. Deleting gateway_instances first would set owner_id
+            // to NULL and make the request impossible to attribute safely.
+            sqlx::query(
+                "UPDATE nblb.proxy_requests AS request SET outcome='abandoned_after_restart', error_class='owner_lease_expired', duration_ms=GREATEST(0, floor(extract(epoch FROM (now() - request.started_at)) * 1000)::bigint), failover_count=GREATEST(0, (SELECT count(*) - 1 FROM nblb.request_attempts AS attempt WHERE attempt.proxy_request_id=request.id))::smallint, finished_at=now() WHERE request.finished_at IS NULL AND (request.owner_id IS NULL OR NOT EXISTS (SELECT 1 FROM nblb.gateway_instances AS instance WHERE instance.id=request.owner_id AND instance.last_seen_at >= now() - interval '30 seconds'))",
+            )
+            .execute(&mut *tx)
+            .await
+            .context("close requests from expired gateway owners")?;
             sqlx::query(
                 "DELETE FROM nblb.gateway_instances WHERE last_seen_at < now() - interval '30 seconds' AND id <> $1",
             )
@@ -364,8 +473,8 @@ impl VaultStore {
         let Some(pool) = &self.database else {
             return Ok(());
         };
-        sqlx::query(
-            "INSERT INTO nblb.request_attempts (request_id, profile_id, key_id, owner_id, outcome) VALUES ($1,$2,$3,$4,'started')",
+        let result = sqlx::query(
+            "INSERT INTO nblb.request_attempts (request_id, profile_id, key_id, owner_id, outcome, proxy_request_id, attempt_no) SELECT $1,$2,$3,$4,'started',request.id,COALESCE((SELECT max(attempt.attempt_no) FROM nblb.request_attempts AS attempt WHERE attempt.proxy_request_id=request.id),0)+1 FROM nblb.proxy_requests AS request WHERE request.request_id=$1 AND request.outcome='started'",
         )
         .bind(request_id)
         .bind(profile)
@@ -374,10 +483,18 @@ impl VaultStore {
         .execute(pool)
         .await
         .context("record request attempt")?;
+        if result.rows_affected() != 1 {
+            bail!("proxy request row is missing before attempt start")
+        }
         Ok(())
     }
 
-    async fn attempt_finished(&self, request_id: Uuid, key_id: Uuid, outcome: &str) -> Result<()> {
+    async fn attempt_finished(
+        &self,
+        request_id: Uuid,
+        key_id: Uuid,
+        terminal: AttemptTerminal,
+    ) -> Result<()> {
         let Some(pool) = &self.database else {
             return Ok(());
         };
@@ -392,11 +509,15 @@ impl VaultStore {
         .context("load request profile")?
         .ok_or_else(|| anyhow!("request attempt terminal row is missing"))?;
         let result = sqlx::query(
-            "UPDATE nblb.request_attempts SET outcome=$3, finished_at=now() WHERE id = (SELECT id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$4 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1)",
+            "UPDATE nblb.request_attempts AS attempt SET outcome=$3, status_code=$4, error_class=$5, cooldown_applied_until=$6, bytes_out=$7, latency_ms=GREATEST(0, floor(extract(epoch FROM (now() - attempt.created_at)) * 1000)::bigint), finished_at=now() WHERE attempt.id = (SELECT id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$8 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1)",
         )
         .bind(request_id)
         .bind(key_id)
-        .bind(outcome)
+        .bind(terminal.outcome)
+        .bind(terminal.status_code.map(i32::from))
+        .bind(terminal.error_class)
+        .bind(terminal.cooldown_applied_until)
+        .bind(terminal.bytes_out)
         .bind(self.owner_id)
         .execute(pool)
         .await
@@ -404,7 +525,7 @@ impl VaultStore {
         if result.rows_affected() != 1 {
             bail!("request attempt terminal row is missing")
         }
-        if outcome == "succeeded" {
+        if terminal.outcome == "succeeded" {
             sqlx::query(
                 "INSERT INTO nblb.profile_probe_receipts (profile_id, key_id) VALUES ($1, $2) ON CONFLICT (profile_id, key_id) DO UPDATE SET verified_at=now()",
             )
@@ -413,6 +534,102 @@ impl VaultStore {
             .execute(pool)
             .await
             .context("persist profile provider receipt")?;
+        }
+        Ok(())
+    }
+
+    async fn request_and_attempt_finished(
+        &self,
+        request_id: Uuid,
+        key_id: Uuid,
+        attempt: AttemptTerminal,
+        request: RequestTerminal,
+    ) -> Result<()> {
+        let Some(pool) = &self.database else {
+            return Ok(());
+        };
+        let mut tx = pool
+            .begin()
+            .await
+            .context("begin request terminal update")?;
+        let profile = sqlx::query_scalar::<_, String>(
+            "SELECT profile_id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$3 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(request_id)
+        .bind(key_id)
+        .bind(self.owner_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("load final request profile")?
+        .ok_or_else(|| anyhow!("final request attempt row is missing"))?;
+        let attempt_result = sqlx::query(
+            "UPDATE nblb.request_attempts AS current SET outcome=$3,status_code=$4,error_class=$5,cooldown_applied_until=$6,bytes_out=$7,latency_ms=GREATEST(0,floor(extract(epoch FROM (now()-current.created_at))*1000)::bigint),finished_at=now() WHERE current.id=(SELECT id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$8 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1)",
+        )
+        .bind(request_id)
+        .bind(key_id)
+        .bind(attempt.outcome)
+        .bind(attempt.status_code.map(i32::from))
+        .bind(attempt.error_class)
+        .bind(attempt.cooldown_applied_until)
+        .bind(attempt.bytes_out)
+        .bind(self.owner_id)
+        .execute(&mut *tx)
+        .await
+        .context("finish final request attempt")?;
+        if attempt_result.rows_affected() != 1 {
+            bail!("final request attempt row is missing")
+        }
+        if attempt.outcome == "succeeded" {
+            sqlx::query(
+                "INSERT INTO nblb.profile_probe_receipts(profile_id,key_id) VALUES ($1,$2) ON CONFLICT (profile_id,key_id) DO UPDATE SET verified_at=now()",
+            )
+            .bind(&profile)
+            .bind(key_id)
+            .execute(&mut *tx)
+            .await
+            .context("persist final request profile receipt")?;
+        }
+        let request_result = sqlx::query(
+            "UPDATE nblb.proxy_requests AS request SET outcome=$2,status_code=$3,error_class=$4,duration_ms=GREATEST(0,floor(extract(epoch FROM (now()-request.started_at))*1000)::bigint),ttfb_ms=$5,failover_count=GREATEST(0,(SELECT count(*)-1 FROM nblb.request_attempts AS child WHERE child.proxy_request_id=request.id))::smallint,finished_at=now() WHERE request.request_id=$1 AND request.outcome='started'",
+        )
+        .bind(request_id)
+        .bind(request.outcome)
+        .bind(request.status_code.map(i32::from))
+        .bind(request.error_class)
+        .bind(request.ttfb_ms)
+        .execute(&mut *tx)
+        .await
+        .context("finish final proxy request")?;
+        if request_result.rows_affected() != 1 {
+            bail!("final proxy request row is missing")
+        }
+        tx.commit()
+            .await
+            .context("commit request terminal update")?;
+        Ok(())
+    }
+
+    async fn attempt_response_started(
+        &self,
+        request_id: Uuid,
+        key_id: Uuid,
+        ttfb_ms: i64,
+    ) -> Result<()> {
+        let Some(pool) = &self.database else {
+            return Ok(());
+        };
+        let result = sqlx::query(
+            "UPDATE nblb.request_attempts SET response_started=true, ttfb_ms=$3 WHERE id=(SELECT id FROM nblb.request_attempts WHERE request_id=$1 AND key_id=$2 AND owner_id=$4 AND finished_at IS NULL ORDER BY created_at DESC LIMIT 1)",
+        )
+        .bind(request_id)
+        .bind(key_id)
+        .bind(ttfb_ms)
+        .bind(self.owner_id)
+        .execute(pool)
+        .await
+        .context("mark request attempt response start")?;
+        if result.rows_affected() != 1 {
+            bail!("request attempt response-start row is missing")
         }
         Ok(())
     }
@@ -921,6 +1138,7 @@ async fn main() -> std::io::Result<()> {
         "default-src 'self'; script-src 'self'{script_hashes}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
     );
     spawn_database_watchdog(state.clone());
+    evidence::spawn_operations_workers(state.clone());
     HttpServer::new(move || {
         App::new()
             .wrap(from_fn(request_id::assign_request_id))
@@ -958,6 +1176,10 @@ fn spawn_database_watchdog(state: web::Data<AppState>) {
             }
             if let Err(error) = state.vault.cleanup_stale_attempts().await {
                 eprintln!("postgres stale attempt cleanup failed: {error:#}");
+                std::process::exit(1);
+            }
+            if let Err(error) = state.vault.cleanup_stale_proxy_requests().await {
+                eprintln!("postgres stale request cleanup failed: {error:#}");
                 std::process::exit(1);
             }
             let healthy = sqlx::query_scalar::<_, i32>("SELECT 1")
@@ -1582,11 +1804,12 @@ fn mock_response(request: &Value, stream: bool) -> HttpResponse {
 /// first frame is intentionally yielded by the body stream (rather than
 /// before the response is returned), so a client timeout exercises the actual
 /// disconnect/cancellation path in PostgreSQL smoke.
-fn mock_stream_response(
+async fn mock_stream_response(
     request: &Value,
     state: web::Data<AppState>,
     request_id: Uuid,
     key_id: Uuid,
+    evidence: RequestEvidence,
 ) -> HttpResponse {
     let model = request
         .get("model")
@@ -1618,14 +1841,48 @@ fn mock_stream_response(
             Some((Ok::<Bytes, reqwest::Error>(chunk), (chunks, index + 1)))
         },
     ));
+    let mut stream_guard = StreamAttemptGuard::with_request(evidence);
+    let (upstream, validator, prefix) =
+        match tokio::time::timeout(STREAM_PRIME_TIMEOUT, prime_stream(upstream)).await {
+            Ok(Ok(value)) => value,
+            _ => {
+                let cooldown = record_failure(&state, key_id, None).await.ok().flatten();
+                let recovery_bytes_out = stream_guard.bytes_out();
+                let durable = stream_guard
+                    .finish_request_and_attempt(
+                        key_id,
+                        AttemptTerminal::failed(Some(502), "mock_stream_prime_error", cooldown),
+                        RequestTerminal::failed(502, "mock_stream_prime_error"),
+                        recovery_bytes_out,
+                    )
+                    .await;
+                if durable.is_durable() {
+                    stream_guard.mark_terminal();
+                } else {
+                    eprintln!("mock stream prime terminal update failed");
+                }
+                return openai_error(
+                    StatusCode::BAD_GATEWAY,
+                    "mock upstream stream did not produce a valid first frame",
+                    "upstream_error",
+                    "mock_stream_prime_error",
+                );
+            }
+        };
+    let ttfb_ms = stream_guard.request_elapsed_ms();
+    if let Err(response) = attempt_response_started(&state, request_id, key_id, ttfb_ms).await {
+        return response;
+    }
+    stream_guard.mark_response_started(ttfb_ms);
+    stream_guard.mark_response_committed(StatusCode::OK.as_u16());
     let downstream = chat_response_stream(
         upstream,
-        SseValidator::default(),
-        VecDeque::new(),
+        validator,
+        prefix,
         state.clone(),
         request_id,
         key_id,
-        StreamAttemptGuard::new(state, request_id, key_id),
+        stream_guard,
     );
     HttpResponse::Ok()
         .insert_header(("content-type", "text/event-stream"))
@@ -1637,15 +1894,15 @@ async fn authorize_scope(
     req: &HttpRequest,
     state: &web::Data<AppState>,
     scope: &str,
-) -> Result<(), HttpResponse> {
+) -> Result<Option<Uuid>, HttpResponse> {
     let Some(token) = bearer(req) else {
         if !state.require_downstream_token {
-            return Ok(());
+            return Ok(None);
         }
         return Err(downstream_unauthorized());
     };
     match state.vault.authenticate(token, scope).await {
-        Ok(_) => Ok(()),
+        Ok(summary) => Ok(Some(summary.id)),
         Err(error) if error.to_string() == "insufficient scope" => Err(downstream_forbidden(scope)),
         Err(error) if error.to_string() == "invalid downstream credential" => {
             Err(downstream_unauthorized())
@@ -1894,10 +2151,17 @@ async fn record_failure(
     state: &web::Data<AppState>,
     id: Uuid,
     retry_after: Option<Duration>,
-) -> Result<(), HttpResponse> {
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, HttpResponse> {
     state
         .vault
-        .mutate(|vault| vault.record_failure(id, retry_after))
+        .mutate(|vault| {
+            vault.record_failure(id, retry_after)?;
+            Ok(vault
+                .list()
+                .into_iter()
+                .find(|key| key.id == id)
+                .and_then(|key| key.cooldown_until))
+        })
         .await
         .map_err(|_| {
             openai_error(
@@ -1949,11 +2213,31 @@ async fn attempt_finished(
     state: &web::Data<AppState>,
     request_id: Uuid,
     key_id: Uuid,
-    outcome: &str,
+    terminal: AttemptTerminal,
 ) -> Result<(), HttpResponse> {
     state
         .vault
-        .attempt_finished(request_id, key_id, outcome)
+        .attempt_finished(request_id, key_id, terminal)
+        .await
+        .map_err(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request attempt ledger unavailable",
+                "service_unavailable_error",
+                "ledger_unavailable",
+            )
+        })
+}
+
+async fn attempt_response_started(
+    state: &web::Data<AppState>,
+    request_id: Uuid,
+    key_id: Uuid,
+    ttfb_ms: i64,
+) -> Result<(), HttpResponse> {
+    state
+        .vault
+        .attempt_response_started(request_id, key_id, ttfb_ms)
         .await
         .map_err(|_| {
             openai_error(

@@ -9,12 +9,13 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use super::{
-    AppState, PROFILES, STREAM_PRIME_TIMEOUT, StreamAttemptGuard, UPSTREAM_REQUEST_TIMEOUT,
-    attempt_finished, attempt_started, authorize_scope, chat_response_stream, invalid_request,
-    mock_modality, mock_response, mock_stream_response, normalize_modality_response, openai_error,
-    poll_nvcf, prepare_modality_request, prime_stream, public_guard_response, quarantine_key,
-    record_failure, record_request, request_id::request_id, select_key, upstream_endpoint_for,
-    valid_data_url, validate_chat_response,
+    AppState, AttemptTerminal, PROFILES, RequestEvidence, RequestTerminal, STREAM_PRIME_TIMEOUT,
+    StreamAttemptGuard, UPSTREAM_REQUEST_TIMEOUT, attempt_finished, attempt_response_started,
+    attempt_started, authorize_scope, chat_response_stream, invalid_request, mock_modality,
+    mock_response, mock_stream_response, modality_for_path, normalize_modality_response,
+    openai_error, poll_nvcf, prepare_modality_request, prime_stream, public_guard_response,
+    quarantine_key, record_failure, record_request, request_id::request_id, select_key,
+    upstream_endpoint_for, valid_data_url, validate_chat_response,
 };
 
 pub(crate) async fn chat_completions(
@@ -25,9 +26,10 @@ pub(crate) async fn chat_completions(
     if let Some(response) = public_guard_response(&req) {
         return response;
     }
-    if let Err(response) = authorize_scope(&req, &state, "chat:write").await {
-        return response;
-    }
+    let downstream_credential_id = match authorize_scope(&req, &state, "chat:write").await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     let body = match read_request_body(&mut payload, 64 * 1024 * 1024).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -48,6 +50,20 @@ pub(crate) async fn chat_completions(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let mut evidence = match RequestEvidence::start(
+        state.clone(),
+        request_id,
+        downstream_credential_id,
+        req.path(),
+        profile,
+        stream,
+        modality_for_path(req.path()),
+    )
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(response) => return response,
+    };
     let key_attempts = state.vault.list().len().max(1);
     let mut attempted = Vec::new();
     let mut rate_limited = false;
@@ -66,7 +82,14 @@ pub(crate) async fn chat_completions(
             Ok(value) => value,
             Err(_) => {
                 all_attempts_rate_limited = false;
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                if let Err(response) = attempt_finished(
+                    &state,
+                    request_id,
+                    id,
+                    AttemptTerminal::failed(None, "credential_unavailable", None),
+                )
+                .await
+                {
                     return response;
                 }
                 continue;
@@ -82,22 +105,37 @@ pub(crate) async fn chat_completions(
                 .unwrap_or(false)
                 && attempted.len() == 1;
             if credential.contains("fail") || force_first_failure {
-                if let Err(response) = record_failure(&state, id, Some(Duration::seconds(2))).await
+                let cooldown = match record_failure(&state, id, Some(Duration::seconds(2))).await {
+                    Ok(cooldown) => cooldown,
+                    Err(response) => return response,
+                };
+                if let Err(response) = attempt_finished(
+                    &state,
+                    request_id,
+                    id,
+                    AttemptTerminal::failed(None, "mock_upstream_failure", cooldown),
+                )
+                .await
                 {
-                    return response;
-                }
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
                     return response;
                 }
                 continue;
             }
             if stream {
-                return mock_stream_response(&request, state.clone(), request_id, id);
+                return mock_stream_response(&request, state.clone(), request_id, id, evidence)
+                    .await;
             }
             if let Err(response) = record_request(&state, id).await {
                 return response;
             }
-            if let Err(response) = attempt_finished(&state, request_id, id, "succeeded").await {
+            if let Err(response) = evidence
+                .finish_with_attempt(
+                    id,
+                    AttemptTerminal::succeeded(200, None),
+                    RequestTerminal::succeeded(200),
+                )
+                .await
+            {
                 return response;
             }
             return mock_response(&request, stream);
@@ -130,33 +168,56 @@ pub(crate) async fn chat_completions(
             {
                 let chat_endpoint =
                     upstream_endpoint_for(&state.upstream_url, "/v1/chat/completions", profile);
-                let response =
-                    match poll_nvcf(&state.client, response, &chat_endpoint, &credential).await {
-                        Ok(response) => response,
-                        Err(_) => {
-                            if let Err(response) = record_failure(&state, id, None).await {
-                                return response;
-                            }
-                            if let Err(response) =
-                                attempt_finished(&state, request_id, id, "failed").await
-                            {
-                                return response;
-                            }
-                            return openai_error(
-                                StatusCode::BAD_GATEWAY,
-                                "NVIDIA accepted the request but polling did not complete",
-                                "upstream_error",
-                                "upstream_poll_error",
-                            );
+                let response = match poll_nvcf(&state.client, response, &chat_endpoint, &credential)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let cooldown = match record_failure(&state, id, None).await {
+                            Ok(cooldown) => cooldown,
+                            Err(response) => return response,
+                        };
+                        if let Err(response) = evidence
+                            .finish_with_attempt(
+                                id,
+                                AttemptTerminal::failed(Some(202), "upstream_poll_error", cooldown),
+                                RequestTerminal::failed(
+                                    StatusCode::BAD_GATEWAY.as_u16(),
+                                    "upstream_poll_error",
+                                ),
+                            )
+                            .await
+                        {
+                            return response;
                         }
-                    };
+                        return openai_error(
+                            StatusCode::BAD_GATEWAY,
+                            "NVIDIA accepted the request but polling did not complete",
+                            "upstream_error",
+                            "upstream_poll_error",
+                        );
+                    }
+                };
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        if let Err(response) =
-                            attempt_finished(&state, request_id, id, "failed").await
+                        let cooldown = match record_failure(&state, id, None).await {
+                            Ok(cooldown) => cooldown,
+                            Err(response) => return response,
+                        };
+                        if let Err(response) = attempt_finished(
+                            &state,
+                            request_id,
+                            id,
+                            AttemptTerminal::failed(
+                                Some(status.as_u16()),
+                                "upstream_body_error",
+                                cooldown,
+                            ),
+                        )
+                        .await
                         {
                             return response;
                         }
@@ -167,7 +228,21 @@ pub(crate) async fn chat_completions(
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
                     }
-                    if let Err(response) = attempt_finished(&state, request_id, id, "failed").await
+                    if let Err(response) = evidence
+                        .finish_with_attempt(
+                            id,
+                            AttemptTerminal::failed(
+                                Some(status.as_u16()),
+                                "upstream_protocol_error",
+                                None,
+                            )
+                            .with_bytes_out(bytes.len()),
+                            RequestTerminal::failed(
+                                StatusCode::BAD_GATEWAY.as_u16(),
+                                "upstream_protocol_error",
+                            ),
+                        )
+                        .await
                     {
                         return response;
                     }
@@ -181,7 +256,14 @@ pub(crate) async fn chat_completions(
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
-                if let Err(response) = attempt_finished(&state, request_id, id, "succeeded").await {
+                if let Err(response) = evidence
+                    .finish_with_attempt(
+                        id,
+                        AttemptTerminal::succeeded(status.as_u16(), Some(bytes.len())),
+                        RequestTerminal::succeeded(status.as_u16()),
+                    )
+                    .await
+                {
                     return response;
                 }
                 return HttpResponse::build(status)
@@ -189,7 +271,17 @@ pub(crate) async fn chat_completions(
                     .body(bytes);
             }
             Ok(response) if response.status().as_u16() == 202 => {
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                if let Err(response) = evidence
+                    .finish_with_attempt(
+                        id,
+                        AttemptTerminal::failed(Some(202), "upstream_protocol_error", None),
+                        RequestTerminal::failed(
+                            StatusCode::BAD_GATEWAY.as_u16(),
+                            "upstream_protocol_error",
+                        ),
+                    )
+                    .await
+                {
                     return response;
                 }
                 return openai_error(
@@ -214,11 +306,21 @@ pub(crate) async fn chat_completions(
                         .next()
                         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
                     {
-                        if let Err(response) = record_failure(&state, id, None).await {
-                            return response;
-                        }
-                        if let Err(response) =
-                            attempt_finished(&state, request_id, id, "failed").await
+                        let cooldown = match record_failure(&state, id, None).await {
+                            Ok(cooldown) => cooldown,
+                            Err(response) => return response,
+                        };
+                        if let Err(response) = attempt_finished(
+                            &state,
+                            request_id,
+                            id,
+                            AttemptTerminal::failed(
+                                Some(status.as_u16()),
+                                "unexpected_stream_content_type",
+                                cooldown,
+                            ),
+                        )
+                        .await
                         {
                             return response;
                         }
@@ -228,25 +330,43 @@ pub(crate) async fn chat_completions(
                     // Own the started attempt before awaiting the first SSE
                     // frame. If the client disconnects while the provider is
                     // silent, dropping this guard still closes the ledger row.
-                    let stream_guard = StreamAttemptGuard::new(state.clone(), request_id, id);
+                    let mut stream_guard = StreamAttemptGuard::with_request(evidence);
                     let (upstream, validator, prefix) =
                         match tokio::time::timeout(STREAM_PRIME_TIMEOUT, prime_stream(upstream))
                             .await
                         {
                             Ok(Ok(value)) => value,
                             _ => {
-                                stream_guard.mark_terminal();
-                                if let Err(response) = record_failure(&state, id, None).await {
-                                    return response;
-                                }
-                                if let Err(response) =
-                                    attempt_finished(&state, request_id, id, "failed").await
+                                let cooldown = match record_failure(&state, id, None).await {
+                                    Ok(cooldown) => cooldown,
+                                    Err(response) => return response,
+                                };
+                                if let Err(response) = attempt_finished(
+                                    &state,
+                                    request_id,
+                                    id,
+                                    AttemptTerminal::failed(
+                                        Some(status.as_u16()),
+                                        "stream_prime_error",
+                                        cooldown,
+                                    ),
+                                )
+                                .await
                                 {
                                     return response;
                                 }
+                                evidence = stream_guard.release_request();
                                 continue;
                             }
                         };
+                    let ttfb_ms = stream_guard.request_elapsed_ms();
+                    if let Err(response) =
+                        attempt_response_started(&state, request_id, id, ttfb_ms).await
+                    {
+                        return response;
+                    }
+                    stream_guard.mark_response_started(ttfb_ms);
+                    stream_guard.mark_response_committed(status.as_u16());
                     let downstream = chat_response_stream(
                         upstream,
                         validator,
@@ -264,11 +384,21 @@ pub(crate) async fn chat_completions(
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        if let Err(response) = record_failure(&state, id, None).await {
-                            return response;
-                        }
-                        if let Err(response) =
-                            attempt_finished(&state, request_id, id, "failed").await
+                        let cooldown = match record_failure(&state, id, None).await {
+                            Ok(cooldown) => cooldown,
+                            Err(response) => return response,
+                        };
+                        if let Err(response) = attempt_finished(
+                            &state,
+                            request_id,
+                            id,
+                            AttemptTerminal::failed(
+                                Some(status.as_u16()),
+                                "upstream_body_error",
+                                cooldown,
+                            ),
+                        )
+                        .await
                         {
                             return response;
                         }
@@ -279,7 +409,21 @@ pub(crate) async fn chat_completions(
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
                     }
-                    if let Err(response) = attempt_finished(&state, request_id, id, "failed").await
+                    if let Err(response) = evidence
+                        .finish_with_attempt(
+                            id,
+                            AttemptTerminal::failed(
+                                Some(status.as_u16()),
+                                "upstream_protocol_error",
+                                None,
+                            )
+                            .with_bytes_out(bytes.len()),
+                            RequestTerminal::failed(
+                                StatusCode::BAD_GATEWAY.as_u16(),
+                                "upstream_protocol_error",
+                            ),
+                        )
+                        .await
                     {
                         return response;
                     }
@@ -293,7 +437,14 @@ pub(crate) async fn chat_completions(
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
-                if let Err(response) = attempt_finished(&state, request_id, id, "succeeded").await {
+                if let Err(response) = evidence
+                    .finish_with_attempt(
+                        id,
+                        AttemptTerminal::succeeded(status.as_u16(), Some(bytes.len())),
+                        RequestTerminal::succeeded(status.as_u16()),
+                    )
+                    .await
+                {
                     return response;
                 }
                 return HttpResponse::build(status)
@@ -311,25 +462,47 @@ pub(crate) async fn chat_completions(
                 // 402 means quota/credit exhaustion, not invalid custody. It
                 // therefore receives the same bounded cooldown/failover path
                 // as 429 instead of permanently quarantining the credential.
-                let auth_failure = matches!(response.status().as_u16(), 401 | 403);
-                if auth_failure {
+                let provider_status = response.status().as_u16();
+                let error_class = retryable_error_class(provider_status);
+                let auth_failure = matches!(provider_status, 401 | 403);
+                let cooldown = if auth_failure {
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
                     }
+                    None
                 } else {
                     let retry = retry_after_duration(&response);
-                    if let Err(response) = record_failure(&state, id, retry).await {
-                        return response;
+                    match record_failure(&state, id, retry).await {
+                        Ok(cooldown) => cooldown,
+                        Err(response) => return response,
                     }
-                }
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                };
+                if let Err(response) = attempt_finished(
+                    &state,
+                    request_id,
+                    id,
+                    AttemptTerminal::failed(Some(provider_status), error_class, cooldown),
+                )
+                .await
+                {
                     return response;
                 }
             }
             Ok(response) => {
                 let status = actix_web::http::StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::BAD_GATEWAY);
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                if let Err(response) = evidence
+                    .finish_with_attempt(
+                        id,
+                        AttemptTerminal::failed(
+                            Some(status.as_u16()),
+                            "upstream_request_rejected",
+                            None,
+                        ),
+                        RequestTerminal::rejected(status.as_u16(), "upstream_request_rejected"),
+                    )
+                    .await
+                {
                     return response;
                 }
                 return openai_error(
@@ -340,10 +513,18 @@ pub(crate) async fn chat_completions(
                 );
             }
             Err(_) => {
-                if let Err(response) = record_failure(&state, id, None).await {
-                    return response;
-                }
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                let cooldown = match record_failure(&state, id, None).await {
+                    Ok(cooldown) => cooldown,
+                    Err(response) => return response,
+                };
+                if let Err(response) = attempt_finished(
+                    &state,
+                    request_id,
+                    id,
+                    AttemptTerminal::failed(None, "upstream_transport_error", cooldown),
+                )
+                .await
+                {
                     return response;
                 }
             }
@@ -365,6 +546,18 @@ pub(crate) async fn chat_completions(
             header::HeaderValue::from_str(&seconds.to_string())
                 .expect("cooldown seconds are a valid HTTP header value"),
         );
+        if let Err(finish_response) = evidence
+            .fail(StatusCode::TOO_MANY_REQUESTS, "upstream_rate_limited")
+            .await
+        {
+            return finish_response;
+        }
+        return response;
+    }
+    if let Err(response) = evidence
+        .fail(StatusCode::SERVICE_UNAVAILABLE, "no_eligible_upstream")
+        .await
+    {
         return response;
     }
     openai_error(
@@ -393,9 +586,10 @@ pub(crate) async fn multimodal(
         "/v1/audio/speech" | "/v1/audio/transcriptions" => "audio:write",
         _ => "media:write",
     };
-    if let Err(response) = authorize_scope(&req, &state, scope).await {
-        return response;
-    }
+    let downstream_credential_id = match authorize_scope(&req, &state, scope).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     let body = match read_request_body(&mut payload, 64 * 1024 * 1024).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -426,6 +620,20 @@ pub(crate) async fn multimodal(
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(PROFILES[0]);
+    let mut evidence = match RequestEvidence::start(
+        state.clone(),
+        request_id,
+        downstream_credential_id,
+        req.path(),
+        profile,
+        false,
+        modality_for_path(req.path()),
+    )
+    .await
+    {
+        Ok(evidence) => evidence,
+        Err(response) => return response,
+    };
     let key_attempts = state.vault.list().len().max(1);
     let mut attempted = Vec::new();
     let mut rate_limited = false;
@@ -445,7 +653,14 @@ pub(crate) async fn multimodal(
             Some(value) => value,
             None => {
                 all_attempts_rate_limited = false;
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                if let Err(response) = attempt_finished(
+                    &state,
+                    request_id,
+                    id,
+                    AttemptTerminal::failed(None, "credential_unavailable", None),
+                )
+                .await
+                {
                     return response;
                 }
                 continue;
@@ -455,14 +670,24 @@ pub(crate) async fn multimodal(
             if let Err(response) = record_request(&state, id).await {
                 return response;
             }
-            if let Err(response) = attempt_finished(&state, request_id, id, "succeeded").await {
-                return response;
-            }
             let (body, content_type) = mock_modality(req.path(), &request);
             let (body, content_type) =
                 match normalize_modality_response(req.path(), &body, content_type) {
                     Ok(value) => value,
                     Err(_) => {
+                        if let Err(response) = evidence
+                            .finish_with_attempt(
+                                id,
+                                AttemptTerminal::failed(Some(502), "mock_contract_invalid", None),
+                                RequestTerminal::failed(
+                                    StatusCode::BAD_GATEWAY.as_u16(),
+                                    "mock_contract_invalid",
+                                ),
+                            )
+                            .await
+                        {
+                            return response;
+                        }
                         return openai_error(
                             StatusCode::BAD_GATEWAY,
                             "mock provider fixture failed the modality contract",
@@ -471,6 +696,16 @@ pub(crate) async fn multimodal(
                         );
                     }
                 };
+            if let Err(response) = evidence
+                .finish_with_attempt(
+                    id,
+                    AttemptTerminal::succeeded(200, Some(body.len())),
+                    RequestTerminal::succeeded(200),
+                )
+                .await
+            {
+                return response;
+            }
             return HttpResponse::Ok()
                 .insert_header(("content-type", content_type))
                 .body(body);
@@ -541,11 +776,24 @@ pub(crate) async fn multimodal(
                     match poll_nvcf(&state.client, response, &endpoint, &credential).await {
                         Ok(response) => response,
                         Err(_) => {
-                            if let Err(response) = record_failure(&state, id, None).await {
-                                return response;
-                            }
-                            if let Err(response) =
-                                attempt_finished(&state, request_id, id, "failed").await
+                            let cooldown = match record_failure(&state, id, None).await {
+                                Ok(cooldown) => cooldown,
+                                Err(response) => return response,
+                            };
+                            if let Err(response) = evidence
+                                .finish_with_attempt(
+                                    id,
+                                    AttemptTerminal::failed(
+                                        Some(202),
+                                        "upstream_poll_error",
+                                        cooldown,
+                                    ),
+                                    RequestTerminal::failed(
+                                        StatusCode::BAD_GATEWAY.as_u16(),
+                                        "upstream_poll_error",
+                                    ),
+                                )
+                                .await
                             {
                                 return response;
                             }
@@ -571,11 +819,21 @@ pub(crate) async fn multimodal(
                 let bytes = match response.bytes().await {
                     Ok(bytes) => bytes,
                     Err(_) => {
-                        if let Err(response) = record_failure(&state, id, None).await {
-                            return response;
-                        }
-                        if let Err(response) =
-                            attempt_finished(&state, request_id, id, "failed").await
+                        let cooldown = match record_failure(&state, id, None).await {
+                            Ok(cooldown) => cooldown,
+                            Err(response) => return response,
+                        };
+                        if let Err(response) = attempt_finished(
+                            &state,
+                            request_id,
+                            id,
+                            AttemptTerminal::failed(
+                                Some(status.as_u16()),
+                                "upstream_body_error",
+                                cooldown,
+                            ),
+                        )
+                        .await
                         {
                             return response;
                         }
@@ -589,8 +847,21 @@ pub(crate) async fn multimodal(
                             if let Err(response) = quarantine_key(&state, id).await {
                                 return response;
                             }
-                            if let Err(response) =
-                                attempt_finished(&state, request_id, id, "failed").await
+                            if let Err(response) = evidence
+                                .finish_with_attempt(
+                                    id,
+                                    AttemptTerminal::failed(
+                                        Some(status.as_u16()),
+                                        "upstream_protocol_error",
+                                        None,
+                                    )
+                                    .with_bytes_out(bytes.len()),
+                                    RequestTerminal::failed(
+                                        StatusCode::BAD_GATEWAY.as_u16(),
+                                        "upstream_protocol_error",
+                                    ),
+                                )
+                                .await
                             {
                                 return response;
                             }
@@ -605,7 +876,14 @@ pub(crate) async fn multimodal(
                 if let Err(response) = record_request(&state, id).await {
                     return response;
                 }
-                if let Err(response) = attempt_finished(&state, request_id, id, "succeeded").await {
+                if let Err(response) = evidence
+                    .finish_with_attempt(
+                        id,
+                        AttemptTerminal::succeeded(status.as_u16(), Some(bytes.len())),
+                        RequestTerminal::succeeded(status.as_u16()),
+                    )
+                    .await
+                {
                     return response;
                 }
                 return HttpResponse::build(status)
@@ -622,38 +900,69 @@ pub(crate) async fn multimodal(
             {
                 // 402 is a provider entitlement/credit signal, so cooldown
                 // and failover remain possible; only 401/403 quarantine.
-                let auth_failure = matches!(response.status().as_u16(), 401 | 403);
-                if auth_failure {
+                let provider_status = response.status().as_u16();
+                let error_class = retryable_error_class(provider_status);
+                let auth_failure = matches!(provider_status, 401 | 403);
+                let cooldown = if auth_failure {
                     if let Err(response) = quarantine_key(&state, id).await {
                         return response;
                     }
+                    None
                 } else {
                     let retry = retry_after_duration(&response);
-                    if let Err(response) = record_failure(&state, id, retry).await {
-                        return response;
+                    match record_failure(&state, id, retry).await {
+                        Ok(cooldown) => cooldown,
+                        Err(response) => return response,
                     }
-                }
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                };
+                if let Err(response) = attempt_finished(
+                    &state,
+                    request_id,
+                    id,
+                    AttemptTerminal::failed(Some(provider_status), error_class, cooldown),
+                )
+                .await
+                {
                     return response;
                 }
             }
             Ok(response) => {
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                let status = StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                if let Err(response) = evidence
+                    .finish_with_attempt(
+                        id,
+                        AttemptTerminal::failed(
+                            Some(status.as_u16()),
+                            "upstream_request_rejected",
+                            None,
+                        ),
+                        RequestTerminal::rejected(status.as_u16(), "upstream_request_rejected"),
+                    )
+                    .await
+                {
                     return response;
                 }
                 return openai_error(
-                    StatusCode::from_u16(response.status().as_u16())
-                        .unwrap_or(StatusCode::BAD_GATEWAY),
+                    status,
                     "NVIDIA rejected the request",
                     "upstream_error",
                     "upstream_request_rejected",
                 );
             }
             Err(_) => {
-                if let Err(response) = record_failure(&state, id, None).await {
-                    return response;
-                }
-                if let Err(response) = attempt_finished(&state, request_id, id, "failed").await {
+                let cooldown = match record_failure(&state, id, None).await {
+                    Ok(cooldown) => cooldown,
+                    Err(response) => return response,
+                };
+                if let Err(response) = attempt_finished(
+                    &state,
+                    request_id,
+                    id,
+                    AttemptTerminal::failed(None, "upstream_transport_error", cooldown),
+                )
+                .await
+                {
                     return response;
                 }
             }
@@ -675,6 +984,18 @@ pub(crate) async fn multimodal(
             header::HeaderValue::from_str(&seconds.to_string())
                 .expect("cooldown seconds are a valid HTTP header value"),
         );
+        if let Err(finish_response) = evidence
+            .fail(StatusCode::TOO_MANY_REQUESTS, "upstream_rate_limited")
+            .await
+        {
+            return finish_response;
+        }
+        return response;
+    }
+    if let Err(response) = evidence
+        .fail(StatusCode::SERVICE_UNAVAILABLE, "no_eligible_upstream")
+        .await
+    {
         return response;
     }
     openai_error(
@@ -848,6 +1169,17 @@ fn retry_after_duration(response: &reqwest::Response) -> Option<Duration> {
     let remaining = deadline.duration_since(std::time::SystemTime::now()).ok()?;
     let seconds = i64::try_from(remaining.as_secs()).ok()?.clamp(1, 300);
     Some(Duration::seconds(seconds))
+}
+
+fn retryable_error_class(status_code: u16) -> &'static str {
+    match status_code {
+        401 | 403 => "upstream_auth_error",
+        402 => "upstream_quota_error",
+        408 => "upstream_timeout",
+        429 => "upstream_rate_limited",
+        500..=599 => "upstream_server_error",
+        _ => "upstream_failure",
+    }
 }
 
 fn retry_after_for_keys(keys: &[nvidia_build_lb_core::KeySummary]) -> Option<u64> {
