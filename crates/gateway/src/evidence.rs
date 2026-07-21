@@ -316,13 +316,14 @@ impl VaultStore {
             .await
             .context("begin request terminal recovery")?;
         sqlx::query(
-            "UPDATE nblb.request_attempts AS attempt SET outcome=$2, status_code=$3, error_class=$4, bytes_out=$5, latency_ms=GREATEST(0, floor(extract(epoch FROM (now() - attempt.created_at)) * 1000)::bigint), finished_at=now() WHERE attempt.request_id=$1 AND attempt.owner_id=$6 AND attempt.finished_at IS NULL",
+            "UPDATE nblb.request_attempts AS attempt SET outcome=$2, status_code=$3, error_class=$4, bytes_out=$5, ttfb_ms=COALESCE(attempt.ttfb_ms,$6), response_started=attempt.response_started OR $6 IS NOT NULL, latency_ms=GREATEST(0, floor(extract(epoch FROM (now() - attempt.created_at)) * 1000)::bigint), finished_at=now() WHERE attempt.request_id=$1 AND attempt.owner_id=$7 AND attempt.finished_at IS NULL",
         )
         .bind(request_id)
         .bind(outcome)
         .bind(status_code.map(i32::from))
         .bind(error_class)
         .bind(i64::try_from(bytes_out).unwrap_or(i64::MAX))
+        .bind(ttfb_ms)
         .bind(owner_id)
         .execute(&mut *tx)
         .await
@@ -484,6 +485,7 @@ mod tests {
     use super::{
         AppState, AttemptTerminal, RequestEvidence, RequestTerminal, VaultStore, modality_for_path,
     };
+    use crate::proxy::start_evidenced_attempt;
     use crate::streaming::{
         StreamAttemptGuard, StreamTerminalResult, UpstreamByteStream, chat_response_stream,
         prime_stream,
@@ -553,6 +555,26 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("request terminal pair did not close")
+    }
+
+    async fn wait_for_request_terminal(
+        pool: &sqlx::PgPool,
+        request_id: Uuid,
+    ) -> (String, Option<String>, Option<i16>) {
+        for _ in 0..50 {
+            let state = sqlx::query_as::<_, (String, Option<String>, Option<i16>)>(
+                "SELECT outcome,error_class,status_code FROM nblb.proxy_requests WHERE request_id=$1",
+            )
+            .bind(request_id)
+            .fetch_one(pool)
+            .await
+            .expect("load request terminal state");
+            if state.0 != "started" {
+                return state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("request terminal row did not close")
     }
 
     #[test]
@@ -1018,6 +1040,22 @@ mod tests {
         .execute(&pool)
         .await
         .expect("create one-shot failpoint trigger");
+        sqlx::query("CREATE TABLE nblb.test_attempt_start_failpoints(request_id uuid PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .expect("create attempt-start failpoint table");
+        sqlx::query(
+            "CREATE FUNCTION nblb.test_attempt_start_failpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF EXISTS (SELECT 1 FROM nblb.test_attempt_start_failpoints WHERE request_id=NEW.request_id) THEN RAISE EXCEPTION 'forced attempt-start failure'; END IF; RETURN NEW; END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create attempt-start failpoint function");
+        sqlx::query(
+            "CREATE TRIGGER test_attempt_start_failpoint BEFORE INSERT ON nblb.request_attempts FOR EACH ROW EXECUTE FUNCTION nblb.test_attempt_start_failpoint()",
+        )
+        .execute(&pool)
+        .await
+        .expect("create attempt-start failpoint trigger");
 
         let state = web::Data::new(AppState {
             vault: store,
@@ -1030,6 +1068,65 @@ mod tests {
             public_port: 2456,
             csp_hashes: Vec::new(),
         });
+
+        sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 2")
+            .execute(&pool)
+            .await
+            .expect("disable terminal-update failpoint during attempt-start failure");
+        let attempt_start_id = Uuid::new_v4();
+        let mut attempt_start_evidence = match RequestEvidence::start(
+            state.clone(),
+            attempt_start_id,
+            None,
+            "/v1/chat/completions",
+            "z-ai/glm-5.2",
+            false,
+            "text",
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(_) => panic!("start attempt-start failure evidence"),
+        };
+        sqlx::query("INSERT INTO nblb.test_attempt_start_failpoints(request_id) VALUES ($1)")
+            .bind(attempt_start_id)
+            .execute(&pool)
+            .await
+            .expect("enable attempt-start failpoint");
+        let response = start_evidenced_attempt(
+            &state,
+            &mut attempt_start_evidence,
+            attempt_start_id,
+            "z-ai/glm-5.2",
+            key_id,
+        )
+        .await
+        .expect_err("attempt-start INSERT must fail closed");
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        drop(attempt_start_evidence);
+        assert_eq!(
+            wait_for_request_terminal(&pool, attempt_start_id).await,
+            (
+                "failed".into(),
+                Some("evidence_unavailable".into()),
+                Some(500)
+            ),
+            "attempt-start failure must not become handler abandonment"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.request_attempts WHERE request_id=$1"
+            )
+            .bind(attempt_start_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count failed attempt-start rows"),
+            0,
+            "failed attempt INSERT must not leave a child row"
+        );
 
         sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 1")
             .execute(&pool)
@@ -1051,14 +1148,14 @@ mod tests {
             "pre-handoff auxiliary failure must survive a failed first Drop update"
         );
         assert_eq!(
-            sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
-                "SELECT request.ttfb_ms,attempt.bytes_out FROM nblb.proxy_requests AS request JOIN nblb.request_attempts AS attempt ON attempt.proxy_request_id=request.id WHERE request.request_id=$1",
+            sqlx::query_as::<_, (Option<i64>, Option<i64>, bool, Option<i64>)>(
+                "SELECT request.ttfb_ms,attempt.ttfb_ms,attempt.response_started,attempt.bytes_out FROM nblb.proxy_requests AS request JOIN nblb.request_attempts AS attempt ON attempt.proxy_request_id=request.id WHERE request.request_id=$1",
             )
             .bind(stream_auxiliary_id)
             .fetch_one(&pool)
             .await
             .expect("load stream auxiliary failure accounting"),
-            (Some(35), Some(23)),
+            (Some(35), Some(35), true, Some(23)),
         );
 
         sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 2")

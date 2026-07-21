@@ -75,7 +75,9 @@ pub(crate) async fn chat_completions(
             break;
         }
         attempted.push(id);
-        if let Err(response) = attempt_started(&state, request_id, profile, id).await {
+        if let Err(response) =
+            start_evidenced_attempt(&state, &mut evidence, request_id, profile, id).await
+        {
             return response;
         }
         let credential = match state.vault.credential(id) {
@@ -668,7 +670,9 @@ pub(crate) async fn multimodal(
             break;
         }
         attempted.push(id);
-        if let Err(response) = attempt_started(&state, request_id, profile, id).await {
+        if let Err(response) =
+            start_evidenced_attempt(&state, &mut evidence, request_id, profile, id).await
+        {
             return response;
         }
         let credential = match state.vault.credential(id).ok() {
@@ -1038,6 +1042,22 @@ pub(crate) async fn multimodal(
         "service_unavailable_error",
         "no_eligible_upstream",
     )
+}
+
+/// Starts a provider attempt while keeping the parent request recoverable as
+/// an explicit evidence failure. Both proxy entry points use this boundary so
+/// an attempt-ledger INSERT failure cannot fall back to handler abandonment.
+pub(crate) async fn start_evidenced_attempt(
+    state: &web::Data<AppState>,
+    evidence: &mut RequestEvidence,
+    request_id: uuid::Uuid,
+    profile: &str,
+    key_id: uuid::Uuid,
+) -> Result<(), HttpResponse> {
+    evidence.arm_evidence_failure(None, 0);
+    attempt_started(state, request_id, profile, key_id).await?;
+    evidence.reset_drop_recovery();
+    Ok(())
 }
 
 pub(crate) fn parse_multimodal_request(
