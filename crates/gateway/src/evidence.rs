@@ -10,6 +10,27 @@ use super::{AppState, AttemptTerminal, RequestTerminal, VaultStore, openai_error
 const ROLLUP_BATCH_SIZE: i64 = 500;
 const OPERATIONS_MAINTENANCE_LOCK_KEY: i64 = 0x4e42_4c42_4f50_534d;
 
+#[derive(Clone, Copy)]
+struct DropRecovery {
+    outcome: &'static str,
+    status_code: Option<u16>,
+    error_class: &'static str,
+    ttfb_ms: Option<i64>,
+    bytes_out: usize,
+}
+
+impl Default for DropRecovery {
+    fn default() -> Self {
+        Self {
+            outcome: "failed",
+            status_code: None,
+            error_class: "handler_abandoned",
+            ttfb_ms: None,
+            bytes_out: 0,
+        }
+    }
+}
+
 /// Owns the downstream request row until a non-stream response is committed or
 /// a streaming body reaches a terminal state. No request content enters this
 /// type; only identifiers, route metadata, status classes, and timings do.
@@ -18,6 +39,7 @@ pub(crate) struct RequestEvidence {
     request_id: Uuid,
     started: Instant,
     terminal: bool,
+    drop_recovery: DropRecovery,
 }
 
 impl RequestEvidence {
@@ -47,6 +69,7 @@ impl RequestEvidence {
             request_id,
             started: Instant::now(),
             terminal: false,
+            drop_recovery: DropRecovery::default(),
         })
     }
 
@@ -72,6 +95,13 @@ impl RequestEvidence {
         attempt: AttemptTerminal,
         request: RequestTerminal,
     ) -> Result<(), HttpResponse> {
+        self.arm_drop_recovery(
+            "failed",
+            Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+            "evidence_unavailable",
+            request.ttfb_ms(),
+            terminal_bytes_out(attempt),
+        );
         self.state
             .vault
             .request_and_attempt_finished(self.request_id, key_id, attempt, request)
@@ -87,6 +117,13 @@ impl RequestEvidence {
         attempt: AttemptTerminal,
         request: RequestTerminal,
     ) -> bool {
+        self.arm_drop_recovery(
+            "failed",
+            request.status_code(),
+            "evidence_unavailable",
+            request.ttfb_ms(),
+            terminal_bytes_out(attempt),
+        );
         if let Err(error) = self
             .state
             .vault
@@ -108,6 +145,7 @@ impl RequestEvidence {
         ttfb_ms: Option<i64>,
         bytes_out: usize,
     ) -> bool {
+        self.arm_drop_recovery(outcome, status_code, error_class, ttfb_ms, bytes_out);
         if let Err(error) = self
             .state
             .vault
@@ -135,6 +173,13 @@ impl RequestEvidence {
         error_class: Option<&'static str>,
         ttfb_ms: Option<i64>,
     ) -> Result<(), HttpResponse> {
+        self.arm_drop_recovery(
+            "failed",
+            Some(StatusCode::INTERNAL_SERVER_ERROR.as_u16()),
+            "evidence_unavailable",
+            ttfb_ms,
+            0,
+        );
         self.state
             .vault
             .proxy_request_finished(self.request_id, outcome, status_code, error_class, ttfb_ms)
@@ -142,6 +187,23 @@ impl RequestEvidence {
             .map_err(|_| evidence_unavailable())?;
         self.terminal = true;
         Ok(())
+    }
+
+    fn arm_drop_recovery(
+        &mut self,
+        outcome: &'static str,
+        status_code: Option<u16>,
+        error_class: &'static str,
+        ttfb_ms: Option<i64>,
+        bytes_out: usize,
+    ) {
+        self.drop_recovery = DropRecovery {
+            outcome,
+            status_code,
+            error_class,
+            ttfb_ms,
+            bytes_out,
+        };
     }
 }
 
@@ -152,22 +214,17 @@ impl Drop for RequestEvidence {
         }
         let state = self.state.clone();
         let request_id = self.request_id;
-        // A bare RequestEvidence has not been handed to an Actix body stream.
-        // Dropping it therefore means handler/ledger abandonment, not a proven
-        // downstream disconnect. StreamAttemptGuard owns the only transition
-        // that may classify a post-handoff drop as cancellation.
-        let outcome = "failed";
-        let error_class = "handler_abandoned";
+        let recovery = self.drop_recovery;
         tokio::spawn(async move {
             if let Err(error) = state
                 .vault
                 .proxy_request_and_open_attempts_finished(
                     request_id,
-                    outcome,
-                    None,
-                    error_class,
-                    None,
-                    0,
+                    recovery.outcome,
+                    recovery.status_code,
+                    recovery.error_class,
+                    recovery.ttfb_ms,
+                    recovery.bytes_out,
                 )
                 .await
             {
@@ -190,11 +247,14 @@ impl VaultStore {
         let Some(pool) = &self.database else {
             return Ok(());
         };
+        let owner_id = self
+            .owner_id
+            .context("database evidence owner lease is missing")?;
         sqlx::query(
             "INSERT INTO nblb.proxy_requests (request_id, owner_id, downstream_credential_id, endpoint, profile_id, stream, modality) VALUES ($1,$2,$3,$4,$5,$6,$7)",
         )
         .bind(request_id)
-        .bind(self.owner_id)
+        .bind(owner_id)
         .bind(downstream_credential_id)
         .bind(endpoint)
         .bind(profile_id)
@@ -246,6 +306,9 @@ impl VaultStore {
         let Some(pool) = &self.database else {
             return Ok(());
         };
+        let owner_id = self
+            .owner_id
+            .context("database evidence owner lease is missing")?;
         let mut tx = pool
             .begin()
             .await
@@ -258,7 +321,7 @@ impl VaultStore {
         .bind(status_code.map(i32::from))
         .bind(error_class)
         .bind(i64::try_from(bytes_out).unwrap_or(i64::MAX))
-        .bind(self.owner_id)
+        .bind(owner_id)
         .execute(&mut *tx)
         .await
         .context("close open attempts with request")?;
@@ -398,6 +461,13 @@ pub(crate) fn modality_for_path(path: &str) -> &'static str {
     }
 }
 
+fn terminal_bytes_out(terminal: AttemptTerminal) -> usize {
+    terminal
+        .bytes_out
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .unwrap_or(0)
+}
+
 fn evidence_unavailable() -> HttpResponse {
     openai_error(
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -424,7 +494,10 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
-    fn test_store(pool: sqlx::PgPool, path: &std::path::Path) -> VaultStore {
+    // Rollup tests never create request evidence, so they intentionally do not
+    // register a gateway owner lease. Evidence creation itself fails closed if
+    // a database-backed store has no owner.
+    fn rollup_test_store(pool: sqlx::PgPool, path: &std::path::Path) -> VaultStore {
         VaultStore {
             vault: Mutex::new(Vault::open(path, [31; 32]).expect("open test vault")),
             database: Some(pool),
@@ -519,6 +592,48 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations/sqlx")]
+    async fn pr2_database_evidence_requires_owner_lease(pool: sqlx::PgPool) {
+        let dir = tempfile::tempdir().expect("test directory");
+        let state = web::Data::new(AppState {
+            vault: rollup_test_store(pool.clone(), &dir.path().join("vault.json")),
+            router: Mutex::new(Default::default()),
+            selection_lock: tokio::sync::Mutex::new(()),
+            client: reqwest::Client::new(),
+            admin_token: "test-admin".into(),
+            upstream_url: "mock://provider".into(),
+            require_downstream_token: false,
+            public_port: 2456,
+            csp_hashes: Vec::new(),
+        });
+        let request_id = Uuid::new_v4();
+
+        assert!(
+            RequestEvidence::start(
+                state,
+                request_id,
+                None,
+                "/v1/chat/completions",
+                "z-ai/glm-5.2",
+                false,
+                "text",
+            )
+            .await
+            .is_err(),
+            "database-backed evidence must fail closed without an owner lease"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.proxy_requests WHERE request_id=$1"
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count owner-less evidence rows"),
+            0,
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations/sqlx")]
     async fn pr2_rollup_is_idempotent_classified_and_percentile_ready(pool: sqlx::PgPool) {
         let key_id = Uuid::new_v4();
         let client_id = Uuid::new_v4();
@@ -573,7 +688,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().expect("test directory");
-        let store = test_store(pool.clone(), &dir.path().join("vault.json"));
+        let store = rollup_test_store(pool.clone(), &dir.path().join("vault.json"));
         let (first, second) = tokio::join!(
             store.rollup_request_metrics(),
             store.rollup_request_metrics()
@@ -914,6 +1029,57 @@ mod tests {
             csp_hashes: Vec::new(),
         });
 
+        sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 1")
+            .execute(&pool)
+            .await
+            .expect("reset one-shot non-stream failpoint");
+        let non_stream_id = Uuid::new_v4();
+        let mut non_stream_evidence = match RequestEvidence::start(
+            state.clone(),
+            non_stream_id,
+            None,
+            "/v1/chat/completions",
+            "z-ai/glm-5.2",
+            false,
+            "text",
+        )
+        .await
+        {
+            Ok(evidence) => evidence,
+            Err(_) => panic!("start non-stream request evidence"),
+        };
+        state
+            .vault
+            .attempt_started(non_stream_id, "z-ai/glm-5.2", key_id)
+            .await
+            .expect("start non-stream request attempt");
+        assert!(
+            non_stream_evidence
+                .finish_with_attempt(
+                    key_id,
+                    AttemptTerminal::succeeded(200, Some(64)),
+                    RequestTerminal::succeeded(200),
+                )
+                .await
+                .is_err(),
+            "atomic finalizer failpoint must fail closed"
+        );
+        drop(non_stream_evidence);
+        assert_eq!(
+            wait_for_terminal_pair(&pool, non_stream_id).await,
+            (
+                "failed".into(),
+                "failed".into(),
+                Some("evidence_unavailable".into()),
+                Some("evidence_unavailable".into()),
+            ),
+            "non-stream Drop recovery must not relabel a finalizer failure as handler abandonment"
+        );
+
+        sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 1")
+            .execute(&pool)
+            .await
+            .expect("reset one-shot awaited recovery failpoint");
         let recovered_id = Uuid::new_v4();
         let mut recovered_guard = start_test_stream(&state, recovered_id, key_id).await;
         recovered_guard.mark_response_started(25);
@@ -1039,6 +1205,10 @@ mod tests {
             )
         );
 
+        sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 1")
+            .execute(&pool)
+            .await
+            .expect("reset one-shot Drop recovery failpoint");
         let committed_id = Uuid::new_v4();
         let mut committed_guard = start_test_stream(&state, committed_id, key_id).await;
         committed_guard.mark_response_started(30);
@@ -1053,6 +1223,17 @@ mod tests {
                 Some("downstream_cancelled".into()),
                 Some("downstream_cancelled".into()),
             )
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+                "SELECT request.ttfb_ms,attempt.bytes_out FROM nblb.proxy_requests AS request JOIN nblb.request_attempts AS attempt ON attempt.proxy_request_id=request.id WHERE request.request_id=$1",
+            )
+            .bind(committed_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load Drop-retried stream accounting"),
+            (Some(30), Some(32)),
+            "Drop retry must preserve the captured TTFB and byte count",
         );
     }
 }
