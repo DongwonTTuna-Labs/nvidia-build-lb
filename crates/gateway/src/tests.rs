@@ -3,11 +3,12 @@ use super::provider::{live_qa_provider_is_canonical, prepare_modality_request, u
 use super::proxy::{parse_multimodal_request, validate_chat_request};
 use super::request_id::{assign_request_id, enforce_admin_boundary};
 use super::{
-    AppState, PROFILES, SseValidator, VaultStore, admin_host_allowed,
-    admin_surface_allowed_for_port, bearer, eligible_key_count, format_origin_host,
-    host_authority_well_formed, inline_script_bodies, mock_chat_content, mock_mp4, mock_wav,
-    openai_error, operations_error, percent_encode_userinfo, poll_nvcf, routes, select_initial_key,
-    should_migrate_file_vault, upstream_endpoint_for, validate_admin_token, validate_chat_response,
+    AppState, AttemptTerminal, PROFILES, RequestTerminal, SseValidator, VaultStore,
+    admin_host_allowed, admin_surface_allowed_for_port, bearer, eligible_key_count,
+    format_origin_host, host_authority_well_formed, inline_script_bodies, mock_chat_content,
+    mock_mp4, mock_wav, openai_error, operations_error, percent_encode_userinfo, poll_nvcf, routes,
+    select_initial_key, should_migrate_file_vault, upstream_endpoint_for, validate_admin_token,
+    validate_chat_response,
 };
 use actix_web::http::{Method, StatusCode, header};
 use actix_web::middleware::from_fn;
@@ -1348,6 +1349,88 @@ async fn stale_profile_proof_is_unavailable_across_health_public_and_admin(pool:
 }
 
 #[sqlx::test(migrations = "../../migrations/sqlx")]
+async fn successful_provider_attempts_clear_concurrent_profile_invalidation(pool: sqlx::PgPool) {
+    let directory = tempfile::tempdir().expect("successful proof refresh vault directory");
+    let owner_id = Uuid::new_v4();
+    let state = web::Data::new(
+        database_test_state(&pool, &directory.path().join("vault.json"), owner_id).await,
+    );
+    let key = state
+        .vault
+        .mutate(|vault| {
+            let key = vault.add("proof-refresh", &format!("nvapi-{}", "a".repeat(80)))?;
+            vault.mark_verified(key.id)?;
+            Ok(key)
+        })
+        .await
+        .expect("seed proof refresh upstream");
+
+    for finalize_request in [false, true] {
+        sqlx::query(
+            "INSERT INTO nblb.profile_probe_receipts(profile_id,key_id,invalidated_at,invalidation_reason) VALUES('z-ai/glm-5.2',$1,now(),'provider_auth_error') ON CONFLICT(profile_id,key_id) DO UPDATE SET invalidated_at=now(),invalidation_reason='provider_auth_error'",
+        )
+        .bind(key.id)
+        .execute(&pool)
+        .await
+        .expect("invalidate proof before successful provider completion");
+        let request_id = Uuid::new_v4();
+        let proxy_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.proxy_requests(request_id,owner_id,endpoint,profile_id,stream,modality) VALUES($1,$2,'/v1/chat/completions','z-ai/glm-5.2',false,'text') RETURNING id",
+        )
+        .bind(request_id)
+        .bind(owner_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed proof refresh proxy request");
+        sqlx::query(
+            "INSERT INTO nblb.request_attempts(request_id,profile_id,key_id,owner_id,proxy_request_id,attempt_no,outcome) VALUES($1,'z-ai/glm-5.2',$2,$3,$4,1,'started')",
+        )
+        .bind(request_id)
+        .bind(key.id)
+        .bind(owner_id)
+        .bind(proxy_id)
+        .execute(&pool)
+        .await
+        .expect("seed proof refresh request attempt");
+
+        if finalize_request {
+            state
+                .vault
+                .request_and_attempt_finished(
+                    request_id,
+                    key.id,
+                    AttemptTerminal::succeeded(200, Some(64)),
+                    RequestTerminal::succeeded(200),
+                )
+                .await
+                .expect("finish successful request and attempt");
+        } else {
+            state
+                .vault
+                .attempt_finished(
+                    request_id,
+                    key.id,
+                    AttemptTerminal::succeeded(200, Some(64)),
+                )
+                .await
+                .expect("finish successful attempt");
+        }
+
+        let invalidation = sqlx::query_as::<_, (
+            Option<DateTime<Utc>>,
+            Option<String>,
+        )>(
+            "SELECT invalidated_at,invalidation_reason FROM nblb.profile_probe_receipts WHERE profile_id='z-ai/glm-5.2' AND key_id=$1",
+        )
+        .bind(key.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load refreshed profile proof");
+        assert_eq!(invalidation, (None, None));
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations/sqlx")]
 async fn routing_simulation_matches_freshness_and_cursor_without_persisting(pool: sqlx::PgPool) {
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
@@ -1522,6 +1605,128 @@ async fn model_probe_rejects_duplicate_upstreams_before_probe_and_audits_only_th
             .expect("count profile receipts after duplicate requests"),
         0
     );
+}
+
+#[sqlx::test(migrations = "../../migrations/sqlx")]
+async fn model_probe_rejects_unknown_upstreams_before_provider_or_probe_evidence(
+    pool: sqlx::PgPool,
+) {
+    let directory = tempfile::tempdir().expect("unknown model probe vault directory");
+    let state = web::Data::new(
+        database_test_state(&pool, &directory.path().join("vault.json"), Uuid::new_v4()).await,
+    );
+    let app = test::init_service(
+        App::new()
+            .wrap(from_fn(crate::request_id::audit_failed_admin_mutation))
+            .wrap(from_fn(assign_request_id))
+            .wrap(from_fn(enforce_admin_boundary))
+            .app_data(state)
+            .configure(crate::operations::admin::routes),
+    )
+    .await;
+    let before_probe_runs = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.probe_runs")
+        .fetch_one(&pool)
+        .await
+        .expect("count probe runs before unknown requests");
+
+    for model_id in ["z-ai/glm-5.2", "black-forest-labs/flux.1-kontext-dev"] {
+        let request = TestRequest::post()
+            .uri("/admin/api/v2/models/probe")
+            .insert_header((header::HOST, "localhost:2456"))
+            .insert_header((header::AUTHORIZATION, "Bearer test-admin"))
+            .set_json(serde_json::json!({
+                "model_id":model_id,
+                "upstream_ids":[Uuid::new_v4()],
+                "confirm_billable":true
+            }))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "invalid_upstream_ids");
+    }
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.probe_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count probe runs after unknown requests"),
+        before_probe_runs
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.profile_probe_receipts")
+            .fetch_one(&pool)
+            .await
+            .expect("count profile receipts after unknown requests"),
+        0
+    );
+}
+
+#[actix_web::test]
+async fn credential_probe_checks_database_before_contacting_provider() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind credential probe provider fixture");
+    let address = listener
+        .local_addr()
+        .expect("credential probe provider fixture address");
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let server_request_count = request_count.clone();
+    let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(1);
+    let server_thread = std::thread::spawn(move || {
+        actix_web::rt::System::new().block_on(async move {
+            let server = HttpServer::new(move || {
+                App::new()
+                    .app_data(web::Data::from(server_request_count.clone()))
+                    .default_service(web::to(|counter: web::Data<AtomicUsize>| async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        HttpResponse::InternalServerError().finish()
+                    }))
+            })
+            .listen(listener)
+            .expect("listen credential probe provider fixture")
+            .run();
+            handle_tx
+                .send(server.handle())
+                .expect("publish credential probe provider handle");
+            server.await.expect("run credential probe provider fixture");
+        });
+    });
+    let handle = handle_rx
+        .recv()
+        .expect("receive credential probe provider handle");
+
+    let directory = tempfile::tempdir().expect("database unavailable probe vault directory");
+    let mut state = pr1_legacy_test_state(&directory.path().join("vault.json")).await;
+    let upstream = state
+        .vault
+        .mutate(|vault| vault.add("preflight", &format!("nvapi-{}", "b".repeat(80))))
+        .await
+        .expect("seed database unavailable probe upstream");
+    state.upstream_url = format!("http://{address}");
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .configure(crate::operations::admin::routes),
+    )
+    .await;
+    let request = TestRequest::post()
+        .uri(&format!("/admin/api/v2/upstreams/{}/probe", upstream.id))
+        .insert_header((header::HOST, "localhost:2456"))
+        .insert_header((header::AUTHORIZATION, "Bearer test-token"))
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["error"]["code"], "database_unavailable");
+    assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+    handle.stop(true).await;
+    server_thread
+        .join()
+        .expect("join credential probe provider fixture");
 }
 
 #[sqlx::test(migrations = "../../migrations/sqlx")]
@@ -2223,6 +2428,18 @@ async fn downstream_usage_increments_once_only_after_full_admission(pool: sqlx::
         .execute(&pool)
         .await
         .expect("restore upstreams");
+
+    // Keep the quota oracle stable when this test crosses a UTC minute or day
+    // boundary. One released permit qualifies in the current calendar minute
+    // and one in the immediately following minute; neither affects the later
+    // active-concurrency assertion.
+    sqlx::query(
+        "INSERT INTO nblb.downstream_request_permits(request_id,downstream_credential_id,owner_id,profile_id,acquired_at,released_at) SELECT id,$1,owner_id,'z-ai/glm-5.2',at,at FROM (SELECT gen_random_uuid() AS id,(SELECT id FROM nblb.gateway_instances LIMIT 1) AS owner_id,date_trunc('minute',now()) AS at UNION ALL SELECT gen_random_uuid(),(SELECT id FROM nblb.gateway_instances LIMIT 1),date_trunc('minute',now())+interval '1 minute') AS fixture",
+    )
+    .bind(client_id)
+    .execute(&pool)
+    .await
+    .expect("seed deterministic calendar-window permits");
 
     for (policy, code) in [
         ("rpm", "rpm_limit_exceeded"),

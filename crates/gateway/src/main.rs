@@ -914,7 +914,7 @@ impl VaultStore {
         }
         if terminal.outcome == "succeeded" {
             sqlx::query(
-                "INSERT INTO nblb.profile_probe_receipts (profile_id, key_id) VALUES ($1, $2) ON CONFLICT (profile_id, key_id) DO UPDATE SET verified_at=now()",
+                "INSERT INTO nblb.profile_probe_receipts (profile_id, key_id) VALUES ($1, $2) ON CONFLICT (profile_id, key_id) DO UPDATE SET verified_at=now(),invalidated_at=NULL,invalidation_reason=NULL",
             )
             .bind(profile)
             .bind(key_id)
@@ -968,7 +968,7 @@ impl VaultStore {
         }
         if attempt.outcome == "succeeded" {
             sqlx::query(
-                "INSERT INTO nblb.profile_probe_receipts(profile_id,key_id) VALUES ($1,$2) ON CONFLICT (profile_id,key_id) DO UPDATE SET verified_at=now()",
+                "INSERT INTO nblb.profile_probe_receipts(profile_id,key_id) VALUES ($1,$2) ON CONFLICT (profile_id,key_id) DO UPDATE SET verified_at=now(),invalidated_at=NULL,invalidation_reason=NULL",
             )
             .bind(&profile)
             .bind(key_id)

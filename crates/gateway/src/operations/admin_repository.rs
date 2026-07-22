@@ -173,6 +173,16 @@ pub(crate) async fn upstream(pool: &PgPool, id: Uuid) -> Result<Option<Upstream>
         .find(|item| item.id == id))
 }
 
+pub(crate) async fn upstream_ids_exist(pool: &PgPool, ids: &[Uuid]) -> Result<bool> {
+    let existing =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.upstream_keys WHERE id=ANY($1)")
+            .bind(ids)
+            .fetch_one(pool)
+            .await
+            .context("validate admin upstream IDs")?;
+    Ok(usize::try_from(existing).is_ok_and(|count| count == ids.len()))
+}
+
 #[derive(Debug, FromRow)]
 struct ClientRow {
     id: Uuid,

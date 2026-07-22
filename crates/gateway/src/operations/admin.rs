@@ -1647,11 +1647,11 @@ async fn probe_upstream(
     }
     let upstream_id = id.into_inner();
     let spec = &super::dto::MODEL_SPECS[0];
-    let result = execute_profile_probe(&state, upstream_id, spec).await;
     let pool = match pool(&req, &state) {
         Ok(pool) => pool,
         Err(response) => return response,
     };
+    let result = execute_profile_probe(&state, upstream_id, spec).await;
     let status = result.status;
     let error = result.error;
     let latency_ms = result.latency_ms;
@@ -2393,6 +2393,27 @@ async fn probe_model(
             "One or two distinct upstream IDs are required.",
         );
     }
+    let pool = match pool(&req, &state) {
+        Ok(pool) => pool,
+        Err(response) => return response,
+    };
+    match repository::upstream_ids_exist(pool, &input.upstream_ids).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return invalid(
+                &req,
+                "invalid_upstream_ids",
+                "Every upstream ID must reference an existing upstream.",
+            );
+        }
+        Err(_) => {
+            return failure(
+                &req,
+                "upstreams_unavailable",
+                "Upstream state is unavailable.",
+            );
+        }
+    }
     if spec.billable_probe && !input.confirm_billable {
         return operations_error(
             &req,
@@ -2403,10 +2424,6 @@ async fn probe_model(
             None,
         );
     }
-    let pool = match pool(&req, &state) {
-        Ok(pool) => pool,
-        Err(response) => return response,
-    };
     let mut probe_runs = Vec::new();
     let mut audit_event_id = None;
     let mut failed = false;
