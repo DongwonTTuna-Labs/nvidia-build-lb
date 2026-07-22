@@ -8,34 +8,95 @@ JS 오류, focus 손실, form polling 덮어쓰기 회귀를 잡습니다.
 (
 set -Eeuo pipefail
 
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-$(git rev-parse --short HEAD)"
-project_name="nblb-ui-smoke-$run_id"
-export NBLB_CI_APP_IMAGE="nvidia-build-lb:ui-smoke-$run_id"
-export NBLB_CI_POSTGRES_IMAGE="nvidia-build-lb-postgres:ui-smoke-$run_id"
+project_name="nblb-ui-smoke"
+lock_path="${XDG_RUNTIME_DIR:-/tmp}/nvidia-build-lb-ui-smoke.lock"
+exec 9>"$lock_path"
+flock --nonblock 9 || {
+  printf '%s\n' 'another nvidia-build-lb UI smoke owns the fixed image refs' >&2
+  exit 75
+}
+# Test image refs are deliberately constant. Rebuilding replaces these two
+# component refs instead of creating one tag per run.
+export NBLB_CI_APP_IMAGE="nvidia-build-lb:local-smoke"
+export NBLB_CI_POSTGRES_IMAGE="nvidia-build-lb-postgres:local-smoke"
+test_image_label="io.dongwontuna.nvidia-build-lb.test-scope=local-smoke"
 export NBLB_APP_REGISTRY_DIGEST="$(printf '0%.0s' {1..64})"
 export NBLB_POSTGRES_REGISTRY_DIGEST="$(printf '0%.0s' {1..64})"
 export NBLB_PORT=63778
 secret_dir=""
 
+remove_test_images() {
+  local image
+  local image_ids
+  local residual_ids
+  local -a stale_image_ids
+  for image in "$NBLB_CI_APP_IMAGE" "$NBLB_CI_POSTGRES_IMAGE"; do
+    if ! image_ids="$(docker image ls --quiet --no-trunc --filter "reference=$image")"; then
+      return 1
+    fi
+    if [[ -n "$image_ids" ]]; then
+      docker image rm "$image" || return 1
+    fi
+  done
+  if ! image_ids="$(docker image ls --quiet --no-trunc --filter "label=$test_image_label")"; then
+    return 1
+  fi
+  if [[ -n "$image_ids" ]]; then
+    if ! image_ids="$(sort -u <<<"$image_ids")"; then
+      return 1
+    fi
+    mapfile -t stale_image_ids <<<"$image_ids"
+    docker image rm "${stale_image_ids[@]}" || return 1
+  fi
+  for image in "$NBLB_CI_APP_IMAGE" "$NBLB_CI_POSTGRES_IMAGE"; do
+    if ! residual_ids="$(docker image ls --quiet --no-trunc --filter "reference=$image")"; then
+      return 1
+    fi
+    if [[ -n "$residual_ids" ]]; then
+      return 1
+    fi
+  done
+  if ! residual_ids="$(docker image ls --quiet --no-trunc --filter "label=$test_image_label")"; then
+    return 1
+  fi
+  [[ -z "$residual_ids" ]]
+}
+
 cleanup() {
   status=$?
+  cleanup_status=0
   trap - EXIT
   set +e
   if [[ -n "$secret_dir" ]]; then
     NBLB_SECRET_DIR="$secret_dir" docker compose --project-name "$project_name" \
-      --file compose.yml --file compose.ci.yml down --volumes --remove-orphans
-    if docker image inspect "$NBLB_CI_POSTGRES_IMAGE" >/dev/null 2>&1; then
+      --file compose.yml --file compose.ci.yml down --volumes --remove-orphans || cleanup_status=1
+    if ! postgres_image_ids="$(docker image ls --quiet --no-trunc \
+      --filter "reference=$NBLB_CI_POSTGRES_IMAGE")"; then
+      cleanup_status=1
+    elif [[ -n "$postgres_image_ids" ]]; then
       docker run --rm --entrypoint rm \
         --mount "type=bind,source=$secret_dir,target=/secrets" \
         "$NBLB_CI_POSTGRES_IMAGE" -f \
-        /secrets/admin_token /secrets/vault_master_key /secrets/db_password
+        /secrets/admin_token /secrets/vault_master_key /secrets/db_password || cleanup_status=1
     fi
-    rmdir "$secret_dir" 2>/dev/null
+    rmdir "$secret_dir" 2>/dev/null || cleanup_status=1
   fi
-  docker image rm "$NBLB_CI_APP_IMAGE" "$NBLB_CI_POSTGRES_IMAGE" >/dev/null 2>&1
+  if ! remove_test_images; then
+    printf '%s\n' 'nvidia-build-lb test image cleanup left residual state' >&2
+    cleanup_status=1
+  fi
+  if ((status == 0 && cleanup_status != 0)); then
+    status=$cleanup_status
+  fi
   exit "$status"
 }
 trap cleanup EXIT
+
+# Recover containers and volumes from an earlier force-killed run before the
+# fixed refs are rebuilt. This never targets the production project name.
+NBLB_SECRET_DIR=/tmp docker compose --project-name "$project_name" \
+  --file compose.yml --file compose.ci.yml down --volumes --remove-orphans
+remove_test_images
 
 bun install --cwd apps/admin --frozen-lockfile --ignore-scripts --no-progress
 bun run --cwd apps/admin check
@@ -45,8 +106,9 @@ bun run --cwd apps/public check
 bun run --cwd apps/public build
 
 # 현재 checkout을 실제 image로 빌드한다. release .env나 운영 digest를 재사용하지 않는다.
-docker build --file Dockerfile.rust --tag "$NBLB_CI_APP_IMAGE" .
-docker build --file docker/postgres.Dockerfile --tag "$NBLB_CI_POSTGRES_IMAGE" .
+docker build --label "$test_image_label" --file Dockerfile.rust --tag "$NBLB_CI_APP_IMAGE" .
+docker build --label "$test_image_label" --file docker/postgres.Dockerfile \
+  --tag "$NBLB_CI_POSTGRES_IMAGE" .
 
 secret_dir=$(mktemp -d)
 chmod 0700 "$secret_dir"
@@ -85,10 +147,13 @@ test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
 persistent context로 실행하고 `Control+Equal` browser-zoom shortcut을 반복해 200%로
 올린 뒤, 750px 물리 창에서 `window.innerWidth`가 375 CSS px인지 확인합니다. zoom 전후
 `innerWidth`, `devicePixelRatio`, `visualViewport.width`, screenshot을 함께 기록하며, 단순
-HiDPI/device-scale 변화만 생기면 실패입니다. 위 명령은 고유 image tag만 사용하며 성공,
-실패, 중단 어느 경우에도 EXIT trap이 **격리된 QA project와 volume**, root-owned 임시
-secret, 임시 image를 정리합니다. 운영 project와 운영 volume에는 이 명령을 사용하지
-않습니다.
+HiDPI/device-scale 변화만 생기면 실패입니다. 위 명령은 app/migrate용 한 개와 PostgreSQL용
+한 개의 **고정 test image ref**만 재사용합니다. 성공·실패 시 EXIT trap이 격리된 QA
+project와 volume, root-owned 임시 secret, 두 test image를 정리하고 고정 ref와 test 전용
+label 기준 잔존 0을 검증합니다. 프로세스가 강제 종료되어 trap이 실행되지 않아도 다음
+실행은 고정 project를 내린 뒤 같은 두 ref와 test label을 가진 이전 image ID를 먼저
+제거합니다. 전역 image prune은 사용하지 않으며 운영 project·volume·immutable digest는
+대상이 아닙니다.
 
 증거는 세 PNG와 DOM의 public navigation, `관리 인증이 필요합니다`,
 `관리 token`, `열기`입니다. 실제 gateway에서 다음을 추가 검증합니다.

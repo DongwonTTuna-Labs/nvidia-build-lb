@@ -33,6 +33,14 @@ jobs:
           --health-retries 20
     env:
       DATABASE_URL: postgresql://postgres:nblb-ci-only@127.0.0.1:5432/nblb
+      NBLB_CI_APP_IMAGE: nvidia-build-lb:ci
+      NBLB_CI_POSTGRES_IMAGE: nvidia-build-lb-postgres:ci
+      NBLB_CI_TEST_IMAGE_LABEL: io.dongwontuna.nvidia-build-lb.test-scope=ci
+      NBLB_APP_REGISTRY_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      NBLB_POSTGRES_REGISTRY_DIGEST: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      NBLB_SECRET_DIR: /tmp/nblb-ci-secrets
+      NBLB_UPSTREAM_URL: mock://provider
+      NBLB_PORT: "2456"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -66,19 +74,34 @@ jobs:
           bun run --cwd apps/public format
           bun run --cwd apps/public knip
           bun run --cwd apps/public build
+      - name: Reconcile previous Compose smoke resources
+        run: |
+          docker compose --project-name nblb-ci --file compose.yml --file compose.ci.yml \
+            down --volumes --remove-orphans
+          for image in "$NBLB_CI_APP_IMAGE" "$NBLB_CI_POSTGRES_IMAGE"; do
+            image_ids="$(docker image ls --quiet --no-trunc --filter "reference=$image")"
+            if [[ -n "$image_ids" ]]; then
+              docker image rm "$image"
+            fi
+          done
+          image_ids="$(docker image ls --quiet --no-trunc \
+            --filter "label=$NBLB_CI_TEST_IMAGE_LABEL")"
+          if [[ -n "$image_ids" ]]; then
+            image_ids="$(sort -u <<<"$image_ids")"
+            mapfile -t stale_image_ids <<<"$image_ids"
+            docker image rm "${stale_image_ids[@]}"
+          fi
+          residual_ids="$(docker image ls --quiet --no-trunc \
+            --filter "label=$NBLB_CI_TEST_IMAGE_LABEL")"
+          test -z "$residual_ids"
       - name: Build runtime images
         run: |
-          docker build --pull --build-arg NBLB_GIT_COMMIT="$GITHUB_SHA" --file Dockerfile.rust --tag nvidia-build-lb:ci .
-          docker build --pull --file docker/postgres.Dockerfile --tag nvidia-build-lb-postgres:ci .
+          docker build --pull --label "$NBLB_CI_TEST_IMAGE_LABEL" \
+            --build-arg NBLB_GIT_COMMIT="$GITHUB_SHA" \
+            --file Dockerfile.rust --tag "$NBLB_CI_APP_IMAGE" .
+          docker build --pull --label "$NBLB_CI_TEST_IMAGE_LABEL" \
+            --file docker/postgres.Dockerfile --tag "$NBLB_CI_POSTGRES_IMAGE" .
       - name: Run independent-stack Compose smoke
-        env:
-          NBLB_CI_APP_IMAGE: nvidia-build-lb:ci
-          NBLB_CI_POSTGRES_IMAGE: nvidia-build-lb-postgres:ci
-          NBLB_APP_REGISTRY_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          NBLB_POSTGRES_REGISTRY_DIGEST: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-          NBLB_SECRET_DIR: /tmp/nblb-ci-secrets
-          NBLB_UPSTREAM_URL: mock://provider
-          NBLB_PORT: "2456"
         run: |
           install -d -m 0700 "$NBLB_SECRET_DIR"
           admin_token="nblb_admin_$(openssl rand -hex 32)"
@@ -130,12 +153,42 @@ jobs:
             http://127.0.0.1:2456/v1/chat/completions | jq -e '.choices[0].message.content' >/dev/null
       - name: Clean Compose smoke resources
         if: always()
-        env:
-          NBLB_CI_APP_IMAGE: nvidia-build-lb:ci
-          NBLB_CI_POSTGRES_IMAGE: nvidia-build-lb-postgres:ci
-          NBLB_APP_REGISTRY_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          NBLB_POSTGRES_REGISTRY_DIGEST: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-          NBLB_SECRET_DIR: /tmp/nblb-ci-secrets
         run: |
-          docker compose --project-name nblb-ci --file compose.yml --file compose.ci.yml down --volumes --remove-orphans
-          sudo rm -rf -- "$NBLB_SECRET_DIR"
+          cleanup_status=0
+          docker compose --project-name nblb-ci --file compose.yml --file compose.ci.yml \
+            down --volumes --remove-orphans || cleanup_status=1
+          sudo rm -rf -- "$NBLB_SECRET_DIR" || cleanup_status=1
+          for image in "$NBLB_CI_APP_IMAGE" "$NBLB_CI_POSTGRES_IMAGE"; do
+            if ! image_ids="$(docker image ls --quiet --no-trunc \
+              --filter "reference=$image")"; then
+              cleanup_status=1
+              continue
+            fi
+            if [[ -n "$image_ids" ]] && ! docker image rm "$image"; then
+              cleanup_status=1
+            fi
+            if ! residual_ids="$(docker image ls --quiet --no-trunc \
+              --filter "reference=$image")"; then
+              cleanup_status=1
+            elif [[ -n "$residual_ids" ]]; then
+              cleanup_status=1
+            fi
+          done
+          if ! image_ids="$(docker image ls --quiet --no-trunc \
+            --filter "label=$NBLB_CI_TEST_IMAGE_LABEL")"; then
+            cleanup_status=1
+          elif [[ -n "$image_ids" ]]; then
+            if ! image_ids="$(sort -u <<<"$image_ids")"; then
+              cleanup_status=1
+            else
+              mapfile -t stale_image_ids <<<"$image_ids"
+              docker image rm "${stale_image_ids[@]}" || cleanup_status=1
+            fi
+          fi
+          if ! residual_ids="$(docker image ls --quiet --no-trunc \
+            --filter "label=$NBLB_CI_TEST_IMAGE_LABEL")"; then
+            cleanup_status=1
+          elif [[ -n "$residual_ids" ]]; then
+            cleanup_status=1
+          fi
+          exit "$cleanup_status"
