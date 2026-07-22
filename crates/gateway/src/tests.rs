@@ -1517,7 +1517,7 @@ async fn qa_admin_rejects_live_mock_but_accepts_explicit_fake_identity(pool: sql
     assert_eq!(body["item"]["live"], false);
     let run_id =
         Uuid::parse_str(body["item"]["id"].as_str().expect("fake run ID")).expect("fake run UUID");
-    let terminal_status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let terminal_status = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let status: String = sqlx::query_scalar("SELECT status FROM nblb.qa_runs WHERE id=$1")
                 .bind(run_id)

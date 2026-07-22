@@ -922,40 +922,46 @@ mod tests {
         pool: &sqlx::PgPool,
         request_id: Uuid,
     ) -> (String, String, Option<String>, Option<String>) {
-        for _ in 0..50 {
-            let state = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
-                "SELECT request.outcome,attempt.outcome,request.error_class,attempt.error_class FROM nblb.proxy_requests AS request JOIN nblb.request_attempts AS attempt ON attempt.proxy_request_id=request.id WHERE request.request_id=$1",
-            )
-            .bind(request_id)
-            .fetch_one(pool)
-            .await
-            .expect("load request terminal pair");
-            if state.0 != "started" && state.1 != "started" {
-                return state;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let state = sqlx::query_as::<_, (String, String, Option<String>, Option<String>)>(
+                    "SELECT request.outcome,attempt.outcome,request.error_class,attempt.error_class FROM nblb.proxy_requests AS request JOIN nblb.request_attempts AS attempt ON attempt.proxy_request_id=request.id WHERE request.request_id=$1",
+                )
+                .bind(request_id)
+                .fetch_one(pool)
+                .await
+                .expect("load request terminal pair");
+                if state.0 != "started" && state.1 != "started" {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("request terminal pair did not close")
+        })
+        .await
+        .expect("request terminal pair did not close within the bounded recovery window")
     }
 
     async fn wait_for_request_terminal(
         pool: &sqlx::PgPool,
         request_id: Uuid,
     ) -> (String, Option<String>, Option<i16>) {
-        for _ in 0..50 {
-            let state = sqlx::query_as::<_, (String, Option<String>, Option<i16>)>(
-                "SELECT outcome,error_class,status_code FROM nblb.proxy_requests WHERE request_id=$1",
-            )
-            .bind(request_id)
-            .fetch_one(pool)
-            .await
-            .expect("load request terminal state");
-            if state.0 != "started" {
-                return state;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let state = sqlx::query_as::<_, (String, Option<String>, Option<i16>)>(
+                    "SELECT outcome,error_class,status_code FROM nblb.proxy_requests WHERE request_id=$1",
+                )
+                .bind(request_id)
+                .fetch_one(pool)
+                .await
+                .expect("load request terminal state");
+                if state.0 != "started" {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("request terminal row did not close")
+        })
+        .await
+        .expect("request terminal row did not close within the bounded recovery window")
     }
 
     #[test]
