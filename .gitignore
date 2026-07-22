@@ -16,6 +16,8 @@ dist/
 *.sql.gz
 !migrations/sqlx/
 !migrations/sqlx/*.sql
+!crates/gateway/sql/
+!crates/gateway/sql/*.sql
 backups/
 secrets/
 .omo/

@@ -18,6 +18,21 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: nblb-ci-only
+          POSTGRES_DB: nblb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nblb"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:nblb-ci-only@127.0.0.1:5432/nblb
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -34,14 +49,93 @@ jobs:
         run: |
           legacy_files="$(git ls-files | grep -Ei '\.(py|pyw|sh|bash|zsh|js|jsx|mjs|cjs)$' || true)"
           test -z "$legacy_files"
+      - name: Secret pattern scan
+        run: |
+          matches="$(git grep -IlE 'nvapi-[A-Za-z0-9_-]{32,}|nblb_(ds|admin)_[A-Fa-f0-9]{32,}' -- . ':!Cargo.lock' || true)"
+          test -z "$matches"
       - name: Svelte checks
         run: |
           bun install --cwd apps/admin --frozen-lockfile --ignore-scripts --no-progress
+          bun install --cwd apps/public --frozen-lockfile --ignore-scripts --no-progress
+          bun run --cwd apps/admin test
           bun run --cwd apps/admin check
           bun run --cwd apps/admin format
           bun run --cwd apps/admin knip
           bun run --cwd apps/admin build
+          bun run --cwd apps/public check
+          bun run --cwd apps/public format
+          bun run --cwd apps/public knip
+          bun run --cwd apps/public build
       - name: Build runtime images
         run: |
-          docker build --pull --file Dockerfile.rust --tag nvidia-build-lb:ci .
+          docker build --pull --build-arg NBLB_GIT_COMMIT="$GITHUB_SHA" --file Dockerfile.rust --tag nvidia-build-lb:ci .
           docker build --pull --file docker/postgres.Dockerfile --tag nvidia-build-lb-postgres:ci .
+      - name: Run independent-stack Compose smoke
+        env:
+          NBLB_CI_APP_IMAGE: nvidia-build-lb:ci
+          NBLB_CI_POSTGRES_IMAGE: nvidia-build-lb-postgres:ci
+          NBLB_APP_REGISTRY_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          NBLB_POSTGRES_REGISTRY_DIGEST: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          NBLB_SECRET_DIR: /tmp/nblb-ci-secrets
+          NBLB_UPSTREAM_URL: mock://provider
+          NBLB_PORT: "2456"
+        run: |
+          install -d -m 0700 "$NBLB_SECRET_DIR"
+          admin_token="nblb_admin_$(openssl rand -hex 32)"
+          printf '%s' "$admin_token" > "$NBLB_SECRET_DIR/admin_token"
+          openssl rand 32 > "$NBLB_SECRET_DIR/vault_master_key"
+          openssl rand -hex 32 > "$NBLB_SECRET_DIR/db_password"
+          chmod 0600 "$NBLB_SECRET_DIR"/*
+          docker run --rm --entrypoint chown \
+            --mount "type=bind,source=$NBLB_SECRET_DIR,target=/secrets" \
+            nvidia-build-lb-postgres:ci root:root \
+            /secrets/admin_token /secrets/vault_master_key /secrets/db_password
+          docker compose --project-name nblb-ci --file compose.yml --file compose.ci.yml config --quiet
+          docker compose --project-name nblb-ci --file compose.yml --file compose.ci.yml up --detach --wait
+          test "$(docker inspect nblb-ci-db-1 --format '{{.State.Health.Status}}')" = healthy
+          test "$(docker inspect nblb-ci-app-1 --format '{{.State.Health.Status}}')" = healthy
+          curl --fail --silent --show-error http://127.0.0.1:2456/health/live >/dev/null
+          for slot in 1 2; do
+            suffix="$(printf '%*s' 64 '' | tr ' ' "$(test "$slot" = 1 && printf a || printf b)")"
+            upstream="$(curl --fail --silent --show-error \
+              -H 'Host: localhost:2456' \
+              -H "Authorization: Bearer $admin_token" \
+              -H 'Content-Type: application/json' \
+              --data "$(jq -nc --arg label "ci-slot-$slot" --arg credential "nvapi-$suffix" '{label:$label,credential:$credential}')" \
+              http://127.0.0.1:2456/admin/api/v2/upstreams)"
+            upstream_id="$(jq -er '.item.id' <<<"$upstream")"
+            curl --fail --silent --show-error -X POST \
+              -H 'Host: localhost:2456' \
+              -H "Authorization: Bearer $admin_token" \
+              "http://127.0.0.1:2456/admin/api/v2/upstreams/$upstream_id/probe" >/dev/null
+            curl --fail --silent --show-error -X POST \
+              -H 'Host: localhost:2456' \
+              -H "Authorization: Bearer $admin_token" \
+              "http://127.0.0.1:2456/admin/api/v2/upstreams/$upstream_id/enable" >/dev/null
+          done
+          client="$(curl --fail --silent --show-error \
+            -H 'Host: localhost:2456' \
+            -H "Authorization: Bearer $admin_token" \
+            -H 'Content-Type: application/json' \
+            --data '{"label":"ci-smoke","scopes":["models:read","chat:write"]}' \
+            http://127.0.0.1:2456/admin/api/v2/clients)"
+          downstream_token="$(jq -er '.token' <<<"$client")"
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $downstream_token" \
+            http://127.0.0.1:2456/v1/models | jq -e '.data | length > 0' >/dev/null
+          curl --fail --silent --show-error \
+            -H "Authorization: Bearer $downstream_token" \
+            -H 'Content-Type: application/json' \
+            --data '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"CI"}]}' \
+            http://127.0.0.1:2456/v1/chat/completions | jq -e '.choices[0].message.content' >/dev/null
+      - name: Clean Compose smoke resources
+        if: always()
+        env:
+          NBLB_CI_APP_IMAGE: nvidia-build-lb:ci
+          NBLB_CI_POSTGRES_IMAGE: nvidia-build-lb-postgres:ci
+          NBLB_APP_REGISTRY_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          NBLB_POSTGRES_REGISTRY_DIGEST: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          NBLB_SECRET_DIR: /tmp/nblb-ci-secrets
+        run: |
+          docker compose --project-name nblb-ci --file compose.yml --file compose.ci.yml down --volumes --remove-orphans
+          sudo rm -rf -- "$NBLB_SECRET_DIR"

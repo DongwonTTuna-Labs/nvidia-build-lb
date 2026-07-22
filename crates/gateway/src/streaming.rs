@@ -14,7 +14,15 @@ use std::{
 };
 use uuid::Uuid;
 
-use super::{AppState, record_failure, record_request};
+#[cfg(not(test))]
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+use super::{
+    AppState, AttemptTerminal, RequestEvidence, RequestTerminal, record_failure, record_request,
+    validate_chat_response,
+};
 
 pub(crate) fn sse_error_frame(message: &str) -> Bytes {
     // Once an SSE response has started, an HTTP status cannot be changed. A
@@ -56,24 +64,135 @@ pub(crate) async fn prime_stream(
 }
 
 pub(crate) struct StreamAttemptGuard {
-    state: web::Data<AppState>,
-    request_id: Uuid,
-    key_id: Uuid,
     terminal: Arc<AtomicBool>,
+    request: Option<RequestEvidence>,
+    ttfb_ms: Option<i64>,
+    bytes_out: usize,
+    drop_outcome: &'static str,
+    drop_status_code: Option<u16>,
+    drop_error_class: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamTerminalResult {
+    RequestedTerminalCommitted,
+    RecoveredAsEvidenceFailure,
+    PendingDropRetry,
+}
+
+impl StreamTerminalResult {
+    pub(crate) fn is_durable(self) -> bool {
+        self != Self::PendingDropRetry
+    }
 }
 
 impl StreamAttemptGuard {
-    pub(crate) fn new(state: web::Data<AppState>, request_id: Uuid, key_id: Uuid) -> Self {
+    pub(crate) fn with_request(request: RequestEvidence) -> Self {
         Self {
-            state,
-            request_id,
-            key_id,
             terminal: Arc::new(AtomicBool::new(false)),
+            request: Some(request),
+            ttfb_ms: None,
+            bytes_out: 0,
+            drop_outcome: "failed",
+            drop_status_code: None,
+            drop_error_class: "handler_abandoned",
         }
     }
 
     pub(crate) fn mark_terminal(&self) {
         self.terminal.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn request_elapsed_ms(&self) -> i64 {
+        self.request.as_ref().map_or(0, RequestEvidence::elapsed_ms)
+    }
+
+    pub(crate) fn mark_response_started(&mut self, ttfb_ms: i64) {
+        self.ttfb_ms = Some(ttfb_ms);
+    }
+
+    /// Arms a fail-closed terminal before an auxiliary accounting/health
+    /// update that follows a conclusive provider observation. If that update
+    /// fails, Drop preserves the observation as an evidence failure instead
+    /// of relabeling it as handler abandonment.
+    pub(crate) fn arm_evidence_failure(&mut self, ttfb_ms: Option<i64>, bytes_out: usize) {
+        self.ttfb_ms = ttfb_ms;
+        self.bytes_out = bytes_out;
+        self.drop_outcome = "failed";
+        self.drop_status_code = Some(500);
+        self.drop_error_class = "evidence_unavailable";
+    }
+
+    /// Marks the point after which Actix owns the response body. Only drops
+    /// after this handoff are evidence of a downstream cancellation.
+    pub(crate) fn mark_response_committed(&mut self, status_code: u16) {
+        self.drop_outcome = "cancelled";
+        self.drop_status_code = Some(status_code);
+        self.drop_error_class = "downstream_cancelled";
+    }
+
+    pub(crate) fn record_bytes_out(&mut self, bytes: usize) {
+        self.bytes_out = self.bytes_out.saturating_add(bytes);
+    }
+
+    pub(crate) fn bytes_out(&self) -> usize {
+        self.bytes_out
+    }
+
+    /// Releases the request to the failover loop only after the current
+    /// attempt has reached a durable terminal state. Consuming self prevents
+    /// a disarmed guard from existing across another await.
+    pub(crate) fn release_request(mut self) -> RequestEvidence {
+        self.mark_terminal();
+        self.request
+            .take()
+            .expect("stream guard always owns request evidence")
+    }
+
+    pub(crate) async fn finish_request_and_attempt(
+        &mut self,
+        key_id: Uuid,
+        attempt: AttemptTerminal,
+        terminal: RequestTerminal,
+        recovery_bytes_out: usize,
+    ) -> StreamTerminalResult {
+        let terminal = terminal.with_ttfb(self.ttfb_ms);
+        let finished = match self.request.as_mut() {
+            Some(request) => {
+                request
+                    .finish_with_attempt_silently(key_id, attempt, terminal)
+                    .await
+            }
+            None => return StreamTerminalResult::RequestedTerminalCommitted,
+        };
+        if finished {
+            return StreamTerminalResult::RequestedTerminalCommitted;
+        }
+
+        // The typed finalizer rolled back. Preserve one awaited recovery before
+        // emitting a terminal SSE frame; if it also fails, keep the guard armed
+        // so Drop schedules a final best-effort retry with the same timings.
+        self.drop_outcome = "failed";
+        self.drop_status_code = terminal.status_code();
+        self.drop_error_class = "evidence_unavailable";
+        self.bytes_out = recovery_bytes_out;
+        if self
+            .request
+            .as_mut()
+            .expect("stream guard owns request evidence until terminal")
+            .finish_with_open_attempts_silently(
+                self.drop_outcome,
+                self.drop_status_code,
+                self.drop_error_class,
+                terminal.ttfb_ms(),
+                self.bytes_out,
+            )
+            .await
+        {
+            StreamTerminalResult::RecoveredAsEvidenceFailure
+        } else {
+            StreamTerminalResult::PendingDropRetry
+        }
     }
 }
 
@@ -82,19 +201,26 @@ impl Drop for StreamAttemptGuard {
         if self.terminal.swap(true, Ordering::AcqRel) {
             return;
         }
-        let state = self.state.clone();
-        let request_id = self.request_id;
-        let key_id = self.key_id;
+        let mut request = self.request.take();
+        let ttfb_ms = self.ttfb_ms;
+        let bytes_out = self.bytes_out;
+        let outcome = self.drop_outcome;
+        let status_code = self.drop_status_code;
+        let error_class = self.drop_error_class;
         // Actix drops the body stream on a client disconnect. The durable
         // terminal update is therefore scheduled from Drop so a started row
         // cannot survive an abandoned downstream connection.
         tokio::spawn(async move {
-            if let Err(error) = state
-                .vault
-                .attempt_finished(request_id, key_id, "cancelled")
-                .await
-            {
-                eprintln!("stream cancellation ledger update failed: {error:#}");
+            if let Some(request) = request.as_mut() {
+                request
+                    .finish_with_open_attempts_silently(
+                        outcome,
+                        status_code,
+                        error_class,
+                        ttfb_ms,
+                        bytes_out,
+                    )
+                    .await;
             }
         });
     }
@@ -102,19 +228,27 @@ impl Drop for StreamAttemptGuard {
 
 pub(crate) async fn finish_stream_failure(
     state: &web::Data<AppState>,
-    request_id: Uuid,
     key_id: Uuid,
-) {
-    if record_failure(state, key_id, None).await.is_err() {
-        eprintln!("stream failure health update failed");
-    }
-    if let Err(error) = state
-        .vault
-        .attempt_finished(request_id, key_id, "failed")
+    terminal: AttemptTerminal,
+    error_class: &'static str,
+    guard: &mut StreamAttemptGuard,
+) -> StreamTerminalResult {
+    let cooldown = match record_failure(state, key_id, None).await {
+        Ok(cooldown) => cooldown,
+        Err(_) => {
+            eprintln!("stream failure health update failed");
+            None
+        }
+    };
+    let bytes_out = guard.bytes_out();
+    guard
+        .finish_request_and_attempt(
+            key_id,
+            terminal.with_cooldown(cooldown).with_bytes_out(bytes_out),
+            RequestTerminal::failed(200, error_class),
+            bytes_out,
+        )
         .await
-    {
-        eprintln!("stream failure ledger update failed: {error:#}");
-    }
 }
 
 #[derive(Default)]
@@ -313,6 +447,55 @@ impl SseValidator {
     }
 }
 
+async fn finish_stream_success(
+    state: &web::Data<AppState>,
+    key_id: Uuid,
+    guard: &mut StreamAttemptGuard,
+) -> Bytes {
+    if record_request(state, key_id).await.is_err() {
+        let error_frame = sse_error_frame("request accounting unavailable");
+        guard.record_bytes_out(error_frame.len());
+        let recovery_bytes_out = guard.bytes_out();
+        let durable = guard
+            .finish_request_and_attempt(
+                key_id,
+                AttemptTerminal::failed(Some(200), "request_accounting_unavailable", None)
+                    .with_bytes_out(recovery_bytes_out),
+                RequestTerminal::failed(200, "request_accounting_unavailable"),
+                recovery_bytes_out,
+            )
+            .await;
+        if durable.is_durable() {
+            guard.mark_terminal();
+        }
+        return error_frame;
+    }
+    let done = Bytes::from_static(b"data: [DONE]\n\n");
+    let error_frame = sse_error_frame("request evidence unavailable");
+    let success_bytes_out = guard.bytes_out().saturating_add(done.len());
+    let recovery_bytes_out = guard.bytes_out().saturating_add(error_frame.len());
+    let terminal_result = guard
+        .finish_request_and_attempt(
+            key_id,
+            AttemptTerminal::succeeded(200, Some(success_bytes_out)),
+            RequestTerminal::succeeded(200),
+            recovery_bytes_out,
+        )
+        .await;
+    match terminal_result {
+        StreamTerminalResult::RequestedTerminalCommitted => {
+            guard.record_bytes_out(done.len());
+            guard.mark_terminal();
+            done
+        }
+        StreamTerminalResult::RecoveredAsEvidenceFailure => {
+            guard.mark_terminal();
+            error_frame
+        }
+        StreamTerminalResult::PendingDropRetry => error_frame,
+    }
+}
+
 pub(crate) fn chat_response_stream(
     upstream: UpstreamByteStream,
     validator: SseValidator,
@@ -333,7 +516,7 @@ pub(crate) fn chat_response_stream(
             state,
             request_id,
             key_id,
-            guard,
+            mut guard,
             mut terminal,
         )| async move {
             if terminal {
@@ -341,6 +524,7 @@ pub(crate) fn chat_response_stream(
             }
             loop {
                 if let Some(chunk) = prefix.pop_front() {
+                    guard.record_bytes_out(chunk.len());
                     return Some((
                         Ok(chunk),
                         (
@@ -348,14 +532,37 @@ pub(crate) fn chat_response_stream(
                         ),
                     ));
                 }
-                match upstream.next().await {
-                    Some(Ok(chunk)) => {
+                // `[DONE]` is the semantic end-of-stream. Some providers keep
+                // the HTTP body open after it, so finish the durable ledger as
+                // soon as every preceding validated frame has been emitted.
+                if validator.finish().is_ok() {
+                    let final_frame = finish_stream_success(&state, key_id, &mut guard).await;
+                    return Some((
+                        Ok(final_frame),
+                        (
+                            upstream, validator, prefix, state, request_id, key_id, guard, true,
+                        ),
+                    ));
+                }
+                match tokio::time::timeout(STREAM_IDLE_TIMEOUT, upstream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
                         if validator.feed(&chunk).is_err() {
-                            finish_stream_failure(&state, request_id, key_id).await;
+                            let error_frame = sse_error_frame("invalid upstream stream");
+                            guard.record_bytes_out(error_frame.len());
+                            let durable = finish_stream_failure(
+                                &state,
+                                key_id,
+                                AttemptTerminal::failed(Some(200), "upstream_protocol_error", None),
+                                "upstream_protocol_error",
+                                &mut guard,
+                            )
+                            .await;
                             terminal = true;
-                            guard.terminal.store(true, Ordering::Release);
+                            if durable.is_durable() {
+                                guard.mark_terminal();
+                            }
                             return Some((
-                                Ok(sse_error_frame("invalid upstream stream")),
+                                Ok(error_frame),
                                 (
                                     upstream, validator, prefix, state, request_id, key_id, guard,
                                     terminal,
@@ -365,71 +572,88 @@ pub(crate) fn chat_response_stream(
                         prefix.extend(validator.take_emitted());
                         continue;
                     }
-                    Some(Err(_)) => {
-                        finish_stream_failure(&state, request_id, key_id).await;
+                    Ok(Some(Err(_))) => {
+                        let error_frame = sse_error_frame("upstream stream failed");
+                        guard.record_bytes_out(error_frame.len());
+                        let durable = finish_stream_failure(
+                            &state,
+                            key_id,
+                            AttemptTerminal::failed(Some(200), "upstream_stream_error", None),
+                            "upstream_stream_error",
+                            &mut guard,
+                        )
+                        .await;
                         terminal = true;
-                        guard.terminal.store(true, Ordering::Release);
+                        if durable.is_durable() {
+                            guard.mark_terminal();
+                        }
                         return Some((
-                            Ok(sse_error_frame("upstream stream failed")),
+                            Ok(error_frame),
                             (
                                 upstream, validator, prefix, state, request_id, key_id, guard,
                                 terminal,
                             ),
                         ));
                     }
-                    None => {
+                    Ok(None) => {
                         if validator.finish().is_err() {
-                            finish_stream_failure(&state, request_id, key_id).await;
-                            guard.terminal.store(true, Ordering::Release);
-                            return Some((
-                                Ok(sse_error_frame("incomplete upstream stream")),
-                                (
-                                    upstream, validator, prefix, state, request_id, key_id, guard,
-                                    true,
+                            let error_frame = sse_error_frame("incomplete upstream stream");
+                            guard.record_bytes_out(error_frame.len());
+                            let durable = finish_stream_failure(
+                                &state,
+                                key_id,
+                                AttemptTerminal::failed(
+                                    Some(200),
+                                    "incomplete_upstream_stream",
+                                    None,
                                 ),
-                            ));
-                        }
-                        if record_request(&state, key_id).await.is_err() {
-                            if let Err(error) = state
-                                .vault
-                                .attempt_finished(request_id, key_id, "failed")
-                                .await
-                            {
-                                eprintln!("stream accounting ledger update failed: {error:#}");
+                                "incomplete_upstream_stream",
+                                &mut guard,
+                            )
+                            .await;
+                            if durable.is_durable() {
+                                guard.mark_terminal();
                             }
-                            guard.terminal.store(true, Ordering::Release);
                             return Some((
-                                Ok(sse_error_frame("request accounting unavailable")),
+                                Ok(error_frame),
                                 (
                                     upstream, validator, prefix, state, request_id, key_id, guard,
                                     true,
                                 ),
                             ));
                         }
-                        if let Err(error) = state
-                            .vault
-                            .attempt_finished(request_id, key_id, "succeeded")
-                            .await
-                        {
-                            eprintln!("stream success ledger update failed: {error:#}");
-                            guard.terminal.store(true, Ordering::Release);
-                            return Some((
-                                Ok(sse_error_frame("request ledger unavailable")),
-                                (
-                                    upstream, validator, prefix, state, request_id, key_id, guard,
-                                    true,
-                                ),
-                            ));
-                        }
-                        guard.terminal.store(true, Ordering::Release);
-                        // Do not expose the provider's success terminator until
-                        // the durable request and attempt ledger commits have
-                        // succeeded.  A client must never observe `[DONE]` for
-                        // a request the gateway recorded as failed.
+                        let final_frame = finish_stream_success(&state, key_id, &mut guard).await;
                         return Some((
-                            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                            Ok(final_frame),
                             (
                                 upstream, validator, prefix, state, request_id, key_id, guard, true,
+                            ),
+                        ));
+                    }
+                    Err(_) => {
+                        let error_frame = sse_error_frame("upstream stream timed out");
+                        guard.record_bytes_out(error_frame.len());
+                        let durable = finish_stream_failure(
+                            &state,
+                            key_id,
+                            AttemptTerminal::failed(
+                                Some(200),
+                                "upstream_stream_idle_timeout",
+                                None,
+                            ),
+                            "upstream_stream_idle_timeout",
+                            &mut guard,
+                        )
+                        .await;
+                        terminal = true;
+                        if durable.is_durable() {
+                            guard.mark_terminal();
+                        }
+                        return Some((
+                            Ok(error_frame),
+                            (
+                                upstream, validator, prefix, state, request_id, key_id, guard,
+                                terminal,
                             ),
                         ));
                     }
@@ -663,15 +887,7 @@ fn validate_modality_response(path: &str, body: &[u8], content_type: &str) -> Re
                             })
                     })
         }
-        "/v1/nvidia/inference" => {
-            value
-                .get("video")
-                .and_then(Value::as_str)
-                .and_then(decode_base64)
-                .is_some_and(|bytes| valid_mp4(&bytes))
-                && value.get("finish_reason").and_then(Value::as_str) == Some("SUCCESS")
-                && value.get("seed").and_then(Value::as_i64).is_some()
-        }
+        "/v1/nvidia/inference" => validate_chat_response(body, false).is_ok(),
         _ => value.is_object(),
     };
     valid.then_some(()).ok_or(())

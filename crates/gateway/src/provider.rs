@@ -4,6 +4,29 @@ use std::env;
 
 use super::{SseValidator, invalid_request};
 
+fn is_canonical_nvidia_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let host_is_nvidia_api = url.host_str().is_some_and(|host| {
+        matches!(
+            host,
+            "integrate.api.nvidia.com" | "ai.api.nvidia.com" | "api.nvcf.nvidia.com"
+        ) || host.ends_with(".api.nvcf.nvidia.com")
+    });
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && host_is_nvidia_api
+}
+
+pub(crate) fn live_qa_provider_is_canonical(configured: &str) -> bool {
+    is_canonical_nvidia_url(configured) && is_canonical_nvidia_url(&magpie_tts_endpoint())
+}
+
 pub(crate) fn upstream_endpoint(configured: &str, path: &str) -> String {
     let configured = configured.trim_end_matches('/');
     let versionless_path = path.strip_prefix("/v1").unwrap_or(path);
@@ -67,18 +90,50 @@ pub(crate) fn prepare_modality_request(path: &str, request: &Value) -> Result<Va
                 .get("size")
                 .and_then(Value::as_str)
                 .unwrap_or("1024x1024");
-            let aspect_ratio = match size {
-                "1024x1024" => "1:1",
-                "1792x1024" | "1536x864" => "16:9",
-                "1024x1792" | "864x1536" => "9:16",
-                _ => return Err(invalid_request("size is not supported by FLUX")),
+            let image = object
+                .get("image")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            let aspect_ratio = if image.is_none() {
+                match size {
+                    "1024x1024" => "1:1",
+                    "1792x1024" | "1536x864" => "16:9",
+                    "1024x1792" | "864x1536" => "9:16",
+                    _ => return Err(invalid_request("size is not supported by FLUX")),
+                }
+            } else {
+                "match_input_image"
             };
             if object.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
                 return Err(invalid_request("FLUX supports exactly one image"));
             }
-            Ok(
-                json!({"prompt": prompt, "image": Value::Null, "aspect_ratio": aspect_ratio, "samples": 1}),
-            )
+            let mut result = serde_json::Map::new();
+            result.insert("prompt".to_owned(), Value::String(prompt.to_owned()));
+            if let Some(image) = image {
+                result.insert("image".to_owned(), Value::String(image.to_owned()));
+            }
+            result.insert(
+                "aspect_ratio".to_owned(),
+                Value::String(aspect_ratio.to_owned()),
+            );
+            result.insert(
+                "steps".to_owned(),
+                json!(object.get("steps").and_then(Value::as_u64).unwrap_or(30)),
+            );
+            result.insert(
+                "cfg_scale".to_owned(),
+                json!(
+                    object
+                        .get("cfg_scale")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(3.5)
+                ),
+            );
+            result.insert(
+                "seed".to_owned(),
+                json!(object.get("seed").and_then(Value::as_u64).unwrap_or(0)),
+            );
+            Ok(Value::Object(result))
         }
         "/v1/videos/generations" => {
             let input = object
@@ -112,34 +167,11 @@ pub(crate) fn prepare_modality_request(path: &str, request: &Value) -> Result<Va
             Ok(Value::Object(result))
         }
         "/v1/nvidia/inference" => {
-            let input = object
-                .get("input")
-                .and_then(Value::as_object)
-                .ok_or_else(|| invalid_request("input must be an object"))?;
-            let image = input
-                .get("image")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_request("input.image is required"))?;
-            let mut result = serde_json::Map::new();
-            result.insert("image".to_owned(), Value::String(image.to_owned()));
-            result.insert(
-                "seed".to_owned(),
-                input.get("seed").cloned().unwrap_or_else(|| json!(0)),
-            );
-            result.insert(
-                "cfg_scale".to_owned(),
-                input
-                    .get("cfg_scale")
-                    .cloned()
-                    .unwrap_or_else(|| json!(1.8)),
-            );
-            result.insert(
-                "motion_bucket_id".to_owned(),
-                input
-                    .get("motion_bucket_id")
-                    .cloned()
-                    .unwrap_or_else(|| json!(127)),
-            );
+            // The hosted VILA endpoint is an endpoint-specific OpenAI chat
+            // contract. The public alias carries `model` for routing, while
+            // the provider endpoint already identifies the model.
+            let mut result = object.clone();
+            result.remove("model");
             Ok(Value::Object(result))
         }
         _ => Ok(request.clone()),

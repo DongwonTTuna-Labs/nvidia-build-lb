@@ -2,7 +2,9 @@
 
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::Utc;
-use nvidia_build_lb_core::{KeySummary, MAX_UPSTREAM_KEYS};
+#[cfg(test)]
+use nvidia_build_lb_core::KeySummary;
+use nvidia_build_lb_core::MAX_UPSTREAM_KEYS;
 use serde::Serialize;
 use std::time::Duration;
 
@@ -30,12 +32,17 @@ pub(crate) struct Readiness {
 }
 
 impl Readiness {
+    #[cfg(test)]
     pub(crate) fn from_state(database_ready: bool, keys: &[KeySummary]) -> Self {
         let eligible_keys = if database_ready {
             eligible_key_count(keys)
         } else {
             0
         };
+        Self::from_eligible_count(database_ready, eligible_keys)
+    }
+
+    fn from_eligible_count(database_ready: bool, eligible_keys: usize) -> Self {
         let traffic_ready = database_ready && eligible_keys > 0;
         let pair_ready = database_ready && eligible_keys == MAX_UPSTREAM_KEYS;
         let mut reason_codes = Vec::with_capacity(2);
@@ -88,14 +95,19 @@ pub(crate) async fn readiness(req: HttpRequest, state: web::Data<AppState>) -> i
     if let Some(response) = public_guard_response(&req) {
         return response;
     }
-    let database_ready = match &state.vault.database {
-        Some(pool) => tokio::time::timeout(
-            DATABASE_PROBE_TIMEOUT,
-            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
-        )
+    let (database_ready, eligible_keys) = match &state.vault.database {
+        Some(pool) => match tokio::time::timeout(DATABASE_PROBE_TIMEOUT, async {
+            sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(pool)
+                .await?;
+            super::operations::repository::eligible_key_ids(pool, "z-ai/glm-5.2").await
+        })
         .await
-        .is_ok_and(|result| result.is_ok()),
-        None => true,
+        {
+            Ok(Ok(ids)) => (true, ids.len()),
+            _ => (false, 0),
+        },
+        None => (true, eligible_key_count(&state.vault.list())),
     };
-    Readiness::from_state(database_ready, &state.vault.list()).response()
+    Readiness::from_eligible_count(database_ready, eligible_keys).response()
 }

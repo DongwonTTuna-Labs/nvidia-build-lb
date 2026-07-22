@@ -12,6 +12,7 @@ base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 httpdate.workspace = true
 hex.workspace = true
 nvidia-build-lb-core = { path = "../core" }
@@ -25,6 +26,9 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.21"
 
 [[bin]]
 name = "nblb-pg-bootstrap"
@@ -41,3 +45,7 @@ path = "src/bin/nblb-healthcheck.rs"
 [[bin]]
 name = "nblb-migrate"
 path = "src/bin/nblb-migrate.rs"
+
+[[bin]]
+name = "nblb-hermes-cutover"
+path = "src/bin/nblb-hermes-cutover.rs"

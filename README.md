@@ -36,6 +36,8 @@ cargo test -p nvidia-build-lb-gateway --bins
 test -z "$(git ls-files | awk 'tolower($0) ~ /\\.(py|pyw|sh|bash|zsh|js|mjs|cjs|jsx)$/ {print}')"
 bun run --cwd apps/admin check
 bun run --cwd apps/admin build
+bun run --cwd apps/public check
+bun run --cwd apps/public build
 ```
 
 최종 게이트에서만 `cargo test --workspace`, `cargo clippy --workspace --all-targets
@@ -75,3 +77,31 @@ credential, request evidence를 읽지 않습니다.
 응답의 `ready`와 `traffic_ready`는 실제 요청 가능 여부이고, `pair_ready`는 두 slot
 모두 분산·장애 전환에 참여할 수 있는지를 뜻합니다. key가 0개인 초기 설정 상태에서는
 컨테이너는 healthy지만 readiness endpoint는 `503`입니다.
+
+## Operations와 Hermes QA
+
+공개 Svelte 화면은 `/`, `/status`, `/models`, `/docs`, `/incidents`, `/security`에서
+sanitized API `/api/public/v1/*`만 사용합니다. loopback 관리자 화면은 `/admin/*`,
+typed API는 `/admin/api/v2/*`입니다. `/admin/api/v1/*`는 기존 배포 호환 adapter이며
+신규 UI 계약이 아닙니다.
+
+QA history는 `GET /admin/api/v2/qa/runs?limit=1..100&before=<opaque>`로 조회하며 응답의
+`next_before`만 다음 요청에 전달합니다. queued/running run은 배포 전체에서 하나만
+허용됩니다. 동시 create의 409 `qa_run_active`는 `details.active_run_id`로 이미 실행 중인
+run을 가리킵니다. `hermes-e2e`는 실제 helper 증거가 필요한 `live:true`만 허용합니다.
+
+`hermes-e2e` QA는 UI에서 run을 먼저 생성한 뒤 root-only Rust helper에 해당 ID를
+전달합니다.
+
+```bash
+sudo NBLB_EXPECTED_COMMIT=<40자리_APP_COMMIT_SHA> \
+  /usr/local/sbin/nblb-hermes-cutover apply --qa-run <QA_RUN_UUID>
+```
+
+helper는 rollback rehearsal과 최종 Hermes 검증을 마친 뒤 receipt를 먼저 원자 저장하고,
+safe scalar evidence만 loopback completion API에 제출합니다. gateway는 제출된 client,
+request, attempt, terminal outcome을 PostgreSQL에서 다시 확인합니다. 30분 timeout,
+gateway 재시작, helper 실패는 run을 `failed`로 닫으며 실행 중 상태로 방치하지 않습니다.
+helper는 QA/commit identity를 어떤 lock·snapshot·client·Docker mutation보다 먼저
+검증합니다. `committed` journal 뒤에는 rollback이나 failed completion을 하지 않고 이전
+client revoke와 idempotent PASS 제출만 재시도합니다.

@@ -1,0 +1,7 @@
+services:
+  db:
+    image: ${NBLB_CI_POSTGRES_IMAGE:?current checkout PostgreSQL image required}
+  migrate:
+    image: ${NBLB_CI_APP_IMAGE:?current checkout application image required}
+  app:
+    image: ${NBLB_CI_APP_IMAGE:?current checkout application image required}
