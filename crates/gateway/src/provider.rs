@@ -93,8 +93,8 @@ pub(crate) fn prepare_modality_request(path: &str, request: &Value) -> Result<Va
             let image = object
                 .get("image")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
-            let aspect_ratio = if image.is_empty() {
+                .filter(|value| !value.is_empty());
+            let aspect_ratio = if image.is_none() {
                 match size {
                     "1024x1024" => "1:1",
                     "1792x1024" | "1536x864" => "16:9",
@@ -107,14 +107,33 @@ pub(crate) fn prepare_modality_request(path: &str, request: &Value) -> Result<Va
             if object.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
                 return Err(invalid_request("FLUX supports exactly one image"));
             }
-            Ok(json!({
-                "prompt": prompt,
-                "image": image,
-                "aspect_ratio": aspect_ratio,
-                "steps": object.get("steps").and_then(Value::as_u64).unwrap_or(30),
-                "cfg_scale": object.get("cfg_scale").and_then(Value::as_f64).unwrap_or(3.5),
-                "seed": object.get("seed").and_then(Value::as_u64).unwrap_or(0)
-            }))
+            let mut result = serde_json::Map::new();
+            result.insert("prompt".to_owned(), Value::String(prompt.to_owned()));
+            if let Some(image) = image {
+                result.insert("image".to_owned(), Value::String(image.to_owned()));
+            }
+            result.insert(
+                "aspect_ratio".to_owned(),
+                Value::String(aspect_ratio.to_owned()),
+            );
+            result.insert(
+                "steps".to_owned(),
+                json!(object.get("steps").and_then(Value::as_u64).unwrap_or(30)),
+            );
+            result.insert(
+                "cfg_scale".to_owned(),
+                json!(
+                    object
+                        .get("cfg_scale")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(3.5)
+                ),
+            );
+            result.insert(
+                "seed".to_owned(),
+                json!(object.get("seed").and_then(Value::as_u64).unwrap_or(0)),
+            );
+            Ok(Value::Object(result))
         }
         "/v1/videos/generations" => {
             let input = object

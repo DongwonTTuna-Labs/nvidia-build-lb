@@ -2,6 +2,7 @@
 import { onDestroy, onMount } from "svelte";
 import { base } from "$app/paths";
 import {
+  ApiError,
   adminErrorMessage,
   api,
   copyText,
@@ -13,6 +14,7 @@ import DataState from "$lib/components/DataState.svelte";
 import PageHeader from "$lib/components/PageHeader.svelte";
 import PaginationButton from "$lib/components/PaginationButton.svelte";
 import StatusBadge from "$lib/components/StatusBadge.svelte";
+import { staleClientActionMessage, staleClientActionRefreshFailedMessage } from "$lib/operations";
 import type { Client, Page } from "$lib/types";
 
 const allScopes = [
@@ -139,7 +141,16 @@ async function action(item: Client, name: "rotate" | "revoke") {
     notice = `${targetLabel}: ${name} 완료`;
     await load();
   } catch (e) {
-    actionError = adminErrorMessage(e, "Client 작업에 실패했습니다.");
+    if (name === "rotate" && e instanceof ApiError && e.status === 404) {
+      await load();
+      if (queryError) {
+        queryError = staleClientActionRefreshFailedMessage(targetLabel, queryError);
+      } else {
+        notice = staleClientActionMessage(targetLabel);
+      }
+    } else {
+      actionError = adminErrorMessage(e, "Client 작업에 실패했습니다.");
+    }
   } finally {
     busy = "";
   }

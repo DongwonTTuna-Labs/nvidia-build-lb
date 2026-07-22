@@ -1067,7 +1067,8 @@ async fn exercise_traffic(
     }
     let mut traffic_evidence = TrafficEvidence::default();
     if suite == "smoke" {
-        traffic_evidence.http_contract = Some(probe_http_contract(&issued.token, live).await?);
+        traffic_evidence.http_contract =
+            Some(probe_http_contract(&issued.token, live, state.public_port).await?);
     }
     if suite == "distribution" {
         let pool = state
@@ -1078,7 +1079,7 @@ async fn exercise_traffic(
         traffic_evidence.distribution_generation_before =
             Some(prepare_distribution_cursor(pool).await?);
     }
-    let traffic = send_suite_requests(suite, &issued.token).await;
+    let traffic = send_suite_requests(suite, &issued.token, state.public_port).await;
     if traffic.is_ok() && suite == "distribution" {
         let pool = state
             .vault
@@ -1149,27 +1150,50 @@ async fn prepare_distribution_cursor(pool: &PgPool) -> Result<i64> {
     Ok(generation)
 }
 
-async fn probe_http_contract(token: &str, live: bool) -> Result<HttpContractEvidence> {
+fn local_qa_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    public_port: u16,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, url)
+        .header(reqwest::header::HOST, format!("127.0.0.1:{public_port}"))
+}
+
+async fn probe_http_contract(
+    token: &str,
+    live: bool,
+    public_port: u16,
+) -> Result<HttpContractEvidence> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build HTTP contract QA client")?;
-    let local_liveness_status = client
-        .get(format!("{LOCAL_QA_BASE_URL}/health/live"))
-        .send()
-        .await
-        .context("request local liveness")?
-        .status()
-        .as_u16();
-    let local_readiness_status = client
-        .get(format!("{LOCAL_QA_BASE_URL}/health/ready"))
-        .send()
-        .await
-        .context("request local readiness")?
-        .status()
-        .as_u16();
+    let local_liveness_status = local_qa_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{LOCAL_QA_BASE_URL}/health/live"),
+        public_port,
+    )
+    .send()
+    .await
+    .context("request local liveness")?
+    .status()
+    .as_u16();
+    let local_readiness_status = local_qa_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{LOCAL_QA_BASE_URL}/health/ready"),
+        public_port,
+    )
+    .send()
+    .await
+    .context("request local readiness")?
+    .status()
+    .as_u16();
     let (public_root_status, public_liveness_status) = if live {
         let root = client
             .get(format!("{PUBLIC_QA_BASE_URL}/"))
@@ -1189,19 +1213,27 @@ async fn probe_http_contract(token: &str, live: bool) -> Result<HttpContractEvid
     } else {
         (None, None)
     };
-    let models_unauthorized_status = client
-        .get(format!("{LOCAL_QA_BASE_URL}/v1/models"))
-        .send()
-        .await
-        .context("request models without authentication")?
-        .status()
-        .as_u16();
-    let models_response = client
-        .get(format!("{LOCAL_QA_BASE_URL}/v1/models"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("request authenticated models")?;
+    let models_unauthorized_status = local_qa_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{LOCAL_QA_BASE_URL}/v1/models"),
+        public_port,
+    )
+    .send()
+    .await
+    .context("request models without authentication")?
+    .status()
+    .as_u16();
+    let models_response = local_qa_request(
+        &client,
+        reqwest::Method::GET,
+        format!("{LOCAL_QA_BASE_URL}/v1/models"),
+        public_port,
+    )
+    .bearer_auth(token)
+    .send()
+    .await
+    .context("request authenticated models")?;
     let models_authorized_status = models_response.status().as_u16();
     let models_request_id = models_response
         .headers()
@@ -1233,7 +1265,7 @@ async fn probe_http_contract(token: &str, live: bool) -> Result<HttpContractEvid
     })
 }
 
-async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
+async fn send_suite_requests(suite: &str, token: &str, public_port: u16) -> Result<()> {
     // The container listener is fixed at 2456. `public_port` is the external
     // Host authority and may be remapped by compose.
     let base = LOCAL_QA_BASE_URL;
@@ -1249,6 +1281,7 @@ async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
                 token,
                 &format!("{base}/v1/chat/completions"),
                 json!({"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"QA"}],"max_tokens":2,"stream":false}),
+                public_port,
             )
             .await?;
             send_json(
@@ -1256,6 +1289,7 @@ async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
                 token,
                 &format!("{base}/v1/chat/completions"),
                 json!({"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"QA"}],"metadata":{"mock_stream_scenario":"fragmented_sse"},"max_tokens":2,"stream":true}),
+                public_port,
             )
             .await?;
         }
@@ -1266,6 +1300,7 @@ async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
                     token,
                     &format!("{base}/v1/chat/completions"),
                     json!({"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"QA"}],"max_tokens":2,"stream":false}),
+                    public_port,
                 )
                 .await?;
             }
@@ -1276,6 +1311,7 @@ async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
                 token,
                 &format!("{base}/v1/chat/completions"),
                 json!({"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"QA"}],"metadata":{"mock_stream_scenario":"disconnect_before_first_frame"},"max_tokens":2,"stream":true}),
+                public_port,
             )
             .await?;
             let bytes = send_json(
@@ -1283,6 +1319,7 @@ async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
                 token,
                 &format!("{base}/v1/chat/completions"),
                 json!({"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"QA"}],"metadata":{"mock_stream_scenario":"disconnect_after_first_frame"},"max_tokens":2,"stream":true}),
+                public_port,
             )
             .await?;
             if !bytes
@@ -1348,7 +1385,7 @@ async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
                     json!({"model":"nvidia/magpie-tts-multilingual","input":"QA","voice":"Magpie-Multilingual.EN-US.Aria","response_format":"wav"}),
                 ),
             ] {
-                send_json(&client, token, &format!("{base}{path}"), body).await?;
+                send_json(&client, token, &format!("{base}{path}"), body, public_port).await?;
             }
             let wav = vec![
                 b'R', b'I', b'F', b'F', 38, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't',
@@ -1364,13 +1401,17 @@ async fn send_suite_requests(suite: &str, token: &str) -> Result<()> {
                         .mime_str("audio/wav")
                         .context("build QA WAV part")?,
                 );
-            let response = client
-                .post(format!("{base}/v1/audio/transcriptions"))
-                .bearer_auth(token)
-                .multipart(form)
-                .send()
-                .await
-                .context("send transcription QA request")?;
+            let response = local_qa_request(
+                &client,
+                reqwest::Method::POST,
+                format!("{base}/v1/audio/transcriptions"),
+                public_port,
+            )
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .context("send transcription QA request")?;
             require_success(response, "transcription").await?;
         }
         _ => bail!("unsupported traffic QA suite"),
@@ -1383,9 +1424,9 @@ async fn send_json(
     token: &str,
     url: &str,
     body: Value,
+    public_port: u16,
 ) -> Result<bytes::Bytes> {
-    let response = client
-        .post(url)
+    let response = local_qa_request(client, reqwest::Method::POST, url.to_owned(), public_port)
         .bearer_auth(token)
         .json(&body)
         .send()
@@ -1787,11 +1828,35 @@ mod tests {
     use super::{
         HermesCompletion, HermesRequestEvidence, PersistenceSnapshot, QA_H264_MP4_DATA_URL,
         SecretScanEvidence, close_interrupted_runs, combine_traffic_cleanup, complete_hermes,
-        database_secret_matches, fail_running_run, persistence_case,
+        database_secret_matches, fail_running_run, local_qa_request, persistence_case,
     };
     use base64::Engine as _;
     use chrono::{Duration, Utc};
     use uuid::Uuid;
+
+    #[test]
+    fn local_qa_connects_to_the_fixed_listener_with_the_remapped_public_authority() {
+        let client = reqwest::Client::new();
+        let request = local_qa_request(
+            &client,
+            reqwest::Method::POST,
+            "http://127.0.0.1:2456/v1/chat/completions".to_owned(),
+            43_123,
+        )
+        .build()
+        .expect("build remapped local QA request");
+
+        assert_eq!(request.url().port(), Some(2456));
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::HOST)
+                .expect("explicit local QA Host")
+                .to_str()
+                .expect("ASCII local QA Host"),
+            "127.0.0.1:43123"
+        );
+    }
 
     fn snapshot(owner_id: Uuid) -> PersistenceSnapshot {
         PersistenceSnapshot {

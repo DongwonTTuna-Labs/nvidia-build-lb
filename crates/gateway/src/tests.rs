@@ -1,5 +1,5 @@
 use super::admin::{PageCursor, PageQuery, encode_page_cursor, page_before};
-use super::provider::{live_qa_provider_is_canonical, upstream_endpoint};
+use super::provider::{live_qa_provider_is_canonical, prepare_modality_request, upstream_endpoint};
 use super::proxy::{parse_multimodal_request, validate_chat_request};
 use super::request_id::{assign_request_id, enforce_admin_boundary};
 use super::{
@@ -298,6 +298,35 @@ fn modality_and_chat_boundaries_reject_malformed_requests() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn flux_provider_payload_distinguishes_generation_from_image_edit() {
+    let generation = prepare_modality_request(
+        "/v1/images/generations",
+        &serde_json::json!({
+            "prompt":"green square",
+            "size":"1792x1024",
+            "n":1
+        }),
+    )
+    .expect("prepare text-to-image request");
+    assert_eq!(generation["aspect_ratio"], "16:9");
+    assert!(generation.get("image").is_none());
+
+    let image = "data:image/png;base64,AA==";
+    let edit = prepare_modality_request(
+        "/v1/images/generations",
+        &serde_json::json!({
+            "prompt":"make it greener",
+            "image":image,
+            "size":"1024x1024",
+            "n":1
+        }),
+    )
+    .expect("prepare image-edit request");
+    assert_eq!(edit["aspect_ratio"], "match_input_image");
+    assert_eq!(edit["image"], image);
 }
 
 #[test]
@@ -1398,6 +1427,91 @@ async fn routing_simulation_matches_freshness_and_cursor_without_persisting(pool
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["selected_slot"], 1);
     assert_eq!(body["eligible_order"], serde_json::json!([first_id]));
+}
+
+#[sqlx::test(migrations = "../../migrations/sqlx")]
+async fn model_probe_rejects_duplicate_upstreams_before_probe_and_audits_only_the_rejection(
+    pool: sqlx::PgPool,
+) {
+    let directory = tempfile::tempdir().expect("duplicate probe vault directory");
+    let state = web::Data::new(
+        database_test_state(&pool, &directory.path().join("vault.json"), Uuid::new_v4()).await,
+    );
+    let app = test::init_service(
+        App::new()
+            .wrap(from_fn(crate::request_id::audit_failed_admin_mutation))
+            .wrap(from_fn(assign_request_id))
+            .wrap(from_fn(enforce_admin_boundary))
+            .app_data(state)
+            .configure(crate::operations::admin::routes),
+    )
+    .await;
+    let duplicate_id = Uuid::new_v4();
+    let before_probe_runs = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.probe_runs")
+        .fetch_one(&pool)
+        .await
+        .expect("count probe runs before duplicate requests");
+    let before_audit_events =
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.audit_events")
+            .fetch_one(&pool)
+            .await
+            .expect("count audit events before duplicate requests");
+
+    for (model_id, confirm_billable) in [
+        ("z-ai/glm-5.2", false),
+        ("black-forest-labs/flux.1-kontext-dev", false),
+        ("black-forest-labs/flux.1-kontext-dev", true),
+    ] {
+        let request = TestRequest::post()
+            .uri("/admin/api/v2/models/probe")
+            .insert_header((header::HOST, "localhost:2456"))
+            .insert_header((header::AUTHORIZATION, "Bearer test-admin"))
+            .set_json(serde_json::json!({
+                "model_id":model_id,
+                "upstream_ids":[duplicate_id, duplicate_id],
+                "confirm_billable":confirm_billable
+            }))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "invalid_upstream_ids");
+    }
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.probe_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count probe runs after duplicate requests"),
+        before_probe_runs
+    );
+    let failed_audits = sqlx::query_as::<_, (String, String, serde_json::Value)>(
+        "SELECT action,outcome,detail FROM nblb.audit_events ORDER BY id DESC LIMIT 3",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("load duplicate rejection audits");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.audit_events")
+            .fetch_one(&pool)
+            .await
+            .expect("count audit events after duplicate requests"),
+        before_audit_events + 3
+    );
+    assert_eq!(failed_audits.len(), 3);
+    assert!(failed_audits.iter().all(|(action, outcome, detail)| {
+        action == "model_catalog.probe"
+            && outcome == "failed"
+            && detail["http_status"] == 422
+            && detail["best_effort"] == true
+    }));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.profile_probe_receipts")
+            .fetch_one(&pool)
+            .await
+            .expect("count profile receipts after duplicate requests"),
+        0
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations/sqlx")]

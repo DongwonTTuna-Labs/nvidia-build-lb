@@ -8,6 +8,8 @@ import {
   parseModelProbeResponse,
   parseProfileProbeResponse,
   probeErrorClass,
+  staleClientActionMessage,
+  staleClientActionRefreshFailedMessage,
   withoutProbeResult,
 } from "./operations";
 
@@ -147,5 +149,19 @@ describe("credential probe evidence", () => {
     expect(next["upstream-1"]).toBeUndefined();
     expect(next["upstream-2"]?.id).toBe("probe-2");
     expect(previous["upstream-1"]?.id).toBe("probe-1");
+  });
+});
+
+describe("stale client action recovery", () => {
+  test("explains why a stale rotate target disappeared and what recovered", () => {
+    expect(staleClientActionMessage("Hermes production")).toBe(
+      "Hermes production: 이미 폐기되었거나 상태가 변경되어 최신 목록으로 갱신했습니다.",
+    );
+  });
+
+  test("does not claim a refresh succeeded when the latest list is unavailable", () => {
+    expect(staleClientActionRefreshFailedMessage("Hermes production", "HTTP 503")).toBe(
+      "Hermes production: 이미 폐기되었거나 상태가 변경되었습니다. 최신 목록 갱신에도 실패했습니다: HTTP 503",
+    );
   });
 });

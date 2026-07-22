@@ -604,11 +604,9 @@ impl Vault {
                 .state
                 .downstream
                 .iter_mut()
-                .find(|item| item.id == id)
+                .find(|item| item.id == id && item.active)
                 .ok_or_else(|| anyhow!("downstream credential not found"))?;
             item.token_digest = fingerprint(token.as_bytes());
-            item.active = true;
-            item.revoked_at = None;
             downstream_summary(item)
         };
         self.persist()?;
@@ -1256,6 +1254,60 @@ mod tests {
         );
         let raw = fs::read_to_string(dir.path().join("vault.json")).expect("read");
         assert!(!raw.contains(&issued.token));
+    }
+
+    #[test]
+    fn downstream_rotation_replaces_only_an_active_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.json");
+        let mut vault = Vault::open(&path, [24; 32]).expect("open");
+        let issued = vault
+            .issue_downstream("active", &["chat:write".into()])
+            .expect("issue active credential");
+
+        let rotated = vault
+            .rotate_downstream(issued.summary.id)
+            .expect("rotate active credential");
+        assert!(rotated.summary.active);
+        assert_eq!(rotated.summary.revoked_at, None);
+        assert_ne!(rotated.token, issued.token);
+        assert!(
+            vault
+                .authenticate_downstream(&issued.token, "chat:write")
+                .is_err()
+        );
+        assert!(
+            vault
+                .authenticate_downstream(&rotated.token, "chat:write")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn downstream_rotation_cannot_reactivate_a_revoked_credential() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.json");
+        let mut vault = Vault::open(&path, [25; 32]).expect("open");
+        let issued = vault
+            .issue_downstream("revoked", &["chat:write".into()])
+            .expect("issue credential");
+        let revoked = vault
+            .revoke_downstream(issued.summary.id)
+            .expect("revoke credential");
+        let digest_before = vault.state.downstream[0].token_digest.clone();
+        let file_before = fs::read(&path).expect("read revoked vault");
+
+        assert!(vault.rotate_downstream(issued.summary.id).is_err());
+
+        let stored = vault
+            .list_downstream()
+            .into_iter()
+            .find(|item| item.id == issued.summary.id)
+            .expect("revoked credential remains stored");
+        assert!(!stored.active);
+        assert_eq!(stored.revoked_at, revoked.revoked_at);
+        assert_eq!(vault.state.downstream[0].token_digest, digest_before);
+        assert_eq!(fs::read(&path).expect("reread revoked vault"), file_before);
     }
 
     #[test]

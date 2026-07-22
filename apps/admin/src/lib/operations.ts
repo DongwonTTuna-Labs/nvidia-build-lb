@@ -206,6 +206,14 @@ export function probeErrorClass(run: ProbeRun): string {
   return run.error_class ?? "없음";
 }
 
+export function staleClientActionMessage(label: string): string {
+  return `${label}: 이미 폐기되었거나 상태가 변경되어 최신 목록으로 갱신했습니다.`;
+}
+
+export function staleClientActionRefreshFailedMessage(label: string, reason: string): string {
+  return `${label}: 이미 폐기되었거나 상태가 변경되었습니다. 최신 목록 갱신에도 실패했습니다: ${reason}`;
+}
+
 export function withoutProbeResult<T>(
   results: Record<string, T>,
   upstreamId: string,

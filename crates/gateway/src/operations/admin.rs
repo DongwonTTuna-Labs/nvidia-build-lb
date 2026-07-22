@@ -2375,6 +2375,16 @@ async fn probe_model(
     else {
         return invalid(&req, "invalid_model", "The model is not supported.");
     };
+    if input.upstream_ids.is_empty()
+        || input.upstream_ids.len() > 2
+        || input.upstream_ids.len() == 2 && input.upstream_ids[0] == input.upstream_ids[1]
+    {
+        return invalid(
+            &req,
+            "invalid_upstream_ids",
+            "One or two distinct upstream IDs are required.",
+        );
+    }
     if spec.billable_probe && !input.confirm_billable {
         return operations_error(
             &req,
@@ -2383,13 +2393,6 @@ async fn probe_model(
             "This model probe may be billable.",
             false,
             None,
-        );
-    }
-    if input.upstream_ids.is_empty() || input.upstream_ids.len() > 2 {
-        return invalid(
-            &req,
-            "invalid_upstream_ids",
-            "One or two upstream IDs are required.",
         );
     }
     let pool = match pool(&req, &state) {
