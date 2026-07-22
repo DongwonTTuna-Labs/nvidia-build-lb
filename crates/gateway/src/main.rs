@@ -5,6 +5,7 @@ mod admin;
 mod errors;
 mod evidence;
 mod health;
+mod operations;
 mod provider;
 mod proxy;
 mod request_id;
@@ -18,12 +19,14 @@ pub(crate) use provider::{
 };
 pub(crate) use streaming::{
     SseValidator, StreamAttemptGuard, UpstreamByteStream, chat_response_stream,
-    normalize_modality_response, prime_stream, valid_data_url,
+    normalize_modality_response, prime_stream, sse_error_frame, valid_data_url,
 };
 
-use actix_files::Files;
+use actix_files::{Files, NamedFile};
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, guard,
+    App, HttpRequest, HttpResponse, HttpServer,
+    error::InternalError,
+    guard,
     http::{StatusCode, header},
     middleware::{DefaultHeaders, from_fn},
     web,
@@ -34,11 +37,12 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use futures_util::stream;
 use nvidia_build_lb_core::{
-    DownstreamSummary, PROFILES, Router, Vault, VaultDownstreamRecord, VaultKeyRecord,
+    DownstreamAuthError, DownstreamSummary, PROFILES, Router, Vault, VaultDownstreamRecord,
+    VaultKeyRecord,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
+use sqlx::{FromRow, PgConnection, PgPool, postgres::PgPoolOptions};
 use std::{
     collections::{BTreeMap, HashMap},
     env,
@@ -47,10 +51,35 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(not(test))]
 const UPSTREAM_REQUEST_TIMEOUT: StdDuration = StdDuration::from_secs(60);
+#[cfg(test)]
+const UPSTREAM_REQUEST_TIMEOUT: StdDuration = StdDuration::from_millis(500);
 const UPSTREAM_CONNECT_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+#[cfg(not(test))]
 const NVCF_POLL_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+#[cfg(test)]
+const NVCF_POLL_TIMEOUT: StdDuration = StdDuration::from_millis(250);
+#[cfg(not(test))]
+const NVCF_POLL_DEADLINE: StdDuration = StdDuration::from_secs(30);
+#[cfg(test)]
+const NVCF_POLL_DEADLINE: StdDuration = StdDuration::from_millis(750);
+#[cfg(not(test))]
+const NVCF_INITIAL_POLL_DELAY: StdDuration = StdDuration::from_millis(250);
+#[cfg(test)]
+const NVCF_INITIAL_POLL_DELAY: StdDuration = StdDuration::from_millis(25);
+#[cfg(not(test))]
 const STREAM_PRIME_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+#[cfg(test)]
+const STREAM_PRIME_TIMEOUT: StdDuration = StdDuration::from_millis(250);
+#[cfg(not(test))]
+const STREAM_RESPONSE_HEADER_TIMEOUT: StdDuration = StdDuration::from_secs(15);
+#[cfg(test)]
+const STREAM_RESPONSE_HEADER_TIMEOUT: StdDuration = StdDuration::from_millis(250);
+pub(crate) const BUILD_COMMIT: &str = match option_env!("NBLB_GIT_COMMIT") {
+    Some(value) => value,
+    None => "unknown",
+};
 
 struct AppState {
     vault: VaultStore,
@@ -62,6 +91,23 @@ struct AppState {
     require_downstream_token: bool,
     public_port: u16,
     csp_hashes: Vec<String>,
+}
+
+#[derive(Debug)]
+enum PermitError {
+    Expired,
+    ModelForbidden,
+    RateLimited(u64),
+    DailyLimit,
+    ConcurrencyLimit,
+    StoreUnavailable,
+}
+
+#[derive(Debug)]
+enum DownstreamAuthenticationError {
+    InvalidCredential,
+    InsufficientScope,
+    StoreUnavailable,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,6 +246,64 @@ struct VaultStore {
     database: Option<PgPool>,
     sync_lock: tokio::sync::Mutex<()>,
     owner_id: Option<Uuid>,
+    // The encrypted vault is intentionally single-owner. Holding this
+    // dedicated PostgreSQL session lock prevents a second gateway process
+    // from serving stale in-memory credentials or routing cursors.
+    _owner_guard: Option<PgConnection>,
+}
+
+// PostgreSQL advisory locks are cluster-wide, even when sessions are connected
+// to different databases. Scope the single-owner lock to the durable database
+// name so independent nvidia-build-lb stacks (and parallel SQLx test databases)
+// cannot block one another while every process for one database still contends
+// on the same session lock.
+const VAULT_OWNER_LOCK_SQL: &str =
+    "SELECT pg_try_advisory_lock(hashtextextended(current_database() || ':nblb.vault.owner', 0))";
+
+async fn try_acquire_vault_owner_lock(connection: &mut PgConnection) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(VAULT_OWNER_LOCK_SQL)
+        .fetch_one(connection)
+        .await
+        .context("acquire single-owner vault lock")
+}
+
+#[derive(Debug, Clone)]
+struct ClientPolicyMutation {
+    id: Uuid,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    expires_at_changed: bool,
+    model_allowlist: Option<Vec<String>>,
+    model_allowlist_changed: bool,
+    rpm_limit: Option<u32>,
+    rpm_limit_changed: bool,
+    max_concurrency: Option<u32>,
+    max_concurrency_changed: bool,
+    request_limit_day: Option<u32>,
+    request_limit_day_changed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct VaultAuditMutation {
+    action: &'static str,
+    resource_kind: &'static str,
+    resource_id: Option<Uuid>,
+    request_id: Uuid,
+    detail: Value,
+    client_policy: Option<ClientPolicyMutation>,
+    probe_result: Option<ProbeAuditMutation>,
+}
+
+#[derive(Debug, Clone)]
+struct ProbeAuditMutation {
+    id: Uuid,
+    kind: &'static str,
+    upstream_id: Uuid,
+    profile_id: Option<&'static str>,
+    receipt_profile: Option<&'static str>,
+    billable: bool,
+    status_code: Option<u16>,
+    error_class: Option<&'static str>,
+    latency_ms: u64,
 }
 
 impl VaultStore {
@@ -209,6 +313,20 @@ impl VaultStore {
         database: Option<PgPool>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let owner_guard = if let Some(pool) = &database {
+            let mut connection = pool
+                .acquire()
+                .await
+                .context("acquire single-owner vault connection")?
+                .detach();
+            let acquired = try_acquire_vault_owner_lock(&mut connection).await?;
+            if !acquired {
+                bail!("another gateway process owns the encrypted vault")
+            }
+            Some(connection)
+        } else {
+            None
+        };
         let owner_id = if let Some(pool) = &database {
             let owner_id = Uuid::new_v4();
             let mut tx = pool.begin().await.context("begin gateway owner lease")?;
@@ -235,6 +353,12 @@ impl VaultStore {
             .execute(&mut *tx)
             .await
             .context("close requests from expired gateway owners")?;
+            sqlx::query(
+                "UPDATE nblb.downstream_request_permits AS permit SET released_at=now() WHERE permit.released_at IS NULL AND NOT EXISTS (SELECT 1 FROM nblb.gateway_instances AS instance WHERE instance.id=permit.owner_id AND instance.last_seen_at >= now()-interval '30 seconds')",
+            )
+            .execute(&mut *tx)
+            .await
+            .context("release permits from expired gateway owners")?;
             sqlx::query(
                 "DELETE FROM nblb.gateway_instances WHERE last_seen_at < now() - interval '30 seconds' AND id <> $1",
             )
@@ -312,6 +436,7 @@ impl VaultStore {
             database,
             sync_lock: tokio::sync::Mutex::new(()),
             owner_id,
+            _owner_guard: owner_guard,
         })
     }
 
@@ -396,14 +521,267 @@ impl VaultStore {
         Ok(result)
     }
 
-    async fn authenticate(&self, token: &str, scope: &str) -> Result<DownstreamSummary> {
-        self.mutate(|vault| vault.authenticate_downstream(token, scope))
+    /// Applies a vault-backed admin mutation, its optional client policy, and
+    /// the corresponding audit event in one PostgreSQL transaction. The
+    /// encrypted rollback copy is restored if any database step fails, so an
+    /// API success can never exist without its audit row.
+    async fn mutate_with_audit<F, A, T>(&self, operation: F, audit_for: A) -> Result<(T, Uuid)>
+    where
+        F: FnOnce(&mut Vault) -> Result<T>,
+        A: FnOnce(&T) -> VaultAuditMutation,
+    {
+        let _sync_guard = self.sync_lock.lock().await;
+        let (previous, result) = {
+            let mut vault = self.vault.lock().map_err(|_| anyhow!("vault lock"))?;
+            let previous = vault.clone();
+            let result = operation(&mut vault);
+            (previous, result)
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let mut vault = self.vault.lock().map_err(|_| anyhow!("vault lock"))?;
+                *vault = previous;
+                return Err(error);
+            }
+        };
+        let audit = audit_for(&result);
+        let audit_id = match self
+            .sync_unlocked_with_audit(Some(&previous), Some(&audit))
             .await
+        {
+            Ok(Some(audit_id)) => audit_id,
+            Ok(None) => {
+                let mut vault = self.vault.lock().map_err(|_| anyhow!("vault lock"))?;
+                *vault = previous;
+                vault.persist_for_rollback()?;
+                bail!("audited mutation requires PostgreSQL")
+            }
+            Err(error) => {
+                let mut vault = self.vault.lock().map_err(|_| anyhow!("vault lock"))?;
+                *vault = previous;
+                vault.persist_for_rollback()?;
+                return Err(error.context("rollback audited vault mutation"));
+            }
+        };
+        Ok((result, audit_id))
+    }
+
+    async fn authorize_downstream(
+        &self,
+        token: &str,
+        scope: &str,
+    ) -> std::result::Result<Uuid, DownstreamAuthenticationError> {
+        let _sync_guard = self.sync_lock.lock().await;
+        let identity = self
+            .vault
+            .lock()
+            .map_err(|_| DownstreamAuthenticationError::StoreUnavailable)?
+            .identify_downstream(token)
+            .map_err(|_| DownstreamAuthenticationError::InvalidCredential)?;
+        if !identity.active {
+            return Err(DownstreamAuthenticationError::InvalidCredential);
+        }
+        if let Some(pool) = &self.database {
+            let policy = sqlx::query_as::<_, (bool, Option<chrono::DateTime<Utc>>)>(
+                "SELECT active,expires_at FROM nblb.downstream_credentials WHERE id=$1",
+            )
+            .bind(identity.id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| DownstreamAuthenticationError::StoreUnavailable)?
+            .ok_or(DownstreamAuthenticationError::InvalidCredential)?;
+            if !policy.0 || policy.1.is_some_and(|expires| expires <= Utc::now()) {
+                return Err(DownstreamAuthenticationError::InvalidCredential);
+            }
+        }
+        self.vault
+            .lock()
+            .map_err(|_| DownstreamAuthenticationError::StoreUnavailable)?
+            .require_downstream_scope(identity.id, scope)
+            .map_err(|error| match error {
+                DownstreamAuthError::InvalidCredential => {
+                    DownstreamAuthenticationError::InvalidCredential
+                }
+                DownstreamAuthError::InsufficientScope => {
+                    DownstreamAuthenticationError::InsufficientScope
+                }
+            })?;
+        Ok(identity.id)
+    }
+
+    async fn record_accepted_downstream_use(
+        &self,
+        id: Uuid,
+    ) -> std::result::Result<(), DownstreamAuthenticationError> {
+        let _sync_guard = self.sync_lock.lock().await;
+        if let Some(pool) = &self.database {
+            let policy = sqlx::query_as::<_, (bool, Option<chrono::DateTime<Utc>>)>(
+                "SELECT active,expires_at FROM nblb.downstream_credentials WHERE id=$1",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| DownstreamAuthenticationError::StoreUnavailable)?
+            .ok_or(DownstreamAuthenticationError::InvalidCredential)?;
+            if !policy.0 || policy.1.is_some_and(|expires| expires <= Utc::now()) {
+                return Err(DownstreamAuthenticationError::InvalidCredential);
+            }
+        }
+        let (previous, summary) = {
+            let mut vault = self
+                .vault
+                .lock()
+                .map_err(|_| DownstreamAuthenticationError::StoreUnavailable)?;
+            let previous = vault.clone();
+            let summary = match vault.record_downstream_use(id, Utc::now()) {
+                Ok(summary) => summary,
+                Err(_) => {
+                    *vault = previous;
+                    return Err(DownstreamAuthenticationError::StoreUnavailable);
+                }
+            };
+            (previous, summary)
+        };
+        if self.sync_unlocked(Some(&previous)).await.is_err() {
+            let mut vault = self
+                .vault
+                .lock()
+                .map_err(|_| DownstreamAuthenticationError::StoreUnavailable)?;
+            *vault = previous;
+            vault
+                .persist_for_rollback()
+                .map_err(|_| DownstreamAuthenticationError::StoreUnavailable)?;
+            return Err(DownstreamAuthenticationError::StoreUnavailable);
+        }
+        let _ = summary;
+        Ok(())
+    }
+
+    async fn acquire_downstream_permit(
+        &self,
+        request_id: Uuid,
+        downstream_id: Option<Uuid>,
+        profile: &str,
+    ) -> Result<bool, PermitError> {
+        let (Some(pool), Some(downstream_id)) = (&self.database, downstream_id) else {
+            return Ok(false);
+        };
+        let owner_id = self.owner_id.ok_or(PermitError::StoreUnavailable)?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| PermitError::StoreUnavailable)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1,0))")
+            .bind(downstream_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PermitError::StoreUnavailable)?;
+        let policy = sqlx::query_as::<_, (
+            bool,
+            Option<chrono::DateTime<Utc>>,
+            Option<Vec<String>>,
+            Option<i32>,
+            Option<i16>,
+            Option<i32>,
+        )>(
+            "SELECT active,expires_at,model_allowlist,rpm_limit,max_concurrency,request_limit_day FROM nblb.downstream_credentials WHERE id=$1 FOR UPDATE",
+        )
+        .bind(downstream_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PermitError::StoreUnavailable)?
+        .ok_or(PermitError::Expired)?;
+        if !policy.0 || policy.1.is_some_and(|expires| expires <= Utc::now()) {
+            return Err(PermitError::Expired);
+        }
+        if policy
+            .2
+            .as_ref()
+            .is_some_and(|models| !models.iter().any(|model| model == profile))
+        {
+            return Err(PermitError::ModelForbidden);
+        }
+        let minute_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM nblb.downstream_request_permits WHERE downstream_credential_id=$1 AND acquired_at>=date_trunc('minute',now())",
+        )
+        .bind(downstream_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PermitError::StoreUnavailable)?;
+        if policy
+            .3
+            .is_some_and(|limit| minute_count >= i64::from(limit))
+        {
+            let retry_after = sqlx::query_scalar::<_, i64>(
+                "SELECT GREATEST(1,CEIL(EXTRACT(EPOCH FROM (date_trunc('minute',now())+interval '1 minute'-now())))::bigint)",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(60);
+            return Err(PermitError::RateLimited(
+                u64::try_from(retry_after).unwrap_or(60),
+            ));
+        }
+        let day_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM nblb.downstream_request_permits WHERE downstream_credential_id=$1 AND acquired_at>=date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
+        )
+        .bind(downstream_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PermitError::StoreUnavailable)?;
+        if policy.5.is_some_and(|limit| day_count >= i64::from(limit)) {
+            return Err(PermitError::DailyLimit);
+        }
+        let active = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM nblb.downstream_request_permits WHERE downstream_credential_id=$1 AND released_at IS NULL",
+        )
+        .bind(downstream_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PermitError::StoreUnavailable)?;
+        if policy.4.is_some_and(|limit| active >= i64::from(limit)) {
+            return Err(PermitError::ConcurrencyLimit);
+        }
+        sqlx::query("INSERT INTO nblb.downstream_request_permits(request_id,downstream_credential_id,owner_id,profile_id) VALUES ($1,$2,$3,$4)")
+            .bind(request_id)
+            .bind(downstream_id)
+            .bind(owner_id)
+            .bind(profile)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PermitError::StoreUnavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PermitError::StoreUnavailable)?;
+        Ok(true)
+    }
+
+    async fn release_downstream_permit(&self, request_id: Uuid) -> Result<()> {
+        let Some(pool) = &self.database else {
+            return Ok(());
+        };
+        sqlx::query("UPDATE nblb.downstream_request_permits SET released_at=COALESCE(released_at,now()) WHERE request_id=$1")
+            .bind(request_id)
+            .execute(pool)
+            .await
+            .context("release downstream request permit")?;
+        Ok(())
     }
 
     async fn sync_unlocked(&self, previous: Option<&Vault>) -> Result<()> {
+        self.sync_unlocked_with_audit(previous, None)
+            .await
+            .map(|_| ())
+    }
+
+    async fn sync_unlocked_with_audit(
+        &self,
+        previous: Option<&Vault>,
+        audit: Option<&VaultAuditMutation>,
+    ) -> Result<Option<Uuid>> {
         let Some(pool) = &self.database else {
-            return Ok(());
+            return Ok(None);
         };
         let (keys, downstream, cursors) = {
             let vault = self.vault.lock().map_err(|_| anyhow!("vault lock"))?;
@@ -418,18 +796,27 @@ impl VaultStore {
                 .iter()
                 .map(|profile| ((*profile).to_owned(), previous.router_cursor_for(profile)))
                 .collect::<BTreeMap<_, _>>();
+            let previous_keys = previous.key_records()?;
+            let previous_downstream = previous.downstream_records()?;
             sync_database_delta(
                 pool,
-                &previous.key_records()?,
-                &previous.downstream_records()?,
-                &previous_cursors,
-                &keys,
-                &downstream,
-                &cursors,
+                VaultSyncSnapshot {
+                    keys: &previous_keys,
+                    downstream: &previous_downstream,
+                    cursors: &previous_cursors,
+                },
+                VaultSyncSnapshot {
+                    keys: &keys,
+                    downstream: &downstream,
+                    cursors: &cursors,
+                },
+                audit,
             )
             .await
         } else {
-            sync_database_rows(pool, &keys, &downstream, &cursors).await
+            sync_database_rows(pool, &keys, &downstream, &cursors)
+                .await
+                .map(|_| None)
         }
     }
 
@@ -634,21 +1021,6 @@ impl VaultStore {
         Ok(())
     }
 
-    async fn record_profile_proof(&self, profile: &str, key_id: Uuid) -> Result<()> {
-        let Some(pool) = &self.database else {
-            return Ok(());
-        };
-        sqlx::query(
-            "INSERT INTO nblb.profile_probe_receipts (profile_id, key_id) VALUES ($1, $2) ON CONFLICT (profile_id, key_id) DO UPDATE SET verified_at=now()",
-        )
-        .bind(profile)
-        .bind(key_id)
-        .execute(pool)
-        .await
-        .context("persist profile provider receipt")?;
-        Ok(())
-    }
-
     async fn heartbeat_owner(&self) -> Result<()> {
         let Some(pool) = &self.database else {
             return Ok(());
@@ -678,6 +1050,12 @@ impl VaultStore {
         .execute(pool)
         .await
         .context("close attempts from expired gateway owners")?;
+        sqlx::query(
+            "UPDATE nblb.downstream_request_permits AS permit SET released_at=now() WHERE permit.released_at IS NULL AND NOT EXISTS (SELECT 1 FROM nblb.gateway_instances AS instance WHERE instance.id=permit.owner_id AND instance.last_seen_at >= now()-interval '30 seconds')",
+        )
+        .execute(pool)
+        .await
+        .context("release permits from expired gateway owners")?;
         Ok(result.rows_affected())
     }
 }
@@ -756,7 +1134,7 @@ async fn sync_database_rows(
     // this transaction waited for the advisory lock.
     for key in keys {
         sqlx::query(
-            "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, fingerprint=EXCLUDED.fingerprint, ciphertext=EXCLUDED.ciphertext, nonce=EXCLUDED.nonce, enabled=EXCLUDED.enabled, verified=EXCLUDED.verified, retired=EXCLUDED.retired, cooldown_until=EXCLUDED.cooldown_until, request_count=EXCLUDED.request_count, failure_count=EXCLUDED.failure_count",
+            "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count, slot_no) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,COALESCE((SELECT slot_no FROM nblb.upstream_keys WHERE id=$1),CASE WHEN $8 THEN ((abs(hashtext($1::text)) % 2) + 1)::smallint ELSE (SELECT slot FROM generate_series(1,2) AS slot WHERE NOT EXISTS (SELECT 1 FROM nblb.upstream_keys WHERE slot_no=slot AND retired=false) ORDER BY slot LIMIT 1) END)) ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, fingerprint=EXCLUDED.fingerprint, ciphertext=EXCLUDED.ciphertext, nonce=EXCLUDED.nonce, enabled=EXCLUDED.enabled, verified=EXCLUDED.verified, retired=EXCLUDED.retired, cooldown_until=EXCLUDED.cooldown_until, request_count=EXCLUDED.request_count, failure_count=EXCLUDED.failure_count",
         )
         .bind(key.id)
         .bind(&key.label)
@@ -775,7 +1153,7 @@ async fn sync_database_rows(
     }
     for item in downstream {
         sqlx::query(
-            "INSERT INTO nblb.downstream_credentials (id, label, digest, scopes, active, request_count, last_used_at, created_at, revoked_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, digest=EXCLUDED.digest, scopes=EXCLUDED.scopes, active=EXCLUDED.active, request_count=EXCLUDED.request_count, last_used_at=EXCLUDED.last_used_at, revoked_at=EXCLUDED.revoked_at",
+            "INSERT INTO nblb.downstream_credentials (id, label, digest, scopes, active, request_count, last_used_at, created_at, revoked_at, key_prefix) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE((SELECT key_prefix FROM nblb.downstream_credentials WHERE id=$1),'issued_'||left(replace($1::text,'-',''),12))) ON CONFLICT (id) DO UPDATE SET label=EXCLUDED.label, digest=EXCLUDED.digest, scopes=EXCLUDED.scopes, active=EXCLUDED.active, request_count=EXCLUDED.request_count, last_used_at=EXCLUDED.last_used_at, revoked_at=EXCLUDED.revoked_at",
         )
         .bind(item.id)
         .bind(&item.label)
@@ -811,26 +1189,30 @@ async fn sync_database_rows(
 /// holds the advisory lock.  A concurrent change therefore fails closed and
 /// lets the caller roll the local mutation back instead of overwriting the
 /// fresher database state.
+struct VaultSyncSnapshot<'a> {
+    keys: &'a [VaultKeyRecord],
+    downstream: &'a [VaultDownstreamRecord],
+    cursors: &'a BTreeMap<String, usize>,
+}
+
 async fn sync_database_delta(
     pool: &PgPool,
-    previous_keys: &[VaultKeyRecord],
-    previous_downstream: &[VaultDownstreamRecord],
-    previous_cursors: &BTreeMap<String, usize>,
-    current_keys: &[VaultKeyRecord],
-    current_downstream: &[VaultDownstreamRecord],
-    current_cursors: &BTreeMap<String, usize>,
-) -> Result<()> {
+    previous: VaultSyncSnapshot<'_>,
+    current: VaultSyncSnapshot<'_>,
+    audit: Option<&VaultAuditMutation>,
+) -> Result<Option<Uuid>> {
     let mut tx = pool.begin().await.context("begin incremental vault sync")?;
     sqlx::query("SELECT pg_advisory_xact_lock(2147483647, 45291)")
         .execute(&mut *tx)
         .await
         .context("lock incremental vault sync")?;
 
-    let previous_keys = previous_keys
+    let previous_keys = previous
+        .keys
         .iter()
         .map(|key| (key.id, key))
         .collect::<HashMap<_, _>>();
-    for current in current_keys {
+    for current in current.keys {
         let Some(previous) = previous_keys.get(&current.id) else {
             let active_count = sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM nblb.upstream_keys WHERE retired = false",
@@ -842,7 +1224,7 @@ async fn sync_database_delta(
                 bail!("at most two upstream credentials are supported")
             }
             let result = sqlx::query(
-                "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO nblb.upstream_keys (id, label, fingerprint, ciphertext, nonce, enabled, verified, retired, cooldown_until, request_count, failure_count, slot_no) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,(SELECT slot FROM generate_series(1,2) AS slot WHERE NOT EXISTS (SELECT 1 FROM nblb.upstream_keys WHERE slot_no=slot AND retired=false) ORDER BY slot LIMIT 1)) ON CONFLICT (id) DO NOTHING",
             )
             .bind(current.id)
             .bind(&current.label)
@@ -904,11 +1286,17 @@ async fn sync_database_delta(
             }
         }
         // Provider receipts are invalid once a key loses verification or is
-        // durably retired. Delete them in this transaction so capability
-        // projections cannot observe proof from an older credential state.
+        // durably retired. Preserve the invalidated rows as operations
+        // evidence while excluding them from every eligibility projection.
         if (!current.verified && previous.verified) || (current.retired && !previous.retired) {
-            sqlx::query("DELETE FROM nblb.profile_probe_receipts WHERE key_id=$1")
+            let reason = if current.retired && !previous.retired {
+                "upstream_retired"
+            } else {
+                "credential_unverified"
+            };
+            sqlx::query("UPDATE nblb.profile_probe_receipts SET invalidated_at=COALESCE(invalidated_at,now()),invalidation_reason=COALESCE(invalidation_reason,$2) WHERE key_id=$1")
                 .bind(current.id)
+                .bind(reason)
                 .execute(&mut *tx)
                 .await
                 .context("invalidate stale profile provider receipts")?;
@@ -972,14 +1360,15 @@ async fn sync_database_delta(
         }
     }
 
-    let previous_downstream = previous_downstream
+    let previous_downstream = previous
+        .downstream
         .iter()
         .map(|item| (item.id, item))
         .collect::<HashMap<_, _>>();
-    for current in current_downstream {
+    for current in current.downstream {
         let Some(previous) = previous_downstream.get(&current.id) else {
             let result = sqlx::query(
-                "INSERT INTO nblb.downstream_credentials (id, label, digest, scopes, active, request_count, last_used_at, created_at, revoked_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO nblb.downstream_credentials (id, label, digest, scopes, active, request_count, last_used_at, created_at, revoked_at, key_prefix) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'issued_'||left(replace($1::text,'-',''),12)) ON CONFLICT (id) DO NOTHING",
             )
             .bind(current.id)
             .bind(&current.label)
@@ -1010,6 +1399,34 @@ async fn sync_database_delta(
             .context("update downstream active state")?;
             if result.rows_affected() != 1 {
                 bail!("concurrent downstream active state")
+            }
+        }
+        if current.token_digest != previous.token_digest {
+            let result = sqlx::query(
+                "UPDATE nblb.downstream_credentials SET digest=$2,rotated_at=now() WHERE id=$1 AND digest=$3",
+            )
+            .bind(current.id)
+            .bind(&current.token_digest)
+            .bind(&previous.token_digest)
+            .execute(&mut *tx)
+            .await
+            .context("rotate downstream credential digest")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent downstream credential rotation")
+            }
+        }
+        if current.scopes != previous.scopes {
+            let result = sqlx::query(
+                "UPDATE nblb.downstream_credentials SET scopes=$2 WHERE id=$1 AND scopes=$3",
+            )
+            .bind(current.id)
+            .bind(&current.scopes)
+            .bind(&previous.scopes)
+            .execute(&mut *tx)
+            .await
+            .context("update downstream credential scopes")?;
+            if result.rows_affected() != 1 {
+                bail!("concurrent downstream credential scopes")
             }
         }
         if current.revoked_at != previous.revoked_at {
@@ -1062,9 +1479,9 @@ async fn sync_database_delta(
     }
 
     for profile in PROFILES {
-        let previous = previous_cursors.get(profile).copied().unwrap_or_default();
-        let current = current_cursors.get(profile).copied().unwrap_or_default();
-        if previous.wrapping_sub(current) % 2 == 0 {
+        let previous_cursor = previous.cursors.get(profile).copied().unwrap_or_default();
+        let current_cursor = current.cursors.get(profile).copied().unwrap_or_default();
+        if previous_cursor.wrapping_sub(current_cursor) % 2 == 0 {
             continue;
         }
         let result = sqlx::query(
@@ -1081,8 +1498,98 @@ async fn sync_database_delta(
             bail!("concurrent routing cursor")
         }
     }
+
+    let audit_id = if let Some(audit) = audit {
+        if let Some(policy) = &audit.client_policy {
+            let result = sqlx::query(
+                "UPDATE nblb.downstream_credentials SET expires_at=CASE WHEN $2 THEN $3 ELSE expires_at END,model_allowlist=CASE WHEN $4 THEN $5 ELSE model_allowlist END,rpm_limit=CASE WHEN $6 THEN $7 ELSE rpm_limit END,max_concurrency=CASE WHEN $8 THEN $9 ELSE max_concurrency END,request_limit_day=CASE WHEN $10 THEN $11 ELSE request_limit_day END WHERE id=$1 AND active=true",
+            )
+            .bind(policy.id)
+            .bind(policy.expires_at_changed)
+            .bind(policy.expires_at)
+            .bind(policy.model_allowlist_changed)
+            .bind(policy.model_allowlist.as_deref())
+            .bind(policy.rpm_limit_changed)
+            .bind(
+                policy
+                    .rpm_limit
+                    .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
+            )
+            .bind(policy.max_concurrency_changed)
+            .bind(
+                policy
+                    .max_concurrency
+                    .map(|value| i16::try_from(value).unwrap_or(i16::MAX)),
+            )
+            .bind(policy.request_limit_day_changed)
+            .bind(
+                policy
+                    .request_limit_day
+                    .map(|value| i32::try_from(value).unwrap_or(i32::MAX)),
+            )
+            .execute(&mut *tx)
+            .await
+            .context("apply client policy in audited vault mutation")?;
+            if result.rows_affected() != 1 {
+                bail!("client policy target is unavailable")
+            }
+        }
+        if let Some(probe) = &audit.probe_result {
+            let passed = probe.error_class.is_none()
+                && probe
+                    .status_code
+                    .is_some_and(|status| (200..300).contains(&status));
+            sqlx::query(
+                "INSERT INTO nblb.probe_runs(id,kind,upstream_id,profile_id,status,status_code,latency_ms,error_class,billable,started_at,finished_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now())",
+            )
+            .bind(probe.id)
+            .bind(probe.kind)
+            .bind(probe.upstream_id)
+            .bind(probe.profile_id)
+            .bind(if passed { "passed" } else { "failed" })
+            .bind(probe.status_code.map(i32::from))
+            .bind(i64::try_from(probe.latency_ms).unwrap_or(i64::MAX))
+            .bind(probe.error_class)
+            .bind(probe.billable)
+            .execute(&mut *tx)
+            .await
+            .context("insert audited probe result")?;
+            if passed {
+                if let Some(profile) = probe.receipt_profile {
+                    sqlx::query("INSERT INTO nblb.profile_probe_receipts(profile_id,key_id,last_probe_run_id,invalidated_at,invalidation_reason) VALUES ($1,$2,$3,NULL,NULL) ON CONFLICT(profile_id,key_id) DO UPDATE SET verified_at=now(),last_probe_run_id=EXCLUDED.last_probe_run_id,invalidated_at=NULL,invalidation_reason=NULL")
+                        .bind(profile)
+                        .bind(probe.upstream_id)
+                        .bind(probe.id)
+                        .execute(&mut *tx)
+                        .await
+                        .context("store audited probe receipt")?;
+                }
+            } else if matches!(probe.status_code, Some(401 | 403)) {
+                sqlx::query("UPDATE nblb.profile_probe_receipts SET invalidated_at=COALESCE(invalidated_at,now()),invalidation_reason='provider_auth_error' WHERE key_id=$1")
+                    .bind(probe.upstream_id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("invalidate audited provider proofs")?;
+            }
+        }
+        Some(
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO nblb.audit_events(action,resource_kind,resource_id,request_id,outcome,detail) VALUES ($1,$2,$3,$4,'succeeded',$5) RETURNING id",
+            )
+            .bind(audit.action)
+            .bind(audit.resource_kind)
+            .bind(audit.resource_id)
+            .bind(audit.request_id)
+            .bind(&audit.detail)
+            .fetch_one(&mut *tx)
+            .await
+            .context("insert audited vault mutation event")?,
+        )
+    } else {
+        None
+    };
     tx.commit().await.context("commit incremental vault sync")?;
-    Ok(())
+    Ok(audit_id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1137,10 +1644,17 @@ async fn main() -> std::io::Result<()> {
     let content_security_policy = format!(
         "default-src 'self'; script-src 'self'{script_hashes}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"
     );
+    operations::qa::recover_interrupted_runs(&state)
+        .await
+        .map_err(|error| {
+            eprintln!("interrupted QA recovery failed: {error:#}");
+            std::io::Error::other("interrupted QA recovery failed")
+        })?;
     spawn_database_watchdog(state.clone());
     evidence::spawn_operations_workers(state.clone());
     HttpServer::new(move || {
         App::new()
+            .wrap(from_fn(request_id::audit_failed_admin_mutation))
             .wrap(from_fn(request_id::assign_request_id))
             .wrap(from_fn(request_id::enforce_admin_boundary))
             .wrap(
@@ -1155,11 +1669,64 @@ async fn main() -> std::io::Result<()> {
             )
             .app_data(state.clone())
             .app_data(web::PayloadConfig::new(64 * 1024 * 1024))
+            .app_data(web::JsonConfig::default().error_handler(|error, req| {
+                let response = extractor_error(
+                    req,
+                    "invalid_json",
+                    "The JSON request body does not match the API contract.",
+                );
+                InternalError::from_response(error, response).into()
+            }))
+            .app_data(web::PathConfig::default().error_handler(|error, req| {
+                let response = extractor_error(
+                    req,
+                    "invalid_path_parameter",
+                    "One or more path parameters are invalid.",
+                );
+                InternalError::from_response(error, response).into()
+            }))
+            .app_data(web::QueryConfig::default().error_handler(|error, req| {
+                let response = extractor_error(
+                    req,
+                    "invalid_query_parameter",
+                    "One or more query parameters are invalid.",
+                );
+                InternalError::from_response(error, response).into()
+            }))
             .configure(routes)
     })
     .bind(("0.0.0.0", port))?
     .run()
     .await
+}
+
+fn extractor_error(req: &HttpRequest, code: &str, message: &str) -> HttpResponse {
+    if req.path().starts_with("/admin/api/v2/") {
+        return operations_error(
+            req,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message,
+            false,
+            None,
+        );
+    }
+    if req.path().starts_with("/api/public/") {
+        return HttpResponse::UnprocessableEntity().json(json!({
+            "error":{
+                "code":code,
+                "message":message,
+                "request_id":request_id::request_id(req),
+                "retryable":false
+            }
+        }));
+    }
+    openai_error(
+        StatusCode::BAD_REQUEST,
+        message,
+        "invalid_request_error",
+        code,
+    )
 }
 
 fn spawn_database_watchdog(state: web::Data<AppState>) {
@@ -1203,6 +1770,8 @@ fn routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/health/live", web::get().to(health::liveness))
         .route("/health/ready", web::get().to(health::readiness))
         .route("/health", web::get().to(health::readiness))
+        .configure(operations::public::routes)
+        .configure(operations::admin::routes)
         .route(
             "/admin/api/v1/operator-readiness",
             web::get().to(admin::operator_readiness),
@@ -1307,6 +1876,7 @@ fn routes(cfg: &mut web::ServiceConfig) {
         .service(
             Files::new("/admin", "/app/static")
                 .index_file("index.html")
+                .default_handler(web::to(admin_spa_index))
                 .guard(guard::fn_guard(|context| {
                     let mut hosts = context.head().headers.get_all(header::HOST);
                     let Some(host) = hosts.next().and_then(|value| value.to_str().ok()) else {
@@ -1317,7 +1887,28 @@ fn routes(cfg: &mut web::ServiceConfig) {
         );
     // Keep the public status artifact separate from the loopback-only admin
     // files so the root dashboard cannot expose operator data by fallback.
-    cfg.service(Files::new("/", "/app/public").index_file("index.html"));
+    cfg.route("/favicon.ico", web::get().to(legacy_favicon))
+        .route("/status", web::get().to(public_spa_index))
+        .route("/models", web::get().to(public_spa_index))
+        .route("/docs", web::get().to(public_spa_index))
+        .route("/incidents", web::get().to(public_spa_index))
+        .route("/incidents/{slug}", web::get().to(public_spa_index))
+        .route("/security", web::get().to(public_spa_index))
+        .service(Files::new("/", "/app/public").index_file("index.html"));
+}
+
+async fn admin_spa_index() -> actix_web::Result<NamedFile> {
+    Ok(NamedFile::open_async("/app/static/index.html").await?)
+}
+
+async fn public_spa_index() -> actix_web::Result<NamedFile> {
+    Ok(NamedFile::open_async("/app/public/index.html").await?)
+}
+
+async fn legacy_favicon() -> HttpResponse {
+    HttpResponse::TemporaryRedirect()
+        .insert_header((header::LOCATION, "/favicon.svg"))
+        .finish()
 }
 
 async fn build_state() -> Result<AppState> {
@@ -1631,7 +2222,19 @@ async fn poll_nvcf(
     if response.status().as_u16() != 202 {
         bail!("NVCF polling requires origin 202")
     }
-    let poll_endpoint = format!("https://api.nvcf.nvidia.com/v2/nvcf/pexec/status/{request_id}");
+    let poll_endpoint = if response
+        .url()
+        .host_str()
+        .is_some_and(|host| host == "api.nvcf.nvidia.com" || host.ends_with(".nvidia.com"))
+    {
+        format!("https://api.nvcf.nvidia.com/v2/nvcf/pexec/status/{request_id}")
+    } else {
+        response
+            .url()
+            .join(&format!("/v2/nvcf/pexec/status/{request_id}"))
+            .context("build same-origin NVCF polling endpoint")?
+            .to_string()
+    };
     for header_name in ["location", "nvcf-status-url"] {
         if let Some(value) = response
             .headers()
@@ -1642,8 +2245,8 @@ async fn poll_nvcf(
             bail!("NVCF returned a non-canonical polling endpoint")
         }
     }
-    let mut delay = StdDuration::from_millis(250);
-    let deadline = Instant::now() + StdDuration::from_secs(30);
+    let mut delay = NVCF_INITIAL_POLL_DELAY;
+    let deadline = Instant::now() + NVCF_POLL_DEADLINE;
     loop {
         if Instant::now() >= deadline {
             bail!("NVCF request polling timed out")
@@ -1660,6 +2263,10 @@ async fn poll_nvcf(
             .send()
             .await
             .context("poll NVCF request")?;
+        if response.status().as_u16() == 202 {
+            delay = (delay * 2).min(StdDuration::from_secs(2));
+            continue;
+        }
         if response.status().is_success() {
             let content_type = response
                 .headers()
@@ -1675,10 +2282,7 @@ async fn poll_nvcf(
             }
             return Ok(response);
         }
-        if response.status().as_u16() != 202 {
-            bail!("NVCF poll returned {}", response.status());
-        }
-        delay = (delay * 2).min(StdDuration::from_secs(2));
+        bail!("NVCF poll returned {}", response.status());
     }
 }
 
@@ -1718,6 +2322,18 @@ fn mock_modality(path: &str, request: &Value) -> (Vec<u8>, &'static str) {
                 .expect("mock transcription fixture is serializable"),
             "application/json",
         ),
+        "/v1/nvidia/inference" => (
+            serde_json::to_vec(&json!({
+                "id":"vila-mock-1",
+                "object":"chat.completion",
+                "created":Utc::now().timestamp(),
+                "model":model,
+                "choices":[{"index":0,"message":{"role":"assistant","content":"image"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}
+            }))
+            .expect("mock VILA fixture is serializable"),
+            "application/json",
+        ),
         _ => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(mock_mp4());
             (
@@ -1750,6 +2366,8 @@ fn mock_wav() -> Vec<u8> {
     bytes[20..22].copy_from_slice(&1_u16.to_le_bytes());
     bytes[22..24].copy_from_slice(&1_u16.to_le_bytes());
     bytes[24..28].copy_from_slice(&44_100_u32.to_le_bytes());
+    bytes[28..32].copy_from_slice(&88_200_u32.to_le_bytes());
+    bytes[32..34].copy_from_slice(&2_u16.to_le_bytes());
     bytes[34..36].copy_from_slice(&16_u16.to_le_bytes());
     bytes[36..40].copy_from_slice(b"data");
     bytes[40..44].copy_from_slice(&4_u32.to_le_bytes());
@@ -1758,10 +2376,13 @@ fn mock_wav() -> Vec<u8> {
 }
 
 fn mock_mp4() -> Vec<u8> {
-    vec![
+    let mut bytes = vec![
         0, 0, 0, 24, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0, 0, 0, 0, b'i', b's', b'o',
-        b'm', b'm', b'p', b'4', 0, 0, 0, 8, b'm', b'o', b'o', b'v',
-    ]
+        b'm', b'm', b'p', b'4', 0,
+    ];
+    bytes.extend_from_slice(&[0, 0, 0, 12, b'm', b'd', b'a', b't', 0, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 8, b'm', b'o', b'o', b'v']);
+    bytes
 }
 
 fn mock_response(request: &Value, stream: bool) -> HttpResponse {
@@ -1817,16 +2438,36 @@ async fn mock_stream_response(
         .unwrap_or("z-ai/glm-5.2")
         .to_owned();
     let id = format!("chatcmpl-{}", Uuid::new_v4());
-    let chunks = vec![
-        Bytes::from(format!(
-            "data: {}\n\n",
-            json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":"NVIDIA Build LB"},"finish_reason":null}]})
-        )),
-        Bytes::from(format!(
-            "data: {}\n\ndata: [DONE]\n\n",
-            json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
-        )),
-    ];
+    let first = Bytes::from(format!(
+        "data: {}\n\n",
+        json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":"NVIDIA Build LB"},"finish_reason":null}]})
+    ));
+    let terminal = Bytes::from(format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+    ));
+    let scenario = request
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("mock_stream_scenario"))
+        .and_then(Value::as_str);
+    let chunks = match scenario {
+        Some("disconnect_after_first_frame") => vec![first],
+        Some("fragmented_sse") => {
+            let joined = [first.as_ref(), terminal.as_ref()].concat();
+            let split = [1_usize, 7, 31, joined.len().saturating_sub(3)];
+            let mut start = 0;
+            let mut chunks = Vec::new();
+            for end in split.into_iter().chain(std::iter::once(joined.len())) {
+                if end > start && end <= joined.len() {
+                    chunks.push(Bytes::copy_from_slice(&joined[start..end]));
+                    start = end;
+                }
+            }
+            chunks
+        }
+        _ => vec![first, terminal],
+    };
     let delay = env::var("NBLB_MOCK_STREAM_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1902,15 +2543,38 @@ async fn authorize_scope(
         }
         return Err(downstream_unauthorized());
     };
-    match state.vault.authenticate(token, scope).await {
-        Ok(summary) => Ok(Some(summary.id)),
-        Err(error) if error.to_string() == "insufficient scope" => Err(downstream_forbidden(scope)),
-        Err(error) if error.to_string() == "invalid downstream credential" => {
-            Err(downstream_unauthorized())
-        }
-        Err(_) => Err(openai_error(
+    match state.vault.authorize_downstream(token, scope).await {
+        Ok(id) => Ok(Some(id)),
+        Err(DownstreamAuthenticationError::InsufficientScope) => Err(downstream_forbidden(scope)),
+        Err(DownstreamAuthenticationError::InvalidCredential) => Err(downstream_unauthorized()),
+        Err(DownstreamAuthenticationError::StoreUnavailable) => Err(openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Credential store is temporarily unavailable.",
+            "service_unavailable_error",
+            "credential_store_unavailable",
+        )),
+    }
+}
+
+async fn record_accepted_downstream_use(
+    state: &web::Data<AppState>,
+    downstream_id: Option<Uuid>,
+) -> Result<(), HttpResponse> {
+    let Some(id) = downstream_id else {
+        return Ok(());
+    };
+    match state.vault.record_accepted_downstream_use(id).await {
+        Ok(()) => Ok(()),
+        Err(DownstreamAuthenticationError::InvalidCredential) => Err(downstream_unauthorized()),
+        Err(DownstreamAuthenticationError::InsufficientScope) => Err(openai_error(
+            StatusCode::FORBIDDEN,
+            "The downstream credential is not allowed to perform this operation.",
+            "permission_error",
+            "insufficient_scope",
+        )),
+        Err(DownstreamAuthenticationError::StoreUnavailable) => Err(openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Credential usage could not be recorded.",
             "service_unavailable_error",
             "credential_store_unavailable",
         )),
@@ -2113,7 +2777,49 @@ fn eligible_key_count(keys: &[nvidia_build_lb_core::KeySummary]) -> usize {
 /// Serialize selection with cursor persistence. Without this boundary two
 /// concurrent requests could persist their cursors in reverse completion order
 /// and make restart resume from an older slot.
-async fn select_key(state: &web::Data<AppState>, profile: &str) -> Option<Uuid> {
+async fn select_initial_key(state: &web::Data<AppState>, profile: &str) -> Option<Uuid> {
+    if let (Some(pool), Some(owner_id)) = (&state.vault.database, state.vault.owner_id) {
+        let mut tx = pool.begin().await.ok()?;
+        let next_slot = sqlx::query_scalar::<_, i16>(
+            "SELECT next_slot FROM nblb.routing_state WHERE profile_id=$1 FOR UPDATE",
+        )
+        .bind(profile)
+        .fetch_optional(&mut *tx)
+        .await
+        .ok()??;
+        let candidates = sqlx::query_as::<_, (Uuid, i16)>(
+            "SELECT key.id,key.slot_no FROM nblb.upstream_keys AS key JOIN nblb.profile_probe_receipts AS proof ON proof.key_id=key.id AND proof.profile_id=$1 AND proof.invalidated_at IS NULL WHERE key.retired=false AND key.enabled=true AND key.verified=true AND (key.cooldown_until IS NULL OR key.cooldown_until<=now()) AND proof.verified_at>=now()-make_interval(secs=>(SELECT proof_freshness_seconds FROM nblb.operations_settings WHERE singleton=true)) AND EXISTS(SELECT 1 FROM nblb.gateway_instances WHERE id=$2 AND last_seen_at>=now()-interval '30 seconds') ORDER BY key.slot_no",
+        )
+        .bind(profile)
+        .bind(owner_id)
+        .fetch_all(&mut *tx)
+        .await
+        .ok()?;
+        let selected = candidates
+            .iter()
+            .find(|(_, slot)| *slot == next_slot)
+            .or_else(|| candidates.first())
+            .copied()?;
+        let following_slot = if selected.1 == 1 { 2_i16 } else { 1_i16 };
+        sqlx::query(
+            "UPDATE nblb.routing_state SET next_slot=$2,generation=generation+1 WHERE profile_id=$1",
+        )
+        .bind(profile)
+        .bind(following_slot)
+        .execute(&mut *tx)
+        .await
+        .ok()?;
+        tx.commit().await.ok()?;
+        if let Ok(mut routers) = state.router.lock() {
+            routers
+                .entry(profile.to_owned())
+                .or_default()
+                .set_next_slot(
+                    usize::try_from(following_slot.saturating_sub(1)).unwrap_or_default(),
+                );
+        }
+        return Some(selected.0);
+    }
     let _selection = state.selection_lock.lock().await;
     let keys = state.vault.list();
     let (id, previous_cursor, next_cursor) = {
@@ -2132,6 +2838,34 @@ async fn select_key(state: &web::Data<AppState>, profile: &str) -> Option<Uuid> 
         return None;
     }
     Some(id)
+}
+
+async fn select_failover_key(
+    state: &web::Data<AppState>,
+    profile: &str,
+    attempted: &[Uuid],
+) -> Option<Uuid> {
+    if let (Some(pool), Some(owner_id)) = (&state.vault.database, state.vault.owner_id) {
+        return sqlx::query_scalar::<_, Uuid>(
+            "SELECT key.id FROM nblb.upstream_keys AS key JOIN nblb.profile_probe_receipts AS proof ON proof.key_id=key.id AND proof.profile_id=$1 AND proof.invalidated_at IS NULL WHERE key.retired=false AND key.enabled=true AND key.verified=true AND (key.cooldown_until IS NULL OR key.cooldown_until<=now()) AND proof.verified_at>=now()-make_interval(secs=>(SELECT proof_freshness_seconds FROM nblb.operations_settings WHERE singleton=true)) AND NOT(key.id=ANY($2)) AND EXISTS(SELECT 1 FROM nblb.gateway_instances WHERE id=$3 AND last_seen_at>=now()-interval '30 seconds') ORDER BY key.slot_no LIMIT 1",
+        )
+        .bind(profile)
+        .bind(attempted)
+        .bind(owner_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    }
+    let keys = state.vault.list();
+    keys.into_iter()
+        .find(|key| {
+            !attempted.contains(&key.id)
+                && key.enabled
+                && key.verified
+                && key.cooldown_until.is_none_or(|until| until <= Utc::now())
+        })
+        .map(|key| key.id)
 }
 
 async fn record_request(state: &web::Data<AppState>, id: Uuid) -> Result<(), HttpResponse> {

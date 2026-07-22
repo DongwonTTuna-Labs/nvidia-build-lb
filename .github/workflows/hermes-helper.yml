@@ -1,0 +1,52 @@
+name: Hermes helper artifact
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Install musl target
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build pinned static helper
+        env:
+          NBLB_GIT_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          cargo build --locked --release --target x86_64-unknown-linux-musl --bin nblb-hermes-cutover
+          install -d artifact
+          install -m 0755 target/x86_64-unknown-linux-musl/release/nblb-hermes-cutover artifact/nblb-hermes-cutover
+          file artifact/nblb-hermes-cutover | tee artifact/nblb-hermes-cutover.file.txt
+          if readelf --program-headers --wide artifact/nblb-hermes-cutover | grep -q 'INTERP'; then
+            echo 'helper contains a dynamic interpreter' >&2
+            exit 1
+          fi
+          if readelf --dynamic --wide artifact/nblb-hermes-cutover 2>/dev/null | grep -q '(NEEDED)'; then
+            echo 'helper contains a dynamic dependency' >&2
+            exit 1
+          fi
+          (cd artifact && sha256sum nblb-hermes-cutover > nblb-hermes-cutover.sha256)
+      - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: nblb-hermes-cutover-${{ github.event.workflow_run.head_sha }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 30

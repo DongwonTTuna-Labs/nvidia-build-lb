@@ -8,7 +8,8 @@ Cloudflare tunnel
 Actix Rust gateway :2456 ── HTTPS ── NVIDIA hosted API
         │
         ├── PostgreSQL (SQLx migrations, durable routing/evidence)
-        └── SvelteKit static admin (/admin)
+        ├── SvelteKit static public product (/)
+        └── SvelteKit static admin console (/admin)
 ```
 
 `nblb-prestart`가 secret을 runtime tmpfs로 복사한 뒤 gateway와 migration을 UID
@@ -23,7 +24,10 @@ database lifecycle과 cross-cutting authorization만 소유한다. HTTP 책임�
 
 - `health.rs`: provider와 분리된 liveness 및 DB/eligible traffic readiness
 - `request_id.rs`: dynamic API correlation과 public-host admin 차단 middleware
-- `admin.rs`: evidence, key/client mutation과 운영 pagination DTO
+- `operations/admin.rs`: loopback-only typed admin v2 route와 validation
+- `operations/admin_repository.rs`: PostgreSQL query/command와 mutation audit
+- `operations/public.rs`: content-free public status/model/incident projection
+- `operations/qa.rs`: async traffic QA, restart persistence, armed Hermes completion
 - `proxy.rs`: OpenAI chat와 multimodal transport/failover orchestration
 - `provider.rs`: upstream endpoint mapping, modality preparation과 response contract
 - `streaming.rs`: SSE priming/terminal accounting과 이미지·오디오·비디오 payload 검증
@@ -39,14 +43,19 @@ durable ledger 같은 공통 권위는 `AppState`를 통해서만 공유한다.
 - `/v1/embeddings`, `/v1/images/generations`, `/v1/videos/generations`,
   `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/nvidia/inference`: profile별
   modality validation과 provider response validation
-- `/admin/api/v1/*`: admin bearer + host boundary를 통과한 운영 DTO
-- `/admin`: Svelte static UI. Rust가 build HTML inline bootstrap hash를 계산해
-  CSP에 반영한다.
+- `/api/public/v1/*`: 인증 없는 sanitized summary/metric/model/incident/OpenAPI
+- `/admin/api/v2/*`: admin bearer와 loopback host boundary를 통과한 typed operations API
+- `/admin/api/v1/*`: 이전 배포를 위한 호환 adapter
+- `/`, `/status`, `/models`, `/docs`, `/incidents*`, `/security`: 공개 Svelte route
+- `/admin/*`: route 기반 관리자 Svelte console. Rust가 build HTML inline bootstrap
+  hash를 계산해 CSP에 반영한다.
 
-게이트웨이 계약 테스트는 `tests.rs`에 두어 process/bootstrap 코드와 분리하고,
-관리 UI의 화면 단위는 `OverviewPanel`, `RoutingStatusPanel`, `ClientsPanel`,
-`ModelsPanel`, `EvidencePanel`로 구성하고, route 파일은 상태 오케스트레이션과
-접근성·custody lifecycle에 집중한다.
+게이트웨이 통합 계약 테스트는 `tests.rs`, 기능 단위 테스트는 소유 모듈에 둡니다.
+관리 UI는 overview, upstreams, clients, routing, models, requests, probes, incidents,
+audit, QA, settings의 독립 route로 구성합니다. 공통 shell, auth control, data state,
+pagination, status badge만 `$lib/components`에서 공유하고 route가 조회·편집 lifecycle을
+소유합니다. polling은 비중첩·hidden-tab skip이며, dirty form과 mutation 중에는 서버
+refresh가 사용자 입력을 덮어쓰지 않습니다.
 
 ## 상태 모델
 
@@ -81,6 +90,17 @@ row 없이 평균과 p95 upper bound를 계산한다. worker가 여러 gateway p
 body, Authorization header, plaintext upstream key나 downstream token을 저장하지 않는다.
 operator metadata와 QA evidence JSON은 최상위 scalar 값만 허용하고 key 수와 문자열
 길이를 제한한다.
+
+Hermes E2E run은 gateway가 모든 case를 `running`으로 arm하고 30분 동안 외부 root-only
+Rust helper를 기다립니다. helper는 receipt 저장과 rollback rehearsal 뒤
+`POST /admin/api/v2/qa/runs/{id}/hermes-completion`에 boolean/UUID/count만 제출합니다.
+gateway는 request IDs가 같은 downstream client, run 이후 시각, terminal success,
+동일 attempt count와 완전한 request window인지 한 transaction에서 다시 검증한 뒤에만
+run을 `passed`로 닫습니다. fake Hermes run은 API/DB에서 금지하고 queued/running QA는
+partial unique index로 global single-flight입니다. history는 `(started_at,id)` opaque
+keyset pagination과 case batch load를 사용합니다. helper는 host mutation 전 exact
+live/running/commit identity를 검증하고 committed 이후에는 reconciliation만 수행합니다.
+helper pre-commit failure, timeout, gateway restart는 fail-closed입니다.
 
 보존 기간은 terminal request/attempt 30일, minute metric/probe 90일,
 audit/terminal QA run 180일이다. 열린 request, 진행 중인 probe/QA run과 incident는

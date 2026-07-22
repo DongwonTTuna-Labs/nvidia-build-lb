@@ -41,6 +41,11 @@ jobs:
           bun run --cwd apps/admin format
           bun run --cwd apps/admin knip
           bun run --cwd apps/admin build
+          bun install --cwd apps/public --frozen-lockfile --ignore-scripts --no-progress
+          bun run --cwd apps/public check
+          bun run --cwd apps/public format
+          bun run --cwd apps/public knip
+          bun run --cwd apps/public build
       - name: Build immutable images
         env:
           IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
@@ -49,7 +54,7 @@ jobs:
           image_repository="$(printf '%s' "$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           IMAGE_TAG="$image_repository:sha-$IMAGE_SHA"
           POSTGRES_TAG="$image_repository:postgres-sha-$IMAGE_SHA"
-          docker buildx build --pull --file Dockerfile.rust --tag "$IMAGE_TAG" --push .
+          docker buildx build --pull --build-arg NBLB_GIT_COMMIT="$IMAGE_SHA" --file Dockerfile.rust --tag "$IMAGE_TAG" --push .
           docker buildx build --pull --file docker/postgres.Dockerfile --tag "$POSTGRES_TAG" --push .
       - name: Resolve and publish immutable digests
         id: publish

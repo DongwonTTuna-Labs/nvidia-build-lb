@@ -9,9 +9,10 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use super::{
-    AppState, DownstreamInput, KeyInput, PROFILES, ToggleInput, UPSTREAM_REQUEST_TIMEOUT,
-    admin_unauthorized, authorize_scope, authorized, eligible_key_count, public_guard_response,
-    quarantine_key, upstream_endpoint_for, validate_chat_response,
+    AppState, DownstreamInput, KeyInput, PROFILES, ProbeAuditMutation, ToggleInput,
+    UPSTREAM_REQUEST_TIMEOUT, VaultAuditMutation, admin_unauthorized, authorize_scope, authorized,
+    eligible_key_count, public_guard_response, record_accepted_downstream_use,
+    request_id::request_id, upstream_endpoint_for, validate_chat_response,
 };
 
 pub(crate) async fn operator_readiness(
@@ -73,9 +74,10 @@ pub(crate) async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl
     if let Some(response) = public_guard_response(&req) {
         return response;
     }
-    if let Err(response) = authorize_scope(&req, &state, "models:read").await {
-        return response;
-    }
+    let downstream_id = match authorize_scope(&req, &state, "models:read").await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     // Keep the public OpenAI-compatible model catalog discoverable before a
     // first request succeeds. Provider proof is an operational readiness
     // signal, exposed by the admin capability/readiness endpoints below; it
@@ -85,6 +87,9 @@ pub(crate) async fn models(req: HttpRequest, state: web::Data<AppState>) -> impl
         .iter()
         .map(|id| json!({"id": id, "object": "model", "owned_by": "nvidia", "created": 1784332800}))
         .collect();
+    if let Err(response) = record_accepted_downstream_use(&state, downstream_id).await {
+        return response;
+    }
     HttpResponse::Ok().json(json!({"object":"list","data":data}))
 }
 
@@ -579,10 +584,29 @@ pub(crate) async fn add_key(
     }
     match state
         .vault
-        .mutate(|vault| vault.add(&payload.label, &payload.credential))
+        .mutate_with_audit(
+            |vault| vault.add(&payload.label, &payload.credential),
+            |summary| VaultAuditMutation {
+                action: "upstream.create",
+                resource_kind: "upstream",
+                resource_id: Some(summary.id),
+                request_id: request_id(&req),
+                detail: json!({"legacy_adapter":true}),
+                client_policy: None,
+                probe_result: None,
+            },
+        )
         .await
     {
-        Ok(summary) => HttpResponse::Created().json(summary),
+        Ok((summary, _)) => HttpResponse::Created().json(summary),
+        Err(error) if error.to_string().contains("audited mutation requires PostgreSQL") => {
+            HttpResponse::ServiceUnavailable().json(json!({
+                "error": {
+                    "code": "audit_unavailable",
+                    "message": "The audited mutation store is unavailable."
+                }
+            }))
+        }
         Err(error) if is_unique_conflict(&error) => HttpResponse::Conflict().json(
             json!({"error":{"code":"resource_conflict","message":"An active upstream slot with this label or credential already exists."}}),
         ),
@@ -600,12 +624,24 @@ pub(crate) async fn toggle_key(
     if !authorized(&req, &state) {
         return admin_unauthorized(&req);
     }
+    let id = path.into_inner();
     match state
         .vault
-        .mutate(|vault| vault.set_enabled(path.into_inner(), payload.enabled))
+        .mutate_with_audit(
+            |vault| vault.set_enabled(id, payload.enabled),
+            |_| VaultAuditMutation {
+                action: if payload.enabled { "upstream.enable" } else { "upstream.disable" },
+                resource_kind: "upstream",
+                resource_id: Some(id),
+                request_id: request_id(&req),
+                detail: json!({"legacy_adapter":true}),
+                client_policy: None,
+                probe_result: None,
+            },
+        )
         .await
     {
-        Ok(summary) => HttpResponse::Ok().json(summary),
+        Ok((summary, _)) => HttpResponse::Ok().json(summary),
         Err(error) if error.to_string().contains("probe") => HttpResponse::Conflict().json(
             json!({"error":{"code":"probe_required","message":"provider probe is required before enabling this key"}}),
         ),
@@ -629,23 +665,71 @@ pub(crate) async fn disable_key_alias(
     toggle_key(req, state, path, web::Json(ToggleInput { enabled: false })).await
 }
 
-/// Verifies one stored credential without changing its routing state.  The
-/// response is deliberately reduced to a status class; provider bodies and
-/// credential material never cross the admin boundary.
-pub(crate) async fn record_probe_receipt(
+async fn persist_credential_probe(
     state: &web::Data<AppState>,
     key_id: Uuid,
-) -> Result<(), HttpResponse> {
-    state
+    status_code: Option<u16>,
+    error_class: Option<&'static str>,
+    correlation_id: Uuid,
+) -> Result<()> {
+    let success =
+        error_class.is_none() && status_code.is_some_and(|status| (200..300).contains(&status));
+    if success || matches!(status_code, Some(401 | 403)) {
+        let probe_id = Uuid::new_v4();
+        let probe = ProbeAuditMutation {
+            id: probe_id,
+            kind: "credential",
+            upstream_id: key_id,
+            profile_id: None,
+            receipt_profile: Some("z-ai/glm-5.2"),
+            billable: false,
+            status_code,
+            error_class,
+            latency_ms: 0,
+        };
+        let mutation = |_: &()| VaultAuditMutation {
+            action: "probe.complete",
+            resource_kind: "probe",
+            resource_id: Some(probe_id),
+            request_id: correlation_id,
+            detail: json!({"billable":false,"kind":"credential","legacy_adapter":true,"passed":success}),
+            client_policy: None,
+            probe_result: Some(probe.clone()),
+        };
+        if success {
+            state
+                .vault
+                .mutate_with_audit(|vault| vault.mark_verified(key_id).map(|_| ()), mutation)
+                .await?;
+        } else {
+            state
+                .vault
+                .mutate_with_audit(|vault| vault.quarantine(key_id).map(|_| ()), mutation)
+                .await?;
+        }
+        return Ok(());
+    }
+    let pool = state
         .vault
-        .record_profile_proof("z-ai/glm-5.2", key_id)
-        .await
-        .map_err(|_| {
-            HttpResponse::ServiceUnavailable().json(json!({
-                "probe_status": "unavailable",
-                "error": {"code": "probe_persistence_failed"}
-            }))
-        })
+        .database
+        .as_ref()
+        .context("credential probe evidence requires PostgreSQL")?;
+    super::operations::admin_repository::record_probe_result(
+        pool,
+        super::operations::admin_repository::ProbeResultInput {
+            kind: "credential",
+            upstream_id: key_id,
+            profile_id: None,
+            receipt_profile: Some("z-ai/glm-5.2"),
+            billable: false,
+            status_code,
+            error_class,
+            latency_ms: 0,
+            request_id: correlation_id,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn probe_key(
@@ -665,22 +749,32 @@ pub(crate) async fn probe_key(
     };
     if state.upstream_url.starts_with("mock://") {
         if credential.contains("fail") {
-            if let Err(response) = quarantine_key(&state, id).await {
-                return response;
+            if persist_credential_probe(
+                &state,
+                id,
+                Some(401),
+                Some("upstream_auth_error"),
+                request_id(&req),
+            )
+            .await
+            .is_err()
+            {
+                return HttpResponse::ServiceUnavailable().json(json!({"probe_status":"unavailable","error":{"code":"probe_persistence_failed"}}));
             }
             return HttpResponse::UnprocessableEntity().json(json!({
                 "probe_status": "invalid_credential",
                 "error": {"code": "invalid_upstream_credential"}
             }));
         }
-        return match state.vault.mutate(|vault| vault.mark_verified(id)).await {
-            Ok(_) => match record_probe_receipt(&state, id).await {
-                Ok(()) => HttpResponse::Ok().json(json!({"probe_status":"valid","status":200})),
-                Err(response) => response,
-            },
-            Err(_) => HttpResponse::ServiceUnavailable().json(
+        return if persist_credential_probe(&state, id, Some(200), None, request_id(&req))
+            .await
+            .is_ok()
+        {
+            HttpResponse::Ok().json(json!({"probe_status":"valid","status":200}))
+        } else {
+            HttpResponse::ServiceUnavailable().json(
                 json!({"probe_status":"unavailable","error":{"code":"probe_persistence_failed"}}),
-            ),
+            )
         };
     }
     let endpoint =
@@ -702,6 +796,14 @@ pub(crate) async fn probe_key(
     let response = match response {
         Ok(response) => response,
         Err(_) => {
+            let _ = persist_credential_probe(
+                &state,
+                id,
+                None,
+                Some("upstream_unavailable"),
+                request_id(&req),
+            )
+            .await;
             return HttpResponse::ServiceUnavailable().json(json!({
                 "probe_status": "unavailable",
                 "error": {"code": "upstream_unavailable"}
@@ -710,8 +812,19 @@ pub(crate) async fn probe_key(
     };
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        if let Err(response) = quarantine_key(&state, id).await {
-            return response;
+        if persist_credential_probe(
+            &state,
+            id,
+            Some(status.as_u16()),
+            Some("upstream_auth_error"),
+            request_id(&req),
+        )
+        .await
+        .is_err()
+        {
+            return HttpResponse::ServiceUnavailable().json(
+                json!({"probe_status":"unavailable","error":{"code":"probe_persistence_failed"}}),
+            );
         }
         return HttpResponse::UnprocessableEntity().json(json!({
             "probe_status": "invalid_credential",
@@ -720,6 +833,14 @@ pub(crate) async fn probe_key(
         }));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let _ = persist_credential_probe(
+            &state,
+            id,
+            Some(status.as_u16()),
+            Some("upstream_rate_limited"),
+            request_id(&req),
+        )
+        .await;
         return HttpResponse::TooManyRequests().json(json!({
             "probe_status": "rate_limited",
             "status": status.as_u16(),
@@ -727,6 +848,14 @@ pub(crate) async fn probe_key(
         }));
     }
     if !status.is_success() {
+        let _ = persist_credential_probe(
+            &state,
+            id,
+            Some(status.as_u16()),
+            Some("upstream_unavailable"),
+            request_id(&req),
+        )
+        .await;
         return HttpResponse::ServiceUnavailable().json(json!({
             "probe_status": "unavailable",
             "status": status.as_u16(),
@@ -743,18 +872,22 @@ pub(crate) async fn probe_key(
         }
     };
     if validate_chat_response(&bytes, false).is_err() {
+        let _ = persist_credential_probe(
+            &state,
+            id,
+            Some(status.as_u16()),
+            Some("upstream_protocol_error"),
+            request_id(&req),
+        )
+        .await;
         return HttpResponse::BadGateway().json(json!({
             "probe_status": "invalid_response",
             "error": {"code": "upstream_protocol_error"}
         }));
     }
-    match state.vault.mutate(|vault| vault.mark_verified(id)).await {
-        Ok(_) => match record_probe_receipt(&state, id).await {
-            Ok(()) => {
-                HttpResponse::Ok().json(json!({"probe_status":"valid","status":status.as_u16()}))
-            }
-            Err(response) => response,
-        },
+    match persist_credential_probe(&state, id, Some(status.as_u16()), None, request_id(&req)).await
+    {
+        Ok(()) => HttpResponse::Ok().json(json!({"probe_status":"valid","status":status.as_u16()})),
         Err(_) => HttpResponse::ServiceUnavailable().json(
             json!({"probe_status":"unavailable","error":{"code":"probe_persistence_failed"}}),
         ),
@@ -769,16 +902,28 @@ pub(crate) async fn delete_key(
     if !authorized(&req, &state) {
         return admin_unauthorized(&req);
     }
+    let id = path.into_inner();
     match state
         .vault
         // Request attempts retain a foreign key to the encrypted key row.
         // “Delete” is therefore a durable retirement, which preserves audit
         // evidence while removing the encrypted credential from all new
         // routing and admin read surfaces.
-        .mutate(|vault| vault.delete(path.into_inner()))
+        .mutate_with_audit(
+            |vault| vault.delete(id),
+            |_| VaultAuditMutation {
+                action: "upstream.retire",
+                resource_kind: "upstream",
+                resource_id: Some(id),
+                request_id: request_id(&req),
+                detail: json!({"legacy_adapter":true}),
+                client_policy: None,
+                probe_result: None,
+            },
+        )
         .await
     {
-        Ok(()) => HttpResponse::NoContent().finish(),
+        Ok(((), _)) => HttpResponse::NoContent().finish(),
         Err(_) => HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}})),
     }
 }
@@ -820,10 +965,21 @@ pub(crate) async fn add_downstream(
     }
     match state
         .vault
-        .mutate(|vault| vault.issue_downstream(&payload.label, &payload.scopes))
+        .mutate_with_audit(
+            |vault| vault.issue_downstream(&payload.label, &payload.scopes),
+            |issued| VaultAuditMutation {
+                action: "client.create",
+                resource_kind: "client",
+                resource_id: Some(issued.summary.id),
+                request_id: request_id(&req),
+                detail: json!({"legacy_adapter":true}),
+                client_policy: None,
+                probe_result: None,
+            },
+        )
         .await
     {
-        Ok(issued) => {
+        Ok((issued, _)) => {
             let mut value = serde_json::to_value(issued.summary).unwrap_or_else(|_| json!({}));
             if let Value::Object(object) = &mut value {
                 object.insert("token".into(), Value::String(issued.token));
@@ -864,12 +1020,24 @@ pub(crate) async fn revoke_downstream(
     if !authorized(&req, &state) {
         return admin_unauthorized(&req);
     }
+    let id = path.into_inner();
     match state
         .vault
-        .mutate(|vault| vault.revoke_downstream(path.into_inner()))
+        .mutate_with_audit(
+            |vault| vault.revoke_downstream(id),
+            |_| VaultAuditMutation {
+                action: "client.revoke",
+                resource_kind: "client",
+                resource_id: Some(id),
+                request_id: request_id(&req),
+                detail: json!({"legacy_adapter":true}),
+                client_policy: None,
+                probe_result: None,
+            },
+        )
         .await
     {
-        Ok(summary) => HttpResponse::Ok().json(summary),
+        Ok((summary, _)) => HttpResponse::Ok().json(summary),
         Err(_) => HttpResponse::NotFound().json(json!({"error":{"code":"resource_not_found"}})),
     }
 }
@@ -882,9 +1050,21 @@ pub(crate) async fn revoke_downstream_legacy(
     if !authorized(&req, &state) {
         return admin_unauthorized(&req);
     }
+    let id = path.into_inner();
     match state
         .vault
-        .mutate(|vault| vault.revoke_downstream(path.into_inner()))
+        .mutate_with_audit(
+            |vault| vault.revoke_downstream(id),
+            |_| VaultAuditMutation {
+                action: "client.revoke",
+                resource_kind: "client",
+                resource_id: Some(id),
+                request_id: request_id(&req),
+                detail: json!({"legacy_adapter":true}),
+                client_policy: None,
+                probe_result: None,
+            },
+        )
         .await
     {
         Ok(_) => HttpResponse::NoContent().finish(),

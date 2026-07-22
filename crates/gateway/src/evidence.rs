@@ -5,10 +5,72 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use super::{AppState, AttemptTerminal, RequestTerminal, VaultStore, openai_error};
+use super::{
+    AppState, AttemptTerminal, PermitError, RequestTerminal, VaultStore, attempt_started,
+    openai_error, select_initial_key,
+};
 
 const ROLLUP_BATCH_SIZE: i64 = 500;
 const OPERATIONS_MAINTENANCE_LOCK_KEY: i64 = 0x4e42_4c42_4f50_534d;
+const PERMIT_RELEASE_RETRY_INITIAL: Duration = Duration::from_millis(25);
+const PERMIT_RELEASE_RETRY_MAX: Duration = Duration::from_secs(5);
+
+struct PermitReleaseGuard {
+    state: web::Data<AppState>,
+    request_id: Uuid,
+    armed: bool,
+}
+
+impl PermitReleaseGuard {
+    fn new(state: web::Data<AppState>, request_id: Uuid, armed: bool) -> Self {
+        Self {
+            state,
+            request_id,
+            armed,
+        }
+    }
+
+    fn transfer(&mut self) -> bool {
+        let armed = self.armed;
+        self.armed = false;
+        armed
+    }
+}
+
+impl Drop for PermitReleaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            spawn_permit_release_retry(self.state.clone(), self.request_id);
+        }
+    }
+}
+
+fn spawn_permit_release_retry(state: web::Data<AppState>, request_id: Uuid) {
+    tokio::spawn(async move {
+        let mut delay = PERMIT_RELEASE_RETRY_INITIAL;
+        let mut failures = 0_u64;
+        loop {
+            match state.vault.release_downstream_permit(request_id).await {
+                Ok(()) => {
+                    if failures > 0 {
+                        eprintln!(
+                            "request permit release recovered after {failures} failed attempt(s)"
+                        );
+                    }
+                    return;
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    if failures == 1 {
+                        eprintln!("request permit release failed; retrying: {error:#}");
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(PERMIT_RELEASE_RETRY_MAX);
+                }
+            }
+        }
+    });
+}
 
 #[derive(Clone, Copy)]
 struct DropRecovery {
@@ -39,10 +101,87 @@ pub(crate) struct RequestEvidence {
     request_id: Uuid,
     started: Instant,
     terminal: bool,
+    permit_acquired: bool,
     drop_recovery: DropRecovery,
 }
 
 impl RequestEvidence {
+    pub(crate) async fn start_selected(
+        state: web::Data<AppState>,
+        request_id: Uuid,
+        downstream_credential_id: Option<Uuid>,
+        endpoint: &str,
+        profile_id: &str,
+        stream: bool,
+        modality: &str,
+    ) -> Result<(Self, Uuid), HttpResponse> {
+        if state.vault.database.is_none() {
+            let mut evidence = Self::start(
+                state.clone(),
+                request_id,
+                downstream_credential_id,
+                endpoint,
+                profile_id,
+                stream,
+                modality,
+            )
+            .await?;
+            let Some(key_id) = select_initial_key(&state, profile_id).await else {
+                evidence
+                    .fail(StatusCode::SERVICE_UNAVAILABLE, "no_eligible_upstream")
+                    .await?;
+                return Err(openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "No verified NVIDIA upstream is currently available.",
+                    "service_unavailable_error",
+                    "no_eligible_upstream",
+                ));
+            };
+            evidence.arm_evidence_failure(None, 0);
+            attempt_started(&state, request_id, profile_id, key_id).await?;
+            evidence.reset_drop_recovery();
+            return Ok((evidence, key_id));
+        }
+
+        let permit_acquired = state
+            .vault
+            .acquire_downstream_permit(request_id, downstream_credential_id, profile_id)
+            .await
+            .map_err(permit_error_response)?;
+        let mut permit_guard = PermitReleaseGuard::new(state.clone(), request_id, permit_acquired);
+        let selected = state
+            .vault
+            .select_and_start_request(
+                request_id,
+                downstream_credential_id,
+                endpoint,
+                profile_id,
+                stream,
+                modality,
+            )
+            .await;
+        match selected {
+            Ok(Some(key_id)) => Ok((
+                Self {
+                    state,
+                    request_id,
+                    started: Instant::now(),
+                    terminal: false,
+                    permit_acquired: permit_guard.transfer(),
+                    drop_recovery: DropRecovery::default(),
+                },
+                key_id,
+            )),
+            Ok(None) => Err(openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No verified NVIDIA upstream is currently available.",
+                "service_unavailable_error",
+                "no_eligible_upstream",
+            )),
+            Err(_) => Err(evidence_unavailable()),
+        }
+    }
+
     pub(crate) async fn start(
         state: web::Data<AppState>,
         request_id: Uuid,
@@ -52,7 +191,13 @@ impl RequestEvidence {
         stream: bool,
         modality: &str,
     ) -> Result<Self, HttpResponse> {
-        state
+        let permit_acquired = state
+            .vault
+            .acquire_downstream_permit(request_id, downstream_credential_id, profile_id)
+            .await
+            .map_err(permit_error_response)?;
+        let mut permit_guard = PermitReleaseGuard::new(state.clone(), request_id, permit_acquired);
+        if let Err(error) = state
             .vault
             .proxy_request_started(
                 request_id,
@@ -63,12 +208,16 @@ impl RequestEvidence {
                 modality,
             )
             .await
-            .map_err(|_| evidence_unavailable())?;
+        {
+            let _ = error;
+            return Err(evidence_unavailable());
+        }
         Ok(Self {
             state,
             request_id,
             started: Instant::now(),
             terminal: false,
+            permit_acquired: permit_guard.transfer(),
             drop_recovery: DropRecovery::default(),
         })
     }
@@ -116,6 +265,7 @@ impl RequestEvidence {
             .await
             .map_err(|_| evidence_unavailable())?;
         self.terminal = true;
+        self.release_permit_now().await;
         Ok(())
     }
 
@@ -142,6 +292,7 @@ impl RequestEvidence {
             return false;
         }
         self.terminal = true;
+        self.release_permit_now().await;
         true
     }
 
@@ -171,6 +322,7 @@ impl RequestEvidence {
             return false;
         }
         self.terminal = true;
+        self.release_permit_now().await;
         true
     }
 
@@ -188,7 +340,27 @@ impl RequestEvidence {
             .await
             .map_err(|_| evidence_unavailable())?;
         self.terminal = true;
+        self.release_permit_now().await;
         Ok(())
+    }
+
+    async fn release_permit_now(&mut self) {
+        if !self.permit_acquired {
+            return;
+        }
+        match self
+            .state
+            .vault
+            .release_downstream_permit(self.request_id)
+            .await
+        {
+            Ok(()) => self.permit_acquired = false,
+            Err(error) => {
+                eprintln!("request permit release failed; handing off to retry: {error:#}");
+                spawn_permit_release_retry(self.state.clone(), self.request_id);
+                self.permit_acquired = false;
+            }
+        }
     }
 
     fn arm_drop_recovery(
@@ -211,32 +383,178 @@ impl RequestEvidence {
 
 impl Drop for RequestEvidence {
     fn drop(&mut self) {
-        if self.terminal {
+        if self.terminal && !self.permit_acquired {
             return;
         }
         let state = self.state.clone();
         let request_id = self.request_id;
         let recovery = self.drop_recovery;
+        let terminal = self.terminal;
+        let permit_acquired = self.permit_acquired;
         tokio::spawn(async move {
-            if let Err(error) = state
-                .vault
-                .proxy_request_and_open_attempts_finished(
-                    request_id,
-                    recovery.outcome,
-                    recovery.status_code,
-                    recovery.error_class,
-                    recovery.ttfb_ms,
-                    recovery.bytes_out,
-                )
-                .await
+            if !terminal
+                && let Err(error) = state
+                    .vault
+                    .proxy_request_and_open_attempts_finished(
+                        request_id,
+                        recovery.outcome,
+                        recovery.status_code,
+                        recovery.error_class,
+                        recovery.ttfb_ms,
+                        recovery.bytes_out,
+                    )
+                    .await
             {
                 eprintln!("request evidence drop update failed: {error:#}");
+            }
+            if permit_acquired {
+                spawn_permit_release_retry(state, request_id);
             }
         });
     }
 }
 
+fn permit_error_response(error: PermitError) -> HttpResponse {
+    match error {
+        PermitError::Expired => openai_error(
+            StatusCode::UNAUTHORIZED,
+            "The downstream credential is expired or revoked.",
+            "authentication_error",
+            "invalid_downstream_token",
+        ),
+        PermitError::ModelForbidden => openai_error(
+            StatusCode::FORBIDDEN,
+            "The requested model is not allowed for this credential.",
+            "permission_error",
+            "model_not_allowed",
+        ),
+        PermitError::RateLimited(retry_after) => {
+            let mut response = openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "The per-minute request limit has been reached.",
+                "rate_limit_error",
+                "rpm_limit_exceeded",
+            );
+            if let Ok(value) =
+                actix_web::http::header::HeaderValue::from_str(&retry_after.to_string())
+            {
+                response
+                    .headers_mut()
+                    .insert(actix_web::http::header::RETRY_AFTER, value);
+            }
+            response
+        }
+        PermitError::DailyLimit => openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "The daily request limit has been reached.",
+            "rate_limit_error",
+            "daily_limit_exceeded",
+        ),
+        PermitError::ConcurrencyLimit => openai_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "The concurrent request limit has been reached.",
+            "rate_limit_error",
+            "concurrency_limit_exceeded",
+        ),
+        PermitError::StoreUnavailable => evidence_unavailable(),
+    }
+}
+
 impl VaultStore {
+    async fn select_and_start_request(
+        &self,
+        request_id: Uuid,
+        downstream_credential_id: Option<Uuid>,
+        endpoint: &str,
+        profile_id: &str,
+        stream: bool,
+        modality: &str,
+    ) -> Result<Option<Uuid>> {
+        let pool = self
+            .database
+            .as_ref()
+            .context("selection transaction requires PostgreSQL")?;
+        let owner_id = self
+            .owner_id
+            .context("selection transaction owner lease is missing")?;
+        let mut tx = pool.begin().await.context("begin first selection")?;
+        let next_slot = sqlx::query_scalar::<_, i16>(
+            "SELECT next_slot FROM nblb.routing_state WHERE profile_id=$1 FOR UPDATE",
+        )
+        .bind(profile_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("lock routing cursor")?
+        .context("routing profile is missing")?;
+        let candidates = sqlx::query_as::<_, (Uuid, i16)>(
+            "SELECT key.id,key.slot_no FROM nblb.upstream_keys AS key JOIN nblb.profile_probe_receipts AS proof ON proof.key_id=key.id AND proof.profile_id=$1 AND proof.invalidated_at IS NULL WHERE key.retired=false AND key.enabled=true AND key.verified=true AND (key.cooldown_until IS NULL OR key.cooldown_until<=now()) AND proof.verified_at>=now()-make_interval(secs=>(SELECT proof_freshness_seconds FROM nblb.operations_settings WHERE singleton=true)) AND EXISTS(SELECT 1 FROM nblb.gateway_instances WHERE id=$2 AND last_seen_at>=now()-interval '30 seconds') ORDER BY key.slot_no",
+        )
+        .bind(profile_id)
+        .bind(owner_id)
+        .fetch_all(&mut *tx)
+        .await
+        .context("load hard-eligible upstream slots")?;
+        let selected = candidates
+            .iter()
+            .find(|(_, slot)| *slot == next_slot)
+            .or_else(|| candidates.first())
+            .copied();
+
+        let Some((key_id, slot_no)) = selected else {
+            sqlx::query(
+                "INSERT INTO nblb.proxy_requests(request_id,owner_id,downstream_credential_id,endpoint,profile_id,stream,modality,outcome,status_code,error_class,duration_ms,failover_count,finished_at) VALUES($1,$2,$3,$4,$5,$6,$7,'failed',503,'no_eligible_upstream',0,0,now())",
+            )
+            .bind(request_id)
+            .bind(owner_id)
+            .bind(downstream_credential_id)
+            .bind(endpoint)
+            .bind(profile_id)
+            .bind(stream)
+            .bind(modality)
+            .execute(&mut *tx)
+            .await
+            .context("record no-eligible request")?;
+            tx.commit().await.context("commit no-eligible request")?;
+            return Ok(None);
+        };
+
+        let following_slot = if slot_no == 1 { 2_i16 } else { 1_i16 };
+        sqlx::query(
+            "UPDATE nblb.routing_state SET next_slot=$2,generation=generation+1 WHERE profile_id=$1",
+        )
+        .bind(profile_id)
+        .bind(following_slot)
+        .execute(&mut *tx)
+        .await
+        .context("advance routing cursor")?;
+        let parent_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.proxy_requests(request_id,owner_id,downstream_credential_id,endpoint,profile_id,stream,modality) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+        )
+        .bind(request_id)
+        .bind(owner_id)
+        .bind(downstream_credential_id)
+        .bind(endpoint)
+        .bind(profile_id)
+        .bind(stream)
+        .bind(modality)
+        .fetch_one(&mut *tx)
+        .await
+        .context("record selected proxy request")?;
+        sqlx::query(
+            "INSERT INTO nblb.request_attempts(request_id,profile_id,key_id,owner_id,outcome,proxy_request_id,attempt_no) VALUES($1,$2,$3,$4,'started',$5,1)",
+        )
+        .bind(request_id)
+        .bind(profile_id)
+        .bind(key_id)
+        .bind(owner_id)
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await
+        .context("record first selected attempt")?;
+        tx.commit().await.context("commit first selection")?;
+        Ok(Some(key_id))
+    }
+
     async fn proxy_request_started(
         &self,
         request_id: Uuid,
@@ -390,17 +708,50 @@ impl VaultStore {
                 .context("rollback skipped operations retention")?;
             return Ok(0);
         }
+        let (request_days, metric_days) = sqlx::query_as::<_, (i32, i32)>(
+            "SELECT request_retention_days,metric_retention_days FROM nblb.operations_settings WHERE singleton=true",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .context("load operations retention settings")?;
         let mut deleted = 0_u64;
-        for statement in [
-            "DELETE FROM nblb.request_attempts WHERE finished_at IS NOT NULL AND created_at < now() - interval '30 days'",
-            "DELETE FROM nblb.proxy_requests WHERE finished_at IS NOT NULL AND started_at < now() - interval '30 days' AND (rolled_up_at IS NOT NULL OR finished_at < now() - interval '90 days')",
-            "DELETE FROM nblb.metric_buckets_minute WHERE bucket_start < now() - interval '90 days'",
-            "DELETE FROM nblb.probe_runs WHERE finished_at IS NOT NULL AND created_at < now() - interval '90 days'",
-            "DELETE FROM nblb.audit_events WHERE created_at < now() - interval '180 days'",
-            "DELETE FROM nblb.qa_runs WHERE finished_at IS NOT NULL AND created_at < now() - interval '180 days'",
+        for (statement, days) in [
+            (
+                "DELETE FROM nblb.downstream_request_permits WHERE released_at IS NOT NULL AND acquired_at < now() - make_interval(days=>$1)",
+                request_days,
+            ),
+            (
+                "DELETE FROM nblb.request_attempts WHERE finished_at IS NOT NULL AND created_at < now() - make_interval(days=>$1)",
+                request_days,
+            ),
+            (
+                "DELETE FROM nblb.proxy_requests WHERE finished_at IS NOT NULL AND started_at < now() - make_interval(days=>$1) AND rolled_up_at IS NOT NULL",
+                request_days,
+            ),
+            (
+                "DELETE FROM nblb.metric_buckets_minute WHERE bucket_start < now() - make_interval(days=>$1)",
+                metric_days,
+            ),
+            (
+                "DELETE FROM nblb.capacity_buckets_minute WHERE bucket_start < now() - make_interval(days=>$1)",
+                metric_days,
+            ),
+            (
+                "DELETE FROM nblb.probe_runs WHERE finished_at IS NOT NULL AND created_at < now() - make_interval(days=>$1)",
+                metric_days,
+            ),
+            (
+                "DELETE FROM nblb.audit_events WHERE created_at < now() - make_interval(days=>$1)",
+                metric_days,
+            ),
+            (
+                "DELETE FROM nblb.qa_runs WHERE finished_at IS NOT NULL AND created_at < now() - make_interval(days=>$1)",
+                metric_days,
+            ),
         ] {
             deleted = deleted.saturating_add(
                 sqlx::query(statement)
+                    .bind(days)
                     .execute(&mut *tx)
                     .await
                     .context("apply operations retention statement")?
@@ -425,6 +776,19 @@ impl VaultStore {
     }
 }
 
+async fn sample_public_capacity(pool: &sqlx::PgPool) -> Result<u8> {
+    let ids = crate::operations::repository::eligible_key_ids(pool, "z-ai/glm-5.2").await?;
+    let eligible = u8::try_from(ids.len().min(2)).unwrap_or_default();
+    sqlx::query(
+        "INSERT INTO nblb.capacity_buckets_minute(bucket_start,eligible_provider_count) VALUES(date_trunc('minute',now()),$1) ON CONFLICT(bucket_start) DO UPDATE SET eligible_provider_count=EXCLUDED.eligible_provider_count",
+    )
+    .bind(i16::from(eligible))
+    .execute(pool)
+    .await
+    .context("persist public hard-eligible capacity sample")?;
+    Ok(eligible)
+}
+
 pub(crate) fn spawn_operations_workers(state: web::Data<AppState>) {
     if state.vault.database.is_none() {
         return;
@@ -437,6 +801,11 @@ pub(crate) fn spawn_operations_workers(state: web::Data<AppState>) {
             interval.tick().await;
             if let Err(error) = rollup_state.vault.rollup_request_metrics().await {
                 eprintln!("request metric rollup failed: {error:#}");
+            }
+            if let Some(pool) = &rollup_state.vault.database
+                && let Err(error) = sample_public_capacity(pool).await
+            {
+                eprintln!("capacity metric sample failed: {error:#}");
             }
         }
     });
@@ -483,18 +852,21 @@ fn evidence_unavailable() -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, AttemptTerminal, RequestEvidence, RequestTerminal, VaultStore, modality_for_path,
+        AppState, AttemptTerminal, PermitError, RequestEvidence, RequestTerminal, VaultStore,
+        modality_for_path, sample_public_capacity,
     };
     use crate::proxy::start_evidenced_attempt;
     use crate::streaming::{
         StreamAttemptGuard, StreamTerminalResult, UpstreamByteStream, chat_response_stream,
         prime_stream,
     };
+    use crate::try_acquire_vault_owner_lock;
     use actix_web::web;
     use bytes::Bytes;
     use futures_util::{StreamExt, stream};
     use nvidia_build_lb_core::Vault;
     use serde_json::json;
+    use sqlx::postgres::PgPoolOptions;
     use std::sync::Mutex;
     use uuid::Uuid;
 
@@ -507,6 +879,7 @@ mod tests {
             database: Some(pool),
             sync_lock: tokio::sync::Mutex::new(()),
             owner_id: None,
+            _owner_guard: None,
         }
     }
 
@@ -662,14 +1035,14 @@ mod tests {
         let key_id = Uuid::new_v4();
         let client_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO nblb.upstream_keys(id,label,fingerprint,ciphertext,nonce,enabled,verified) VALUES ($1,'test-key',decode(repeat('11',32),'hex'),decode(repeat('22',24),'hex'),decode(repeat('33',12),'hex'),true,true)",
+            "INSERT INTO nblb.upstream_keys(id,label,fingerprint,ciphertext,nonce,enabled,verified,slot_no) VALUES ($1,'test-key',decode(repeat('11',32),'hex'),decode(repeat('22',24),'hex'),decode(repeat('33',12),'hex'),true,true,1)",
         )
         .bind(key_id)
         .execute(&pool)
         .await
         .expect("seed upstream");
         sqlx::query(
-            "INSERT INTO nblb.downstream_credentials(id,label,digest,scopes) VALUES ($1,'test-client',decode(repeat('44',32),'hex'),ARRAY['chat:write'])",
+            "INSERT INTO nblb.downstream_credentials(id,label,digest,key_prefix,scopes) VALUES ($1,'test-client',decode(repeat('44',32),'hex'),'nblb_test_client',ARRAY['chat:write'])",
         )
         .bind(client_id)
         .execute(&pool)
@@ -767,20 +1140,78 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations/sqlx")]
+    async fn public_capacity_sample_requires_fresh_profile_proof(pool: sqlx::PgPool) {
+        let key_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nblb.upstream_keys(id,label,fingerprint,ciphertext,nonce,enabled,verified,slot_no) VALUES ($1,'capacity-proof-key',decode(repeat('71',32),'hex'),decode(repeat('72',24),'hex'),decode(repeat('73',12),'hex'),true,true,1)",
+        )
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .expect("seed verified capacity key");
+
+        assert_eq!(
+            sample_public_capacity(&pool)
+                .await
+                .expect("sample without proof"),
+            0
+        );
+        sqlx::query(
+            "INSERT INTO nblb.profile_probe_receipts(profile_id,key_id,verified_at) VALUES('z-ai/glm-5.2',$1,now()-interval '8 days')",
+        )
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .expect("seed stale profile proof");
+        assert_eq!(
+            sample_public_capacity(&pool)
+                .await
+                .expect("sample stale proof"),
+            0
+        );
+
+        sqlx::query(
+            "UPDATE nblb.profile_probe_receipts SET verified_at=now() WHERE profile_id='z-ai/glm-5.2' AND key_id=$1",
+        )
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .expect("refresh profile proof");
+        assert_eq!(
+            sample_public_capacity(&pool)
+                .await
+                .expect("sample fresh proof"),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i16>(
+                "SELECT eligible_provider_count FROM nblb.capacity_buckets_minute ORDER BY bucket_start DESC LIMIT 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("load persisted capacity sample"),
+            1,
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations/sqlx")]
     async fn pr2_restart_and_retention_preserve_terminal_contract(pool: sqlx::PgPool) {
         let dir = tempfile::tempdir().expect("test directory");
         let path = dir.path().join("vault.json");
         let key_id = {
             let mut vault = Vault::open(&path, [31; 32]).expect("open seed vault");
             let key = vault
-                .add("restart-key", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+                .add(
+                    "restart-key",
+                    concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"),
+                )
                 .expect("add encrypted key");
             let record = vault
                 .key_records()
                 .expect("read encrypted record")
                 .remove(0);
             sqlx::query(
-                "INSERT INTO nblb.upstream_keys(id,label,fingerprint,ciphertext,nonce,enabled,verified,retired,request_count,failure_count) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                "INSERT INTO nblb.upstream_keys(id,label,fingerprint,ciphertext,nonce,enabled,verified,retired,request_count,failure_count,slot_no) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1)",
             )
             .bind(record.id)
             .bind(record.label)
@@ -891,7 +1322,7 @@ mod tests {
         let key_id = Uuid::new_v4();
         let owner_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO nblb.upstream_keys(id,label,fingerprint,ciphertext,nonce,enabled,verified) VALUES ($1,'atomic-key',decode(repeat('51',32),'hex'),decode(repeat('52',24),'hex'),decode(repeat('53',12),'hex'),true,true)",
+            "INSERT INTO nblb.upstream_keys(id,label,fingerprint,ciphertext,nonce,enabled,verified,slot_no) VALUES ($1,'atomic-key',decode(repeat('51',32),'hex'),decode(repeat('52',24),'hex'),decode(repeat('53',12),'hex'),true,true,1)",
         )
         .bind(key_id)
         .execute(&pool)
@@ -933,6 +1364,7 @@ mod tests {
             database: Some(pool.clone()),
             sync_lock: tokio::sync::Mutex::new(()),
             owner_id: Some(owner_id),
+            _owner_guard: None,
         };
 
         for target in ["request_attempts", "proxy_requests"] {
@@ -1296,7 +1728,12 @@ mod tests {
 
         let stream_key = state
             .vault
-            .mutate(|vault| vault.add("stream-key", "nvapi-0123456789abcdefghijklmnopqrstuvwxyz"))
+            .mutate(|vault| {
+                vault.add(
+                    "stream-key",
+                    concat!("nvapi", "-0123456789abcdefghijklmnopqrstuvwxyz"),
+                )
+            })
             .await
             .expect("seed stream key in vault and database");
         sqlx::query("ALTER SEQUENCE nblb.test_terminal_once RESTART WITH 1")
@@ -1411,5 +1848,317 @@ mod tests {
             (Some(30), Some(32)),
             "Drop retry must preserve the captured TTFB and byte count",
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations/sqlx")]
+    async fn client_limits_are_atomic_under_concurrent_requests(pool: sqlx::PgPool) {
+        let owner_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO nblb.gateway_instances(id) VALUES ($1)")
+            .bind(owner_id)
+            .execute(&pool)
+            .await
+            .expect("seed permit owner");
+        let dir = tempfile::tempdir().expect("test directory");
+        let store = VaultStore {
+            vault: Mutex::new(
+                Vault::open(dir.path().join("vault.json"), [31; 32]).expect("open permit vault"),
+            ),
+            database: Some(pool.clone()),
+            sync_lock: tokio::sync::Mutex::new(()),
+            owner_id: Some(owner_id),
+            _owner_guard: None,
+        };
+
+        for (index, (column, rejected)) in [
+            ("rpm_limit", "rpm"),
+            ("max_concurrency", "concurrency"),
+            ("request_limit_day", "daily"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let client_id = Uuid::new_v4();
+            let query = format!(
+                "INSERT INTO nblb.downstream_credentials(id,label,digest,key_prefix,scopes,{column}) VALUES ($1,$2,$3,$4,ARRAY['chat:write'],1)"
+            );
+            sqlx::query(&query)
+                .bind(client_id)
+                .bind(format!("{rejected}-client"))
+                .bind(vec![u8::try_from(index + 1).expect("small test index"); 32])
+                .bind(format!("nblb_test_{index}"))
+                .execute(&pool)
+                .await
+                .expect("seed limited downstream client");
+            let first_id = Uuid::new_v4();
+            let second_id = Uuid::new_v4();
+            let (first, second) = tokio::join!(
+                store.acquire_downstream_permit(first_id, Some(client_id), "z-ai/glm-5.2"),
+                store.acquire_downstream_permit(second_id, Some(client_id), "z-ai/glm-5.2")
+            );
+            let successes = [&first, &second]
+                .into_iter()
+                .filter(|result| matches!(result, Ok(true)))
+                .count();
+            assert_eq!(successes, 1, "{column} must admit exactly one request");
+            let rejected_as_expected = [&first, &second].into_iter().any(|result| {
+                matches!(
+                    (rejected, result),
+                    ("rpm", Err(PermitError::RateLimited(_)))
+                        | ("concurrency", Err(PermitError::ConcurrencyLimit))
+                        | ("daily", Err(PermitError::DailyLimit))
+                )
+            });
+            assert!(rejected_as_expected, "{column} rejected the wrong way");
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations/sqlx")]
+    async fn permit_release_retries_until_live_owner_database_recovers(pool: sqlx::PgPool) {
+        let owner_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO nblb.gateway_instances(id) VALUES ($1)")
+            .bind(owner_id)
+            .execute(&pool)
+            .await
+            .expect("seed active permit owner");
+        let client_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nblb.downstream_credentials(id,label,digest,key_prefix,scopes,max_concurrency) VALUES ($1,'permit-retry-client',$2,'nblb_permit_retry',ARRAY['chat:write'],1)",
+        )
+        .bind(client_id)
+        .bind(vec![8_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed concurrency-limited client");
+        sqlx::query("CREATE TABLE nblb.test_permit_release_failure(enabled boolean NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create permit release failpoint state");
+        sqlx::query("INSERT INTO nblb.test_permit_release_failure VALUES(true)")
+            .execute(&pool)
+            .await
+            .expect("enable permit release failure");
+        sqlx::query(
+            "CREATE FUNCTION nblb.test_permit_release_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF (SELECT enabled FROM nblb.test_permit_release_failure LIMIT 1) AND NEW.released_at IS NOT NULL THEN RAISE EXCEPTION 'forced permit release failure'; END IF; RETURN NEW; END $$",
+        )
+        .execute(&pool)
+        .await
+        .expect("create permit release failpoint function");
+        sqlx::query(
+            "CREATE TRIGGER test_permit_release_failure BEFORE UPDATE ON nblb.downstream_request_permits FOR EACH ROW EXECUTE FUNCTION nblb.test_permit_release_failure()",
+        )
+        .execute(&pool)
+        .await
+        .expect("create permit release failpoint trigger");
+
+        let directory = tempfile::tempdir().expect("permit retry test directory");
+        let state = web::Data::new(AppState {
+            vault: VaultStore {
+                vault: Mutex::new(
+                    Vault::open(directory.path().join("vault.json"), [31; 32])
+                        .expect("open permit retry vault"),
+                ),
+                database: Some(pool.clone()),
+                sync_lock: tokio::sync::Mutex::new(()),
+                owner_id: Some(owner_id),
+                _owner_guard: None,
+            },
+            router: Mutex::new(Default::default()),
+            selection_lock: tokio::sync::Mutex::new(()),
+            client: reqwest::Client::new(),
+            admin_token: "test-admin".into(),
+            upstream_url: "mock://provider".into(),
+            require_downstream_token: true,
+            public_port: 2456,
+            csp_hashes: Vec::new(),
+        });
+        let request_id = Uuid::new_v4();
+        let mut evidence = RequestEvidence::start(
+            state.clone(),
+            request_id,
+            Some(client_id),
+            "/v1/chat/completions",
+            "z-ai/glm-5.2",
+            false,
+            "text",
+        )
+        .await
+        .unwrap_or_else(|_| panic!("acquire request evidence and permit"));
+        evidence
+            .fail(
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "fixture_failure",
+            )
+            .await
+            .unwrap_or_else(|_| panic!("terminal request must hand permit to retry worker"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.downstream_request_permits WHERE request_id=$1 AND released_at IS NULL",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count permit while database failure persists"),
+            1,
+        );
+
+        sqlx::query("UPDATE nblb.test_permit_release_failure SET enabled=false")
+            .execute(&pool)
+            .await
+            .expect("recover permit release database path");
+        for _ in 0..100 {
+            let active = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.downstream_request_permits WHERE request_id=$1 AND released_at IS NULL",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("poll permit release recovery");
+            if active == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.downstream_request_permits WHERE request_id=$1 AND released_at IS NULL",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .expect("verify eventual permit release"),
+            0,
+        );
+        assert!(matches!(
+            state
+                .vault
+                .acquire_downstream_permit(Uuid::new_v4(), Some(client_id), "z-ai/glm-5.2",)
+                .await,
+            Ok(true)
+        ));
+    }
+
+    #[sqlx::test(migrations = "../../migrations/sqlx")]
+    async fn daily_limit_survives_gateway_owner_pruning(pool: sqlx::PgPool) {
+        let expired_owner = Uuid::new_v4();
+        let current_owner = Uuid::new_v4();
+        for owner in [expired_owner, current_owner] {
+            sqlx::query("INSERT INTO nblb.gateway_instances(id) VALUES ($1)")
+                .bind(owner)
+                .execute(&pool)
+                .await
+                .expect("seed permit owner");
+        }
+        let client_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nblb.downstream_credentials(id,label,digest,key_prefix,scopes,request_limit_day) VALUES ($1,'restart-daily-client',$2,'nblb_restart_daily',ARRAY['chat:write'],1)",
+        )
+        .bind(client_id)
+        .bind(vec![7_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed daily-limited client");
+        sqlx::query(
+            "INSERT INTO nblb.downstream_request_permits(request_id,downstream_credential_id,owner_id,profile_id,released_at) VALUES ($1,$2,$3,'z-ai/glm-5.2',now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(client_id)
+        .bind(expired_owner)
+        .execute(&pool)
+        .await
+        .expect("seed completed request permit");
+        sqlx::query("DELETE FROM nblb.gateway_instances WHERE id=$1")
+            .bind(expired_owner)
+            .execute(&pool)
+            .await
+            .expect("prune expired owner");
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT count(*),count(owner_id) FROM nblb.downstream_request_permits WHERE downstream_credential_id=$1",
+            )
+            .bind(client_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load durable permit"),
+            (1, 0),
+            "completed usage must survive while its expired owner is detached",
+        );
+
+        let dir = tempfile::tempdir().expect("test directory");
+        let store = VaultStore {
+            vault: Mutex::new(
+                Vault::open(dir.path().join("vault.json"), [31; 32])
+                    .expect("open restart permit vault"),
+            ),
+            database: Some(pool),
+            sync_lock: tokio::sync::Mutex::new(()),
+            owner_id: Some(current_owner),
+            _owner_guard: None,
+        };
+        assert!(matches!(
+            store
+                .acquire_downstream_permit(Uuid::new_v4(), Some(client_id), "z-ai/glm-5.2",)
+                .await,
+            Err(PermitError::DailyLimit)
+        ));
+    }
+
+    #[sqlx::test(migrations = "../../migrations/sqlx")]
+    async fn encrypted_vault_allows_only_one_gateway_owner(pool: sqlx::PgPool) {
+        let first_dir = tempfile::tempdir().expect("first test directory");
+        let second_dir = tempfile::tempdir().expect("second test directory");
+        let base_options = pool.connect_options();
+        let independent_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(base_options.as_ref().clone().database("postgres"))
+            .await
+            .expect("connect independent database");
+        let mut current_connection = pool
+            .acquire()
+            .await
+            .expect("acquire current database lock connection")
+            .detach();
+        let mut independent_connection = independent_pool
+            .acquire()
+            .await
+            .expect("acquire independent database lock connection")
+            .detach();
+        assert!(
+            try_acquire_vault_owner_lock(&mut current_connection)
+                .await
+                .expect("lock current database"),
+        );
+        assert!(
+            try_acquire_vault_owner_lock(&mut independent_connection)
+                .await
+                .expect("lock independent database"),
+            "separate databases in one PostgreSQL cluster must not share vault ownership",
+        );
+        drop(current_connection);
+        drop(independent_connection);
+        independent_pool.close().await;
+
+        let first = VaultStore::open(
+            first_dir.path().join("vault.json"),
+            [41; 32],
+            Some(pool.clone()),
+        )
+        .await
+        .expect("first gateway owns vault");
+        let second = VaultStore::open(
+            second_dir.path().join("vault.json"),
+            [41; 32],
+            Some(pool.clone()),
+        )
+        .await;
+        assert!(
+            second
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("another gateway process")),
+            "a second process must fail closed instead of serving stale state"
+        );
+        drop(first);
+        VaultStore::open(second_dir.path().join("vault.json"), [41; 32], Some(pool))
+            .await
+            .expect("vault lock is released with the owning connection");
     }
 }

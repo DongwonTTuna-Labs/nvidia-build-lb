@@ -67,18 +67,31 @@ pub(crate) fn prepare_modality_request(path: &str, request: &Value) -> Result<Va
                 .get("size")
                 .and_then(Value::as_str)
                 .unwrap_or("1024x1024");
-            let aspect_ratio = match size {
-                "1024x1024" => "1:1",
-                "1792x1024" | "1536x864" => "16:9",
-                "1024x1792" | "864x1536" => "9:16",
-                _ => return Err(invalid_request("size is not supported by FLUX")),
+            let image = object
+                .get("image")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let aspect_ratio = if image.is_empty() {
+                match size {
+                    "1024x1024" => "1:1",
+                    "1792x1024" | "1536x864" => "16:9",
+                    "1024x1792" | "864x1536" => "9:16",
+                    _ => return Err(invalid_request("size is not supported by FLUX")),
+                }
+            } else {
+                "match_input_image"
             };
             if object.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
                 return Err(invalid_request("FLUX supports exactly one image"));
             }
-            Ok(
-                json!({"prompt": prompt, "image": Value::Null, "aspect_ratio": aspect_ratio, "samples": 1}),
-            )
+            Ok(json!({
+                "prompt": prompt,
+                "image": image,
+                "aspect_ratio": aspect_ratio,
+                "steps": object.get("steps").and_then(Value::as_u64).unwrap_or(30),
+                "cfg_scale": object.get("cfg_scale").and_then(Value::as_f64).unwrap_or(3.5),
+                "seed": object.get("seed").and_then(Value::as_u64).unwrap_or(0)
+            }))
         }
         "/v1/videos/generations" => {
             let input = object
@@ -112,34 +125,11 @@ pub(crate) fn prepare_modality_request(path: &str, request: &Value) -> Result<Va
             Ok(Value::Object(result))
         }
         "/v1/nvidia/inference" => {
-            let input = object
-                .get("input")
-                .and_then(Value::as_object)
-                .ok_or_else(|| invalid_request("input must be an object"))?;
-            let image = input
-                .get("image")
-                .and_then(Value::as_str)
-                .ok_or_else(|| invalid_request("input.image is required"))?;
-            let mut result = serde_json::Map::new();
-            result.insert("image".to_owned(), Value::String(image.to_owned()));
-            result.insert(
-                "seed".to_owned(),
-                input.get("seed").cloned().unwrap_or_else(|| json!(0)),
-            );
-            result.insert(
-                "cfg_scale".to_owned(),
-                input
-                    .get("cfg_scale")
-                    .cloned()
-                    .unwrap_or_else(|| json!(1.8)),
-            );
-            result.insert(
-                "motion_bucket_id".to_owned(),
-                input
-                    .get("motion_bucket_id")
-                    .cloned()
-                    .unwrap_or_else(|| json!(127)),
-            );
+            // The hosted VILA endpoint is an endpoint-specific OpenAI chat
+            // contract. The public alias carries `model` for routing, while
+            // the provider endpoint already identifies the model.
+            let mut result = object.clone();
+            result.remove("model");
             Ok(Value::Object(result))
         }
         _ => Ok(request.clone()),

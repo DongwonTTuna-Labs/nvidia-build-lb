@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
-    fs,
+    error::Error,
+    fmt, fs,
     fs::OpenOptions,
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 /// The hosted deployment intentionally has two independent upstream slots.
 pub const MAX_UPSTREAM_KEYS: usize = 2;
@@ -57,7 +59,7 @@ pub struct KeySummary {
 
 /// A downstream bearer summary. The plaintext token is never stored or
 /// returned by read operations.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DownstreamSummary {
     /// Stable credential identifier.
     pub id: Uuid,
@@ -76,6 +78,35 @@ pub struct DownstreamSummary {
     /// Revocation timestamp, if revoked.
     pub revoked_at: Option<DateTime<Utc>>,
 }
+
+/// Non-secret identity used to order authentication checks without recording usage.
+#[derive(Clone, Debug)]
+pub struct DownstreamIdentity {
+    /// Stable credential identifier.
+    pub id: Uuid,
+    /// Whether the encrypted vault currently considers the credential active.
+    pub active: bool,
+}
+
+/// Deterministic credential failures that callers can map without string matching.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownstreamAuthError {
+    /// The bearer format or digest is not known.
+    InvalidCredential,
+    /// The identified credential lacks the required scope.
+    InsufficientScope,
+}
+
+impl fmt::Display for DownstreamAuthError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidCredential => "invalid downstream credential",
+            Self::InsufficientScope => "insufficient scope",
+        })
+    }
+}
+
+impl Error for DownstreamAuthError {}
 
 /// One-time issuance result. The token field must be discarded by callers
 /// after presenting it to the operator.
@@ -563,30 +594,127 @@ impl Vault {
         Ok(summary)
     }
 
-    /// Authenticates a downstream bearer and checks one required scope.
+    /// Replaces the bearer digest and returns the new plaintext exactly once.
+    pub fn rotate_downstream(&mut self, id: Uuid) -> Result<IssuedDownstream> {
+        let mut bytes = [0_u8; 32];
+        rng().fill(&mut bytes);
+        let token = format!("nblb_ds_{}", hex::encode(bytes));
+        let summary = {
+            let item = self
+                .state
+                .downstream
+                .iter_mut()
+                .find(|item| item.id == id)
+                .ok_or_else(|| anyhow!("downstream credential not found"))?;
+            item.token_digest = fingerprint(token.as_bytes());
+            item.active = true;
+            item.revoked_at = None;
+            downstream_summary(item)
+        };
+        self.persist()?;
+        Ok(IssuedDownstream { summary, token })
+    }
+
+    /// Replaces authorization scopes while preserving the credential identity.
+    pub fn update_downstream_scopes(
+        &mut self,
+        id: Uuid,
+        requested_scopes: &[String],
+    ) -> Result<DownstreamSummary> {
+        let scopes = canonical_scopes(requested_scopes)?;
+        let summary = {
+            let item = self
+                .state
+                .downstream
+                .iter_mut()
+                .find(|item| item.id == id && item.active)
+                .ok_or_else(|| anyhow!("downstream credential not found"))?;
+            item.scopes = scopes;
+            downstream_summary(item)
+        };
+        self.persist()?;
+        Ok(summary)
+    }
+
+    /// Resolves a bearer to a non-secret identity without changing vault state.
+    pub fn identify_downstream(
+        &self,
+        token: &str,
+    ) -> std::result::Result<DownstreamIdentity, DownstreamAuthError> {
+        let digest = fingerprint(token.as_bytes());
+        let mut selected_id = [0_u8; 16];
+        let mut selected_active = 0_u8;
+        let mut found = Choice::from(0);
+        for item in &self.state.downstream {
+            let matches = item.token_digest.as_bytes().ct_eq(digest.as_bytes());
+            for (selected, candidate) in selected_id.iter_mut().zip(item.id.as_bytes()) {
+                *selected = u8::conditional_select(selected, candidate, matches);
+            }
+            selected_active =
+                u8::conditional_select(&selected_active, &u8::from(item.active), matches);
+            found |= matches;
+        }
+        if token.is_empty() || !token.starts_with("nblb_ds_") || found.unwrap_u8() != 1 {
+            return Err(DownstreamAuthError::InvalidCredential);
+        }
+        Ok(DownstreamIdentity {
+            id: Uuid::from_bytes(selected_id),
+            active: selected_active == 1,
+        })
+    }
+
+    /// Checks authorization scope without recording credential usage.
+    pub fn require_downstream_scope(
+        &self,
+        id: Uuid,
+        required_scope: &str,
+    ) -> std::result::Result<(), DownstreamAuthError> {
+        let item = self
+            .state
+            .downstream
+            .iter()
+            .find(|item| item.id == id)
+            .ok_or(DownstreamAuthError::InvalidCredential)?;
+        if !item.scopes.iter().any(|scope| scope == required_scope) {
+            return Err(DownstreamAuthError::InsufficientScope);
+        }
+        Ok(())
+    }
+
+    /// Records one accepted authentication after policy and scope validation.
+    pub fn record_downstream_use(
+        &mut self,
+        id: Uuid,
+        used_at: DateTime<Utc>,
+    ) -> Result<DownstreamSummary> {
+        let item = self
+            .state
+            .downstream
+            .iter_mut()
+            .find(|item| item.id == id && item.active)
+            .ok_or_else(|| anyhow!("invalid downstream credential"))?;
+        item.request_count = item.request_count.saturating_add(1);
+        item.last_used_at = Some(used_at);
+        let result = downstream_summary(item);
+        self.persist()?;
+        Ok(result)
+    }
+
+    /// Backward-compatible composite for vault-only callers.
     pub fn authenticate_downstream(
         &mut self,
         token: &str,
         required_scope: &str,
     ) -> Result<DownstreamSummary> {
-        if token.is_empty() || !token.starts_with("nblb_ds_") {
-            bail!("invalid downstream credential")
+        let identity = self
+            .identify_downstream(token)
+            .map_err(anyhow::Error::new)?;
+        if !identity.active {
+            return Err(anyhow!(DownstreamAuthError::InvalidCredential));
         }
-        let digest = fingerprint(token.as_bytes());
-        let item = self
-            .state
-            .downstream
-            .iter_mut()
-            .find(|item| item.active && item.token_digest == digest)
-            .ok_or_else(|| anyhow!("invalid downstream credential"))?;
-        if !item.scopes.iter().any(|scope| scope == required_scope) {
-            bail!("insufficient scope")
-        }
-        item.request_count = item.request_count.saturating_add(1);
-        item.last_used_at = Some(Utc::now());
-        let result = downstream_summary(item);
-        self.persist()?;
-        Ok(result)
+        self.require_downstream_scope(identity.id, required_scope)
+            .map_err(anyhow::Error::new)?;
+        self.record_downstream_use(identity.id, Utc::now())
     }
 
     /// Enables or disables a key.
@@ -904,7 +1032,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault.json");
         let mut vault = Vault::open(&path, [7; 32]).expect("open");
-        let credential = "nvapi-abcdefghijklmnopqrstuvwxyz123456";
+        let credential = concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456");
         let key = vault.add("one", credential).expect("add");
         assert!(!String::from_utf8_lossy(&fs::read(path).expect("read")).contains(credential));
         assert_eq!(vault.credential(key.id).expect("decrypt"), credential);
@@ -1011,7 +1139,7 @@ mod tests {
     fn failure_cooldown_and_profile_cursor_survive_restart() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault.json");
-        let credential = "nvapi-abcdefghijklmnopqrstuvwxyz123456";
+        let credential = concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456");
         let mut vault = Vault::open(&path, [11; 32]).expect("open");
         let key = vault.add("one", credential).expect("add");
         vault
@@ -1032,7 +1160,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut vault = Vault::open(dir.path().join("vault.json"), [13; 32]).expect("open");
         let key = vault
-            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .add("one", concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"))
             .expect("add");
         vault.mark_verified(key.id).expect("probe");
         vault.set_enabled(key.id, true).expect("enable");
@@ -1056,7 +1184,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut vault = Vault::open(dir.path().join("vault.json"), [15; 32]).expect("open");
         let key = vault
-            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .add("one", concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"))
             .expect("add");
         vault.mark_verified(key.id).expect("probe");
         vault.set_enabled(key.id, true).expect("enable");
@@ -1075,7 +1203,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut vault = Vault::open(dir.path().join("vault.json"), [14; 32]).expect("open");
         let key = vault
-            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .add("one", concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"))
             .expect("add");
         vault.mark_verified(key.id).expect("probe");
         vault
@@ -1092,7 +1220,10 @@ mod tests {
         let path = dir.path().join("vault.json");
         let mut vault = Vault::open(&path, [12; 32]).expect("open");
         let key = vault
-            .add("invalid", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .add(
+                "invalid",
+                concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"),
+            )
             .expect("add");
         let summary = vault.quarantine(key.id).expect("quarantine");
         assert!(!summary.enabled);
@@ -1128,10 +1259,47 @@ mod tests {
     }
 
     #[test]
+    fn downstream_identity_and_scope_checks_do_not_record_usage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.json");
+        let mut vault = Vault::open(&path, [23; 32]).expect("open");
+        let issued = vault
+            .issue_downstream("read-only", &["models:read".into()])
+            .expect("issue");
+        let before_bytes = fs::read(&path).expect("read vault before authentication");
+        let identity = vault
+            .identify_downstream(&issued.token)
+            .expect("identify bearer without mutation");
+        assert!(identity.active);
+        assert_eq!(identity.id, issued.summary.id);
+        assert_eq!(
+            vault.require_downstream_scope(identity.id, "chat:write"),
+            Err(DownstreamAuthError::InsufficientScope)
+        );
+        assert_eq!(vault.list_downstream()[0].request_count, 0);
+        assert_eq!(vault.list_downstream()[0].last_used_at, None);
+        assert_eq!(
+            fs::read(&path).expect("read vault after read-only checks"),
+            before_bytes
+        );
+
+        let used_at = Utc::now();
+        let summary = vault
+            .record_downstream_use(identity.id, used_at)
+            .expect("record accepted authentication");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.last_used_at, Some(used_at));
+        assert_ne!(
+            fs::read(&path).expect("read vault after usage"),
+            before_bytes
+        );
+    }
+
+    #[test]
     fn encrypted_records_reconstruct_without_plaintext() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault.json");
-        let credential = "nvapi-abcdefghijklmnopqrstuvwxyz123456";
+        let credential = concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456");
         let mut source = Vault::open(&path, [9; 32]).expect("open");
         let summary = source.add("primary", credential).expect("add");
         let records = source.key_records().expect("records");
@@ -1161,28 +1329,34 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut vault = Vault::open(dir.path().join("vault.json"), [5; 32]).expect("open");
         let one = vault
-            .add("one", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .add("one", concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"))
             .expect("first");
         vault.mark_verified(one.id).expect("probe first");
         vault.set_enabled(one.id, true).expect("enable first");
         assert!(
             vault
-                .add("one", "nvapi-zyxwvutsrqponmlkjihgfedcba654321")
+                .add("one", concat!("nvapi", "-zyxwvutsrqponmlkjihgfedcba654321"))
                 .is_err()
         );
         assert!(
             vault
-                .add("duplicate", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+                .add(
+                    "duplicate",
+                    concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456")
+                )
                 .is_err()
         );
         let two = vault
-            .add("two", "nvapi-zyxwvutsrqponmlkjihgfedcba654321")
+            .add("two", concat!("nvapi", "-zyxwvutsrqponmlkjihgfedcba654321"))
             .expect("second");
         vault.mark_verified(two.id).expect("probe second");
         vault.set_enabled(two.id, true).expect("enable second");
         assert!(
             vault
-                .add("three", "nvapi-0123456789abcdefghijklmnopqrstuvwxyz")
+                .add(
+                    "three",
+                    concat!("nvapi", "-0123456789abcdefghijklmnopqrstuvwxyz")
+                )
                 .is_err()
         );
     }
@@ -1192,19 +1366,28 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut vault = Vault::open(dir.path().join("vault.json"), [6; 32]).expect("open");
         let first = vault
-            .add("first", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .add(
+                "first",
+                concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"),
+            )
             .expect("first");
         assert!(vault.set_enabled(first.id, true).is_err());
         vault.mark_verified(first.id).expect("probe");
         vault.set_enabled(first.id, true).expect("enable");
         let second = vault
-            .add("second", "nvapi-zyxwvutsrqponmlkjihgfedcba654321")
+            .add(
+                "second",
+                concat!("nvapi", "-zyxwvutsrqponmlkjihgfedcba654321"),
+            )
             .expect("second");
         vault.mark_verified(second.id).expect("probe second");
         vault.set_enabled(second.id, true).expect("enable second");
         vault.quarantine(first.id).expect("quarantine");
         let replacement = vault
-            .add("replacement", "nvapi-0123456789abcdefghijklmnopqrstuvwxyz")
+            .add(
+                "replacement",
+                concat!("nvapi", "-0123456789abcdefghijklmnopqrstuvwxyz"),
+            )
             .expect("replace disabled slot");
         assert_ne!(replacement.id, first.id);
         assert!(!replacement.enabled);
@@ -1219,11 +1402,11 @@ mod tests {
             vault
                 .credential(replacement.id)
                 .expect("decrypt replacement"),
-            "nvapi-0123456789abcdefghijklmnopqrstuvwxyz"
+            concat!("nvapi", "-0123456789abcdefghijklmnopqrstuvwxyz")
         );
         assert_eq!(
             vault.credential(first.id).expect("decrypt retired key"),
-            "nvapi-abcdefghijklmnopqrstuvwxyz123456"
+            concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456")
         );
     }
 
@@ -1232,7 +1415,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut vault = Vault::open(dir.path().join("vault.json"), [7; 32]).expect("open");
         let key = vault
-            .add("history", "nvapi-abcdefghijklmnopqrstuvwxyz123456")
+            .add(
+                "history",
+                concat!("nvapi", "-abcdefghijklmnopqrstuvwxyz123456"),
+            )
             .expect("add");
         vault.mark_verified(key.id).expect("probe");
         vault.set_enabled(key.id, true).expect("enable");

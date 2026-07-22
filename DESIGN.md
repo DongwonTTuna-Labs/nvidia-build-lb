@@ -99,6 +99,7 @@ Admin v2 overview는 다음 필드를 명시적으로 갖는다. 각 nullable �
 - `capacity`: configured_slots, verified_slots, eligible_slots, pair_ready
 - `profiles`: catalogued, advertised, proven, available
 - `clients`: active_count
+- `qa`: required, passed, complete (현재 app deployment commit의 live suite만 집계)
 - `recent`: last_nvidia_success_at, last_hermes_e2e_at (nullable)
 - `metrics_24h`: sample_count와 nullable success/failover/latency/TTFB
 - `primary_action`: severity, code, title, reason, label, href (nullable)
@@ -114,6 +115,7 @@ Admin v2 overview는 다음 필드를 명시적으로 갖는다. 각 nullable �
   "capacity": {"configured_slots":0,"verified_slots":0,"eligible_slots":0,"pair_ready":false},
   "profiles": {"catalogued":8,"advertised":8,"proven":0,"available":0},
   "clients": {"active_count":0},
+  "qa": {"required":6,"passed":0,"complete":false},
   "recent": {"last_nvidia_success_at":null,"last_hermes_e2e_at":null},
   "metrics_24h": {"sample_count":0,"success_rate":null,"failover_rate":null,"latency_p95_ms":null,"ttfb_p95_ms":null},
   "primary_action": {"severity":"critical","code":"no_eligible_upstream","title":"...","reason":"...","label":"upstream 설정","href":"/admin/upstreams"},
@@ -139,7 +141,7 @@ create는 201, accepted QA/probe는 202, update/retire/revoke는 200을 사용�
 | Requests | `GET /requests`; `GET /requests/{request_id}` |
 | Probes | `GET /probes`; `GET /probes/{id}` |
 | Incidents | `GET,POST /incidents`; `PATCH /incidents/{id}`; `POST /incidents/{id}/updates` |
-| Governance/QA | `GET /audit`; `POST /qa/runs`; `GET /qa/runs/{id}`; `GET,PATCH /settings` |
+| Governance/QA | `GET /audit`; `GET,POST /qa/runs`; `GET /qa/secret-scan`; `GET /qa/runs/{id}`; `POST /qa/runs/{id}/hermes-completion`; `GET,PATCH /settings` |
 
 Canonical resource shapes are:
 
@@ -220,9 +222,14 @@ type QaCase = { id: Uuid; name: string; status: "pending" | "running" | "passed"
   started_at: Timestamp | null; finished_at: Timestamp | null };
 type QaRun = { id: Uuid; suite: "smoke" | "distribution" | "failover" |
   "persistence" | "multimodal" | "hermes-e2e"; live: boolean;
+  deployment_commit: string;
   status: "queued" | "running" | "passed" | "failed" | "cancelled";
   created_at: Timestamp; started_at: Timestamp | null; finished_at: Timestamp | null;
   cases: QaCase[] };
+type QaCompletion = { suite: QaRun["suite"]; passed: boolean;
+  passed_run: QaRun | null; latest_run: QaRun | null };
+type QaRunsPage = { snapshot: Snapshot; deployment_commit: string; items: QaRun[];
+  completion: QaCompletion[]; next_before: string | null };
 type Settings = { proof_freshness_seconds: number; request_retention_days: number;
   metric_retention_days: number; public_incidents_enabled: boolean };
 type RoutingPolicy = { version: number; active: boolean; retryable_statuses: number[];
@@ -242,6 +249,22 @@ returns `{snapshot:Snapshot,items:AdminModel[],discovered_count:number}`; model 
 never path-decoded. `GET /models` returns `Page<AdminModel>`. Incident create is
 `{slug,title,status,severity,public,public_message}`, patch accepts title/status/severity/public,
 incident update is `{status,public_message}`. QA create is `{suite,live,confirm_billable}`.
+`hermes-e2e`는 `live:true`만 허용하며 fake run은 API와 DB 양쪽에서 거부한다. queued 또는
+running QA run은 전체 DB에서 하나만 존재할 수 있고, 경합한 create는 409
+`qa_run_active`와 `details.active_run_id`를 반환한다. `GET /qa/runs`는 `limit=1..100`과
+opaque `before` cursor를 받아 `{snapshot,items,next_before}` keyset page를 반환한다.
+invalid cursor는 422이며 case는 page별 batch load해 N+1 query를 만들지 않는다. current
+deployment commit의 suite completion은 이 paginated history를 모두 순회해 계산한다.
+`passed_run`은 최신 성공 증거, `latest_run`은 성공 여부와 무관한 최신 실행이므로 과거
+PASS 뒤 최신 FAIL을 같은 timestamp로 오인하지 않는다. `GET /qa/secret-scan`은
+`{schema_version:"nblb.secret-scan.v1",database_matches:number}`만 반환한다.
+Hermes completion은 root helper 전용 exact body
+`{status:"passed"|"failed",generation?:Uuid,client_id?:Uuid,doctor?:boolean,
+exact_marker?:boolean,tool_task?:boolean,request_correlation?:boolean,
+secret_scan?:boolean,rollback_rehearsal?:boolean,duration_ms?:number,
+lb_requests?:{request_id:Uuid,attempt_count:number,outcome:string}[]}`다. passed는 모든 필드와
+boolean true, 3..5개의 unique terminal request가 필요하고 gateway가 DB에서 client,
+run start, attempt count, outcome, complete time window를 다시 검증한다.
 Settings patch is `Partial<Settings>` with at least one key. Every string is trimmed, bounded by
 the SQL constraint, and unknown JSON keys produce 422.
 
@@ -261,7 +284,7 @@ evidence/{id}` map to the named v2 query service. PR1 freezes exact current stat
 table-driven compatibility test before service extraction; future adapters must pass that oracle.
 
 Action queue 우선순위는 DB/owner lease → eligible 0 → probe 미완료 → 두 번째 slot
-미구성 → profile proof → downstream credential → Hermes → stale proof → 높은
+미구성 → profile proof → downstream credential → 전체 QA → Hermes → stale proof → 높은
 429/failover 순서다.
 
 Public health reason mapping은 다음으로 고정한다. 여러 code가 있으면 표 순서에서 가장
@@ -288,6 +311,7 @@ Admin primary action mapping is exact and ordered top-to-bottom:
 | `second_slot_missing` | warning | `두 번째 slot 필요` / `장애 전환과 분산을 위한 slot이 비어 있습니다.` | `slot 추가` → `/admin/upstreams` |
 | `profile_proof_missing` | warning | `model proof 필요` / `광고된 profile 중 실제 provider 증거가 없는 항목이 있습니다.` | `model 검증` → `/admin/models` |
 | `downstream_client_missing` | warning | `client credential 필요` / `호출에 사용할 active downstream client가 없습니다.` | `client 발급` → `/admin/clients` |
+| `qa_incomplete` | warning | `현재 배포 Live QA 미완료` / `필수 여섯 suite 중 아직 통과하지 않은 검증이 있습니다.` | `QA 완료` → `/admin/qa` |
 | `hermes_unverified` | info | `Hermes E2E 필요` / `현재 배포에서 실제 agent 작업 증거가 없습니다.` | `QA 실행` → `/admin/qa` |
 | `proof_stale` | warning | `오래된 proof 갱신 필요` / `provider 검증 유효기간을 넘긴 profile이 있습니다.` | `probe 갱신` → `/admin/probes` |
 | `elevated_failover` | warning | `failover 증가 확인` / `최근 failover 비율이 설정된 임계값을 넘었습니다.` | `라우팅 확인` → `/admin/routing` |
@@ -353,6 +377,10 @@ Actix ingress middleware가 모든 dynamic API 요청에 server-generated UUID v
   이후 additive operations tables가 PostgreSQL source of truth다.
 - NVIDIA credential은 AES-256-GCM ciphertext/nonce로, downstream token은 digest로만
   저장하고 plaintext는 생성 응답에서 한 번만 보여준다.
+- admin bearer는 현재 탭의 TypeScript module memory에만 두며 URL, cookie, DOM,
+  localStorage, sessionStorage에 저장하지 않는다. reload·잠금·탭 종료는 즉시 지우고,
+  one-time downstream token을 clipboard에 복사했다면 dialog를 닫기 전에 clipboard도
+  비운다.
 - active upstream은 최대 두 slot이며 add → probe → enable을 우회하지 않는다.
 - rate-aware round-robin cursor와 cooldown은 재시작 후 유지한다.
 - streaming failover는 첫 downstream SSE frame 전까지만 허용하며 이후 replay하거나
@@ -363,6 +391,64 @@ Actix ingress middleware가 모든 dynamic API 요청에 server-generated UUID v
   Authorization/cookie, provider response body는 DB와 로그에 저장하지 않는다.
 - `request_attempts.owner_id`와 `gateway_instances.last_seen_at` lease를 유지하고 살아
   있는 다른 process의 streaming attempt를 restart cleanup이 종료하지 않는다.
+
+### 미결정값 해소와 구현 권위
+
+첨부 구현 팩은 scaffolding이며 신규 admin namespace를 v1으로 적은 부분은 폐기한다.
+이 문서의 `/admin/api/v2/*`가 유일한 신규 계약이고 `/admin/api/v1/*`는 legacy
+adapter다. model ID는 path segment로 받지 않고 `POST /admin/api/v2/models/probe` JSON
+body로만 받는다. Hermes 최종 cutover 권위는 public custom-endpoint 예제가 아니라 이
+문서의 Rust helper와 loopback `provider:nvidia` 구성이다.
+
+stable upstream slot은 PostgreSQL `slot_no` 1 또는 2로 식별한다. active/non-retired
+slot에 unique constraint를 두고, add transaction이 advisory lock 아래 가장 작은 빈
+slot을 배정한다. retire 뒤 새 key가 빈 번호를 재사용할 수 있지만 과거 attempt는 key
+UUID를 보존하므로 역사적 identity가 바뀌지 않는다. UI와 분산 계산은 현재 key 정렬
+순서로 slot을 추론하지 않는다.
+
+first-attempt 선택만 profile의 round-robin cursor와 generation을 한 번 전진시킨다.
+같은 downstream request의 failover attempt는 cursor/generation을 추가 전진시키지
+않고 아직 시도하지 않은 eligible slot을 stable slot 순서로 선택한다. first selection은
+`routing_state FOR UPDATE`, hard eligibility(profile receipt 포함), cursor/generation,
+parent request, first attempt를 한 transaction으로 저장한다. no-eligible도 parent를
+명시적 terminal로 남긴다.
+
+downstream client 제한은 다음과 같이 고정한다.
+
+- expiration은 인증 시점과 request permit 획득 시점 모두 검사한다.
+- RPM은 현재 UTC minute `[date_trunc('minute', now()), +1 minute)`에 시작한 request
+  수이며 초과 시 다음 minute까지 1..60초 `Retry-After`를 반환한다.
+- request/day는 현재 UTC calendar day에 시작한 request 수다.
+- max concurrency는 `downstream_request_permits`의 unreleased row 수다. permit 획득은
+  client UUID advisory lock, 정책 재확인, count, permit INSERT를 한 transaction으로
+  수행한다. request terminal/Drop에서 release하고 stale owner lease만 restart cleanup이
+  release한다.
+- model allowlist는 body validation 후 provider 호출과 request evidence 생성 전에
+  검사한다. scope와 allowlist 부족은 403, expiration은 401, rate/day/concurrency는 429다.
+
+운영 설정 기본값과 범위는 다음으로 고정한다.
+
+- proof freshness: 기본 604800초(7일), 허용 300..2592000초
+- request retention: 기본 30일, 허용 7..90일
+- metric retention: 기본 90일, 허용 7..365일
+- public incident 표시: 기본 true
+- elevated failover/rate-limit attention: 최근 24시간 표본 20개 이상이며 각각 10% 이상
+- browser last-good snapshot stale 기준: 마지막 성공 후 30초; background 실패는 기존
+  snapshot을 유지하고 한 번의 polite announcement만 낸다.
+- public metric privacy suppression: 집계 point 또는 summary의 sample이 5 미만이면
+  `sample_count`는 실제 count를 내보내지 않고 0, rate/percentile은 null로 반환한다.
+
+routing policy bootstrap은 migration이 version 1 default document를 active로 원자
+seed한다. patch는 advisory lock 아래 기존 active를 내리고 `max(version)+1`을 active로
+insert하므로 lost update가 없다. `stream_failover_before_first_frame_only`는 항상 true,
+`generation_retry`는 항상 false이며 patch로 바꿀 수 없다.
+
+성공 mutation은 resource change와 audit event가 같은 transaction에서 commit되어야
+한다. validation/auth rejection은 resource transaction을 열지 않는다. dependency나
+동시성 실패처럼 transaction이 rollback된 mutation은 secret/content 없는 normalized
+failure code만 별도 best-effort audit transaction으로 남기며, audit 실패가 원래 오류를
+가리지 않는다. `audit_events.detail`과 `qa_cases.evidence`는 action/suite별 typed scalar
+allowlist만 허용하고 임의 key/value JSON을 handler에서 받지 않는다.
 
 ## 단계와 책임
 
@@ -440,6 +526,7 @@ allowlisted exact argv로 host `/usr/bin/docker stop|start|inspect|logs agent-he
 - `/usr/bin/stat --format=%F:%s /tmp/nblb-hermes-e2e-<generation UUID>`
 - `/usr/bin/sha256sum /tmp/nblb-hermes-e2e-<generation UUID>`
 - `/usr/bin/rm -- /tmp/nblb-hermes-e2e-<generation UUID>`
+- `/usr/bin/test ! -e /tmp/nblb-hermes-e2e-<generation UUID>`
 
 helper는 prompt를 상수로 compile하고 caller 입력을 argv에 넣지 않는다. exec stdout/stderr는
 각 64KiB로 제한해 memory에서 marker와 exit status만 판정하고 파일/journal/receipt에
@@ -457,6 +544,20 @@ exact-path `rm`으로 정리하고 absence를 재확인한다. final marker도 �
 벗어나거나 상관되지 않은 request가 있으면 E2E는 실패한다. helper network는 loopback
 `127.0.0.1:2456`만 사용한다.
 다른 container 이름, exec argv, remote URL은 거부한다.
+
+Admin에서 `hermes-e2e` run을 생성하면 gateway는 case를 running으로 arm하고 즉시
+판정하지 않는다. helper는 `apply --qa-run <UUID>`로 receipt와 run을 연결하며 receipt를
+원자 저장한 뒤 completion API를 호출한다. helper는 expected/embedded/deployment commit과
+exact live/running run identity를 lock, snapshot, client 발급, Docker 조작보다 먼저
+read-only preflight한다. receipt와 `committed` journal 이후 오류는 rollback, candidate
+revoke, failed completion으로 되돌아가지 않고 committed reconciliation으로만 복구한다.
+reconciliation은 이전 cutover client revoke 뒤 PASS completion을 제출하며 PASS 제출의
+동일 generation/app commit 재시도는 idempotent다. 마지막 journal write만 실패한 경우
+같은 `apply --qa-run` 재실행이 exact local committed receipt/journal을 확인한 뒤 복구한다.
+동시 apply는 host lock 뒤 run을 다시 조회하며, 먼저 끝난 동일 run의 reconciled generation을
+확인하면 새 snapshot/client/Docker mutation 없이 성공 종료한다. 30분 timeout,
+gateway 재시작, pre-commit helper failure, completion 검증 실패는 fail-closed이고
+interrupted persistence resume 오류도 run/case를 terminal failed로 닫는다.
 
 ## 빠른 검증 계약
 
