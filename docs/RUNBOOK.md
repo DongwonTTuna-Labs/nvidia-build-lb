@@ -48,6 +48,10 @@ lock을 사용하며, 30일이 지난 request도 `rolled_up_at`이 비어 있으
 - minute metric과 완료 probe: 90일
 - audit event와 완료 QA run: 180일
 
+Live QA는 canonical NVIDIA/NVCF HTTPS origin에서 생성·실행된 run만
+`provider_identity=nvidia_hosted`로 기록합니다. mock/custom provider와 migration 전
+`unverified` live history는 현재 배포 완료 증거로 집계하지 않습니다.
+
 열린 row는 retention 대상이 아니다. owner heartbeat가 30초보다 오래 끊긴 gateway의
 열린 request와 attempt는 watchdog이 `abandoned_after_restart`로 닫는다. 이 정리가
 반복 실패하면 gateway는 fail-closed로 종료한다.

@@ -119,6 +119,7 @@ struct QaRunTarget {
     id: Uuid,
     suite: String,
     live: bool,
+    provider_identity: String,
     deployment_commit: String,
     status: String,
 }
@@ -1257,8 +1258,8 @@ async fn validate_qa_run_target_from(
     if target.id != requested_id {
         bail!("Hermes QA run preflight returned a different run")
     }
-    if target.suite != "hermes-e2e" || !target.live {
-        bail!("Hermes QA run must be a live hermes-e2e run")
+    if target.suite != "hermes-e2e" || !target.live || target.provider_identity != "nvidia_hosted" {
+        bail!("Hermes QA run must have NVIDIA hosted live provenance")
     }
     if target.deployment_commit != EMBEDDED_COMMIT || target.deployment_commit != expected_commit {
         bail!("Hermes QA run deployment commit does not match the pinned helper")
@@ -2979,6 +2980,7 @@ mod tests {
             "id": run_id,
             "suite": "hermes-e2e",
             "live": true,
+            "provider_identity": "nvidia_hosted",
             "deployment_commit": EMBEDDED_COMMIT,
             "status": "running"
         });
@@ -3013,6 +3015,7 @@ mod tests {
             "id": run_id,
             "suite": "hermes-e2e",
             "live": true,
+            "provider_identity": "nvidia_hosted",
             "deployment_commit": EMBEDDED_COMMIT,
             "status": "passed"
         });
@@ -3026,6 +3029,7 @@ mod tests {
             "id": run_id,
             "suite": "hermes-e2e",
             "live": true,
+            "provider_identity": "nvidia_hosted",
             "deployment_commit": EMBEDDED_COMMIT,
             "status": "failed"
         });
@@ -3033,11 +3037,12 @@ mod tests {
             .await
             .expect("defer failed-run eligibility to the exact local receipt gate");
         let invalid_shapes = [
-            serde_json::json!({"id":Uuid::new_v4(),"suite":"hermes-e2e","live":true,"deployment_commit":EMBEDDED_COMMIT,"status":"running"}),
-            serde_json::json!({"id":run_id,"suite":"smoke","live":true,"deployment_commit":EMBEDDED_COMMIT,"status":"running"}),
-            serde_json::json!({"id":run_id,"suite":"hermes-e2e","live":false,"deployment_commit":EMBEDDED_COMMIT,"status":"running"}),
-            serde_json::json!({"id":run_id,"suite":"hermes-e2e","live":true,"deployment_commit":EMBEDDED_COMMIT,"status":"queued"}),
-            serde_json::json!({"id":run_id,"suite":"hermes-e2e","live":true,"deployment_commit":"different","status":"running"}),
+            serde_json::json!({"id":Uuid::new_v4(),"suite":"hermes-e2e","live":true,"provider_identity":"nvidia_hosted","deployment_commit":EMBEDDED_COMMIT,"status":"running"}),
+            serde_json::json!({"id":run_id,"suite":"smoke","live":true,"provider_identity":"nvidia_hosted","deployment_commit":EMBEDDED_COMMIT,"status":"running"}),
+            serde_json::json!({"id":run_id,"suite":"hermes-e2e","live":false,"provider_identity":"fake","deployment_commit":EMBEDDED_COMMIT,"status":"running"}),
+            serde_json::json!({"id":run_id,"suite":"hermes-e2e","live":true,"provider_identity":"unverified","deployment_commit":EMBEDDED_COMMIT,"status":"running"}),
+            serde_json::json!({"id":run_id,"suite":"hermes-e2e","live":true,"provider_identity":"nvidia_hosted","deployment_commit":EMBEDDED_COMMIT,"status":"queued"}),
+            serde_json::json!({"id":run_id,"suite":"hermes-e2e","live":true,"provider_identity":"nvidia_hosted","deployment_commit":"different","status":"running"}),
         ];
         for body in invalid_shapes {
             *fixture_evidence
@@ -3056,7 +3061,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(fixture_evidence.requests.load(Ordering::SeqCst), 9);
+        assert_eq!(fixture_evidence.requests.load(Ordering::SeqCst), 10);
         handle.stop(true).await;
     }
 

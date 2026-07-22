@@ -55,7 +55,7 @@ pub(crate) async fn profile_proof_keys(state: &AppState) -> Result<HashMap<Strin
         return Ok(HashMap::new());
     };
     let rows = sqlx::query_as::<_, (String, Uuid)>(
-        "SELECT profile_id, key_id FROM nblb.profile_probe_receipts",
+        "SELECT profile_id, key_id FROM nblb.profile_probe_receipts WHERE invalidated_at IS NULL",
     )
     .fetch_all(pool)
     .await

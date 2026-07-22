@@ -4,6 +4,8 @@ import { base } from "$app/paths";
 import { adminErrorMessage, api, displayTime, startPolling } from "$lib/api";
 import DataState from "$lib/components/DataState.svelte";
 import PageHeader from "$lib/components/PageHeader.svelte";
+import RuntimeRecheckStatus from "$lib/components/RuntimeRecheckStatus.svelte";
+import { leaseRecheckMessage } from "$lib/operations";
 import type { Attention, Overview, Page } from "$lib/types";
 
 let data = $state<Overview | null>(null),
@@ -15,16 +17,19 @@ let data = $state<Overview | null>(null),
   attentionSuccessAt = $state<string | null>(null);
 let attentionStale = $state(false);
 let refreshing = $state(false);
-async function load(): Promise<void> {
-  if (refreshing) return;
+let runtimeCheckMessage = $state("");
+async function refresh(): Promise<{ overviewLoaded: boolean }> {
+  if (refreshing) return { overviewLoaded: false };
   refreshing = true;
   loading = !data;
+  let overviewLoaded = false;
   try {
     const [overviewResult, attentionResult] = await Promise.allSettled([
       api<Overview>("/overview"),
       api<Page<Attention>>("/attentions"),
     ]);
     if (overviewResult.status === "fulfilled") {
+      overviewLoaded = true;
       data = overviewResult.value;
       dataError = "";
       dataSuccessAt = overviewResult.value.snapshot.observed_at;
@@ -44,7 +49,22 @@ async function load(): Promise<void> {
     loading = false;
     refreshing = false;
   }
+  return { overviewLoaded };
 }
+async function load(): Promise<void> {
+  await refresh();
+}
+async function recheckRuntime(): Promise<void> {
+  runtimeCheckMessage = "";
+  const result = await refresh();
+  runtimeCheckMessage = leaseRecheckMessage({
+    freshOverview: result.overviewLoaded && !dataError,
+    ownerLeaseReady: data?.runtime.owner_lease_ready ?? false,
+    lastSuccessLabel: displayTime(dataSuccessAt),
+  });
+}
+const actionHref = (href: string) =>
+  href.startsWith("/admin") ? `${base}${href.replace("/admin", "")}` : href;
 const percent = (value: number | null) =>
   value === null ? "표본 부족" : `${(value * 100).toFixed(1)}%`;
 onMount(() => startPolling(load));
@@ -63,13 +83,27 @@ onMount(() => startPolling(load));
   lastSuccessAt={dataSuccessAt}
   retry={load}
 />
+<RuntimeRecheckStatus message={runtimeCheckMessage} />
 {#if data}
   {#if data.primary_action}<section class="action">
       <p>{data.primary_action.title}</p>
       <h2>{data.primary_action.reason}</h2>
-      <a href={`${base}${data.primary_action.href.replace("/admin", "")}`}
-        >{data.primary_action.label}</a
-      >
+      {#if data.primary_action.code === "owner_lease_stale"}<button
+          class="recheck"
+          type="button"
+          onclick={() => void recheckRuntime()}
+          disabled={refreshing}
+          aria-busy={refreshing}
+          >{refreshing ? "확인 중…" : data.primary_action.label}</button
+        >
+        <p class="recovery">
+          계속 STALE이면 배포 host의 stack 디렉터리에서 DB·app 상태와 app 로그를
+          확인하고 원인을 조치한 뒤 app 컨테이너를 재시작하세요. 재시작 후 이
+          버튼으로 heartbeat 회복을 확인합니다.
+        </p>
+      {:else}<a href={actionHref(data.primary_action.href)}
+          >{data.primary_action.label}</a
+        >{/if}
     </section>{:else}<section class="action good">
       <p>운영 준비 완료</p>
       <h2>지금 즉시 처리할 차단 항목이 없습니다.</h2>
@@ -156,16 +190,22 @@ onMount(() => startPolling(load));
       </p>{/if}{#if attentions.length}<ol>
         {#each attentions as item}<li>
             <div><strong>{item.title}</strong><span>{item.reason}</span></div>
-            <a href={`${base}${item.action.href.replace("/admin", "")}`}
-              >{item.action.label}</a
-            >
+            {#if item.action.href}<a href={actionHref(item.action.href)}
+                >{item.action.label}</a
+              >{:else}<button
+                type="button"
+                onclick={() => void recheckRuntime()}
+                disabled={refreshing}
+                aria-busy={refreshing}
+                >{refreshing ? "확인 중…" : item.action.label}</button
+              >{/if}
           </li>{/each}
       </ol>{:else if !attentionError}<p>대기 중인 조치가 없습니다.</p>{/if}
   </section>
   <section class="panel evidence">
     <h2>최근 실제 증거</h2>
     <p>
-      <span>NVIDIA 성공</span><strong
+      <span>Upstream 성공</span><strong
         >{displayTime(data.recent.last_nvidia_success_at)}</strong
       >
     </p>
@@ -212,6 +252,25 @@ onMount(() => startPolling(load));
     color: #091006;
     text-decoration: none;
     font-weight: 900;
+  }
+  .action .recheck {
+    min-height: 44px;
+    padding: 10px 14px;
+    border: 0;
+    border-radius: 6px;
+    background: #76b900;
+    color: #091006;
+    font: inherit;
+    font-weight: 900;
+    cursor: pointer;
+  }
+  .action .recheck:disabled {
+    cursor: wait;
+    opacity: 0.65;
+  }
+  .action .recovery {
+    max-width: 72ch;
+    margin-top: 14px;
   }
   .stats {
     display: grid;

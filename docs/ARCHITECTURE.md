@@ -97,7 +97,10 @@ Rust helper를 기다립니다. helper는 receipt 저장과 rollback rehearsal �
 gateway는 request IDs가 같은 downstream client, run 이후 시각, terminal success,
 동일 attempt count와 완전한 request window인지 한 transaction에서 다시 검증한 뒤에만
 run을 `passed`로 닫습니다. fake Hermes run은 API/DB에서 금지하고 queued/running QA는
-partial unique index로 global single-flight입니다. history는 `(started_at,id)` opaque
+partial unique index로 global single-flight입니다. 모든 run은 `fake` 또는
+`nvidia_hosted` provider identity를 보존하며 canonical NVIDIA/NVCF HTTPS origin에서
+생성·실행된 `nvidia_hosted` run만 completion 권위에 포함됩니다. 과거 출처 미확인 live
+history는 `unverified`로 격리합니다. history는 `(started_at,id)` opaque
 keyset pagination과 case batch load를 사용합니다. helper는 host mutation 전 exact
 live/running/commit identity를 검증하고 committed 이후에는 reconciliation만 수행합니다.
 helper pre-commit failure, timeout, gateway restart는 fail-closed입니다.

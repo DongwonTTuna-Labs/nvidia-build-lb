@@ -5,6 +5,7 @@ import { adminErrorMessage, api, startPolling } from "$lib/api";
 import DataState from "$lib/components/DataState.svelte";
 import PageHeader from "$lib/components/PageHeader.svelte";
 import StatusBadge from "$lib/components/StatusBadge.svelte";
+import { isModelProbeFailure, parseModelProbeResponse } from "$lib/operations";
 import type { Model, Page, ProbeRun, Upstream } from "$lib/types";
 
 const billable = new Set([
@@ -23,6 +24,7 @@ let items = $state<Model[]>([]),
   selectedUpstreams = $state<string[]>([]),
   confirmBillable = $state(false),
   results = $state<ProbeRun[]>([]),
+  resultUpstreams = $state<Record<string, { label: string; slotNo: number }>>({}),
   lastSuccessAt = $state<string | null>(null),
   snapshotStale = $state(false),
   refreshing = $state(false),
@@ -92,6 +94,11 @@ async function probe() {
   }
   const targetModel = selectedModel;
   const targetUpstreams = [...selectedUpstreams];
+  const targetDescriptors = Object.fromEntries(
+    upstreams
+      .filter((item) => targetUpstreams.includes(item.id))
+      .map((item) => [item.id, { label: item.label, slotNo: item.slot_no }]),
+  );
   if (billable.has(targetModel) && !confirmBillable) {
     actionError = "비용 발생 가능성을 확인하세요.";
     return;
@@ -101,18 +108,29 @@ async function probe() {
   actionError = "";
   notice = "";
   results = [];
+  resultUpstreams = {};
   try {
-    const value = await api<{ model: Model; probe_runs: ProbeRun[] }>("/models/probe", {
-      method: "POST",
-      body: JSON.stringify({
-        model_id: targetModel,
-        upstream_ids: targetUpstreams,
-        confirm_billable: billable.has(targetModel),
-      }),
-    });
+    const value = await api<unknown>(
+      "/models/probe",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          model_id: targetModel,
+          upstream_ids: targetUpstreams,
+          confirm_billable: billable.has(targetModel),
+        }),
+      },
+      [422],
+      (payload) => isModelProbeFailure(payload, targetModel, targetUpstreams),
+    );
     if (generation === mutationGeneration) {
-      results = value.probe_runs;
-      notice = `${targetModel} 검증을 완료했습니다.`;
+      results = parseModelProbeResponse(value, targetModel, targetUpstreams).runs;
+      resultUpstreams = targetDescriptors;
+      if (results.some((run) => run.status !== "passed")) {
+        actionError = `${targetModel} 검증에 실패한 upstream이 있습니다. 아래 probe evidence를 확인하세요.`;
+      } else {
+        notice = `${targetModel} 검증을 완료했습니다.`;
+      }
     }
     await load();
   } catch (e) {
@@ -120,6 +138,9 @@ async function probe() {
   } finally {
     busy = "";
   }
+}
+function resultUpstream(result: ProbeRun): { label: string; slotNo: number } | undefined {
+  return result.upstream_id ? resultUpstreams[result.upstream_id] : undefined;
 }
 onMount(() => startPolling(() => (busy ? Promise.resolve() : load())));
 </script>
@@ -198,12 +219,16 @@ onMount(() => startPolling(() => (busy ? Promise.resolve() : load())));
       >{busy === "probe" ? "검증 중…" : "선택 모델 검증"}</button
     >
     {#if results.length}<ul>
-        {#each results as result}<li>
-            <StatusBadge value={result.status} /><span
-              >{result.profile_id} · HTTP {result.status_code ?? "—"}</span
-            >
+        {#each results as result (result.id)}{@const upstream = resultUpstream(result)}<li>
+            <StatusBadge value={result.status} /><span>
+              SLOT {upstream?.slotNo ?? "—"} · {upstream?.label ?? "알 수 없는 upstream"}<br />
+              HTTP {result.status_code ?? "—"} · 오류 분류 <code
+                >{result.error_class ?? "없음"}</code
+              >
+            </span>
           </li>{/each}
-      </ul>{/if}
+      </ul>
+      <a class="probe-link" href={`${base}/probes`}>전체 probe evidence</a>{/if}
   </section>
   <div class="models">
     {#each items as item}
@@ -324,6 +349,15 @@ onMount(() => startPolling(() => (busy ? Promise.resolve() : load())));
     display: flex;
     gap: 10px;
     align-items: center;
+  }
+  .probe li span {
+    overflow-wrap: anywhere;
+  }
+  .probe-link {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    color: #c9f28e;
   }
   .models {
     display: grid;

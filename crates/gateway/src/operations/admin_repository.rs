@@ -1152,6 +1152,7 @@ struct QaRunRow {
     id: Uuid,
     suite: String,
     live: bool,
+    provider_identity: String,
     deployment_commit: String,
     status: String,
     created_at: DateTime<Utc>,
@@ -1175,6 +1176,7 @@ fn qa_run_from_row(run: QaRunRow, cases: Vec<QaCase>) -> QaRun {
         id: run.id,
         suite: run.suite,
         live: run.live,
+        provider_identity: run.provider_identity,
         deployment_commit: run.deployment_commit,
         status: run.status,
         created_at: run.created_at,
@@ -1186,7 +1188,7 @@ fn qa_run_from_row(run: QaRunRow, cases: Vec<QaCase>) -> QaRun {
 
 pub(crate) async fn qa_run(pool: &PgPool, id: Uuid) -> Result<Option<QaRun>> {
     let run = sqlx::query_as::<_, QaRunRow>(
-        "SELECT id,suite,live,deployment_commit,status,created_at,started_at,finished_at FROM nblb.qa_runs WHERE id=$1",
+        "SELECT id,suite,live,provider_identity,deployment_commit,status,created_at,started_at,finished_at FROM nblb.qa_runs WHERE id=$1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -1213,7 +1215,7 @@ pub(crate) async fn qa_runs(
 ) -> Result<Vec<QaRun>> {
     let (before_at, before_id) = before.unzip();
     let rows = sqlx::query_as::<_, QaRunRow>(
-        "SELECT id,suite,live,deployment_commit,status,created_at,started_at,finished_at FROM nblb.qa_runs WHERE ($1::timestamptz IS NULL OR (created_at,id) < ($1,$2)) ORDER BY created_at DESC,id DESC LIMIT $3",
+        "SELECT id,suite,live,provider_identity,deployment_commit,status,created_at,started_at,finished_at FROM nblb.qa_runs WHERE ($1::timestamptz IS NULL OR (created_at,id) < ($1,$2)) ORDER BY created_at DESC,id DESC LIMIT $3",
     )
     .bind(before_at)
     .bind(before_id)
@@ -1260,7 +1262,7 @@ pub(crate) async fn qa_completion(
     let mut completion = Vec::with_capacity(suites.len());
     for suite in suites {
         let passed_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM nblb.qa_runs WHERE suite=$1 AND live=true AND status='passed' AND deployment_commit=$2 ORDER BY finished_at DESC NULLS LAST,created_at DESC,id DESC LIMIT 1",
+            "SELECT id FROM nblb.qa_runs WHERE suite=$1 AND live=true AND provider_identity='nvidia_hosted' AND status='passed' AND deployment_commit=$2 ORDER BY finished_at DESC NULLS LAST,created_at DESC,id DESC LIMIT 1",
         )
         .bind(suite)
         .bind(deployment_commit)
@@ -1268,7 +1270,7 @@ pub(crate) async fn qa_completion(
         .await
         .context("load current-deployment passed QA run")?;
         let latest_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM nblb.qa_runs WHERE suite=$1 AND live=true AND deployment_commit=$2 ORDER BY created_at DESC,id DESC LIMIT 1",
+            "SELECT id FROM nblb.qa_runs WHERE suite=$1 AND live=true AND provider_identity='nvidia_hosted' AND deployment_commit=$2 ORDER BY created_at DESC,id DESC LIMIT 1",
         )
         .bind(suite)
         .bind(deployment_commit)
@@ -1301,6 +1303,21 @@ pub(crate) enum CreateQaRunError {
     Internal(anyhow::Error),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QaProviderIdentity {
+    Fake,
+    NvidiaHosted,
+}
+
+impl QaProviderIdentity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fake => "fake",
+            Self::NvidiaHosted => "nvidia_hosted",
+        }
+    }
+}
+
 impl fmt::Display for CreateQaRunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1325,6 +1342,7 @@ pub(crate) async fn create_qa_run(
     pool: &PgPool,
     suite: &str,
     live: bool,
+    provider_identity: QaProviderIdentity,
     request_id: Uuid,
 ) -> std::result::Result<(QaRun, Uuid), CreateQaRunError> {
     let cases: &[&str] = match suite {
@@ -1371,6 +1389,11 @@ pub(crate) async fn create_qa_run(
     if suite == "hermes-e2e" && !live {
         return Err(CreateQaRunError::HermesLiveRequired);
     }
+    if live != (provider_identity == QaProviderIdentity::NvidiaHosted) {
+        return Err(CreateQaRunError::Internal(anyhow!(
+            "QA live mode and provider identity do not match"
+        )));
+    }
     for _attempt in 0..3 {
         let mut tx = pool
             .begin()
@@ -1395,10 +1418,11 @@ pub(crate) async fn create_qa_run(
             return Err(CreateQaRunError::ActiveRun(active_id));
         }
         let inserted = sqlx::query_scalar::<_, Uuid>(
-            "INSERT INTO nblb.qa_runs(suite,live,deployment_commit) VALUES ($1,$2,$3) RETURNING id",
+            "INSERT INTO nblb.qa_runs(suite,live,provider_identity,deployment_commit) VALUES ($1,$2,$3,$4) RETURNING id",
         )
         .bind(suite)
         .bind(live)
+        .bind(provider_identity.as_str())
         .bind(crate::BUILD_COMMIT)
         .fetch_one(&mut *tx)
         .await;
@@ -1429,7 +1453,7 @@ pub(crate) async fn create_qa_run(
             "qa_run",
             Some(run_id),
             Some(request_id),
-            json!({"live":live,"suite":suite}),
+            json!({"live":live,"provider_identity":provider_identity.as_str(),"suite":suite}),
         )
         .await
         .map_err(CreateQaRunError::Internal)?;
@@ -1450,16 +1474,22 @@ pub(crate) async fn create_qa_run(
 
 #[cfg(test)]
 mod qa_authority_tests {
-    use super::{CreateQaRunError, create_qa_run, qa_runs};
+    use super::{CreateQaRunError, QaProviderIdentity, create_qa_run, qa_completion, qa_runs};
     use chrono::{TimeZone, Utc};
     use std::collections::HashSet;
     use uuid::Uuid;
 
     #[sqlx::test(migrations = "../../migrations/sqlx")]
     async fn qa_authority_rejects_fake_hermes_and_allows_one_active_run(pool: sqlx::PgPool) {
-        let fake = create_qa_run(&pool, "hermes-e2e", false, Uuid::new_v4())
-            .await
-            .expect_err("fake Hermes must be rejected");
+        let fake = create_qa_run(
+            &pool,
+            "hermes-e2e",
+            false,
+            QaProviderIdentity::Fake,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect_err("fake Hermes must be rejected");
         assert!(matches!(fake, CreateQaRunError::HermesLiveRequired));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.qa_runs")
@@ -1478,8 +1508,20 @@ mod qa_authority_tests {
         );
 
         let (left, right) = tokio::join!(
-            create_qa_run(&pool, "smoke", false, Uuid::new_v4()),
-            create_qa_run(&pool, "distribution", false, Uuid::new_v4()),
+            create_qa_run(
+                &pool,
+                "smoke",
+                false,
+                QaProviderIdentity::Fake,
+                Uuid::new_v4()
+            ),
+            create_qa_run(
+                &pool,
+                "distribution",
+                false,
+                QaProviderIdentity::Fake,
+                Uuid::new_v4()
+            ),
         );
         let (winner, conflict) = match (left, right) {
             (Ok(winner), Err(conflict)) | (Err(conflict), Ok(winner)) => (winner, conflict),
@@ -1509,9 +1551,15 @@ mod qa_authority_tests {
             .execute(&pool)
             .await
             .expect("close winning QA run");
-        create_qa_run(&pool, "smoke", false, Uuid::new_v4())
-            .await
-            .expect("terminal run must release global single-flight");
+        create_qa_run(
+            &pool,
+            "smoke",
+            false,
+            QaProviderIdentity::Fake,
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("terminal run must release global single-flight");
     }
 
     #[sqlx::test(migrations = "../../migrations/sqlx")]
@@ -1561,6 +1609,25 @@ mod qa_authority_tests {
             .collect::<HashSet<_>>();
         assert_eq!(ids.len(), 125);
         assert!(first_page.windows(2).all(|pair| pair[0].id > pair[1].id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations/sqlx")]
+    async fn unverified_live_history_is_not_authoritative_completion(pool: sqlx::PgPool) {
+        sqlx::query(
+            "INSERT INTO nblb.qa_runs(suite,live,provider_identity,deployment_commit,status,started_at,finished_at) VALUES('smoke',true,'unverified',$1,'passed',now(),now())",
+        )
+        .bind(crate::BUILD_COMMIT)
+        .execute(&pool)
+        .await
+        .expect("seed pre-provenance live history");
+
+        let completion = qa_completion(&pool, crate::BUILD_COMMIT, &["smoke"])
+            .await
+            .expect("load provider-authoritative completion");
+        assert_eq!(completion.len(), 1);
+        assert!(!completion[0].passed);
+        assert!(completion[0].passed_run.is_none());
+        assert!(completion[0].latest_run.is_none());
     }
 }
 

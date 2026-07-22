@@ -4,6 +4,29 @@ use std::env;
 
 use super::{SseValidator, invalid_request};
 
+fn is_canonical_nvidia_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let host_is_nvidia_api = url.host_str().is_some_and(|host| {
+        matches!(
+            host,
+            "integrate.api.nvidia.com" | "ai.api.nvidia.com" | "api.nvcf.nvidia.com"
+        ) || host.ends_with(".api.nvcf.nvidia.com")
+    });
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && host_is_nvidia_api
+}
+
+pub(crate) fn live_qa_provider_is_canonical(configured: &str) -> bool {
+    is_canonical_nvidia_url(configured) && is_canonical_nvidia_url(&magpie_tts_endpoint())
+}
+
 pub(crate) fn upstream_endpoint(configured: &str, path: &str) -> String {
     let configured = configured.trim_end_matches('/');
     let versionless_path = path.strip_prefix("/v1").unwrap_or(path);

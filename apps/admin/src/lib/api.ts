@@ -35,7 +35,30 @@ export function saveToken(value: string): void {
   window.dispatchEvent(new CustomEvent("nblb-auth", { detail: { hasToken: Boolean(value) } }));
 }
 
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+export function acceptsHttpStatus(
+  responseOk: boolean,
+  status: number,
+  acceptedStatuses: readonly number[],
+): boolean {
+  return responseOk || acceptedStatuses.includes(status);
+}
+
+export function acceptsHttpResponse(
+  responseOk: boolean,
+  status: number,
+  acceptedStatuses: readonly number[],
+  payload: unknown,
+  acceptedPayload?: (value: unknown) => boolean,
+): boolean {
+  return responseOk || (acceptedStatuses.includes(status) && acceptedPayload?.(payload) === true);
+}
+
+export async function api<T>(
+  path: string,
+  init: RequestInit = {},
+  acceptedStatuses: readonly number[] = [],
+  acceptedPayload?: (value: unknown) => boolean,
+): Promise<T> {
   const credential = token();
   const requestGeneration = credentialGeneration;
   const response = await fetch(`/admin/api/v2${path}`, {
@@ -63,7 +86,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
       details?: Record<string, unknown>;
     };
   };
-  if (!response.ok) {
+  if (
+    !acceptsHttpResponse(response.ok, response.status, acceptedStatuses, parsed, acceptedPayload)
+  ) {
     if (response.status === 401 && requestGeneration === credentialGeneration) {
       window.dispatchEvent(
         new CustomEvent("nblb-auth-invalid", {

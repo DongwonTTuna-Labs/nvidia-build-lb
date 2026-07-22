@@ -226,6 +226,7 @@ export interface QaRun {
   id: string;
   suite: string;
   live: boolean;
+  provider_identity: "fake" | "nvidia_hosted" | "unverified";
   deployment_commit: string;
   status: string;
   created_at: string;

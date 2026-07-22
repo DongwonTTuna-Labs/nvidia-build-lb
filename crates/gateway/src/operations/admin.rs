@@ -149,6 +149,22 @@ fn no_store(mut response: HttpResponse) -> HttpResponse {
     response
 }
 
+fn owner_lease_attention() -> Attention {
+    Attention {
+        severity: "critical",
+        code: "owner_lease_stale",
+        title: "게이트웨이 lease 확인 필요",
+        reason: "요청 정리와 소유권 heartbeat가 최신이 아닙니다.",
+        action: AttentionAction {
+            label: "lease 다시 확인".into(),
+            // This action is an in-place runtime recheck, not navigation. An
+            // empty href prevents API consumers from presenting the current
+            // command center as a no-op recovery destination.
+            href: String::new(),
+        },
+    }
+}
+
 async fn current_attentions(
     pool: &sqlx::PgPool,
     state: &AppState,
@@ -169,6 +185,9 @@ async fn current_attentions(
     };
     let eligible = upstreams.iter().filter(|item| item.eligible_now).count();
     let mut items = Vec::new();
+    if !owner_ready {
+        items.push(owner_lease_attention());
+    }
     let mut add = |severity: &'static str,
                    code: &'static str,
                    title: &'static str,
@@ -186,16 +205,6 @@ async fn current_attentions(
             },
         });
     };
-    if !owner_ready {
-        add(
-            "critical",
-            "owner_lease_stale",
-            "게이트웨이 lease 확인 필요",
-            "요청 정리와 소유권 heartbeat가 최신이 아닙니다.",
-            "런타임 확인",
-            "/admin",
-        );
-    }
     if eligible == 0 {
         add(
             "critical",
@@ -250,7 +259,7 @@ async fn current_attentions(
         );
     }
     let required_qa_passed = sqlx::query_scalar::<_, i64>(
-        "SELECT count(DISTINCT suite) FROM nblb.qa_runs WHERE live=true AND status='passed' AND deployment_commit=$1",
+        "SELECT count(DISTINCT suite) FROM nblb.qa_runs WHERE live=true AND provider_identity='nvidia_hosted' AND status='passed' AND deployment_commit=$1",
     )
     .bind(crate::BUILD_COMMIT)
     .fetch_one(pool)
@@ -267,7 +276,7 @@ async fn current_attentions(
         );
     }
     let hermes_verified = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM nblb.qa_runs WHERE suite='hermes-e2e' AND live=true AND status='passed' AND deployment_commit=$1)",
+        "SELECT EXISTS(SELECT 1 FROM nblb.qa_runs WHERE suite='hermes-e2e' AND live=true AND provider_identity='nvidia_hosted' AND status='passed' AND deployment_commit=$1)",
     )
     .bind(crate::BUILD_COMMIT)
     .fetch_one(pool)
@@ -373,14 +382,14 @@ async fn overview(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse 
     .await
     .unwrap_or(None);
     let last_hermes_e2e_at = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT max(finished_at) FROM nblb.qa_runs WHERE suite='hermes-e2e' AND live=true AND status='passed' AND deployment_commit=$1",
+        "SELECT max(finished_at) FROM nblb.qa_runs WHERE suite='hermes-e2e' AND live=true AND provider_identity='nvidia_hosted' AND status='passed' AND deployment_commit=$1",
     )
     .bind(crate::BUILD_COMMIT)
     .fetch_one(pool)
     .await
     .unwrap_or(None);
     let qa_passed = sqlx::query_scalar::<_, i64>(
-        "SELECT count(DISTINCT suite) FROM nblb.qa_runs WHERE live=true AND status='passed' AND deployment_commit=$1",
+        "SELECT count(DISTINCT suite) FROM nblb.qa_runs WHERE live=true AND provider_identity='nvidia_hosted' AND status='passed' AND deployment_commit=$1",
     )
     .bind(crate::BUILD_COMMIT)
     .fetch_one(pool)
@@ -1106,6 +1115,21 @@ async fn create_qa_run(
         Ok(pool) => pool,
         Err(response) => return response,
     };
+    let provider_identity = if input.live {
+        if !crate::provider::live_qa_provider_is_canonical(&state.upstream_url) {
+            return operations_error(
+                &req,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "live_nvidia_provider_required",
+                "Live QA requires canonical NVIDIA hosted API endpoints.",
+                false,
+                None,
+            );
+        }
+        repository::QaProviderIdentity::NvidiaHosted
+    } else {
+        repository::QaProviderIdentity::Fake
+    };
     if input.live && matches!(input.suite.as_str(), "multimodal") && !input.confirm_billable {
         return operations_error(
             &req,
@@ -1126,7 +1150,15 @@ async fn create_qa_run(
             None,
         );
     }
-    match repository::create_qa_run(pool, &input.suite, input.live, request_id(&req)).await {
+    match repository::create_qa_run(
+        pool,
+        &input.suite,
+        input.live,
+        provider_identity,
+        request_id(&req),
+    )
+    .await
+    {
         Ok((item, audit_event_id)) => {
             super::qa::spawn(state.clone(), item.id);
             no_store(HttpResponse::Accepted().json(AuditMutation {
@@ -2603,7 +2635,7 @@ async fn update_settings(
 mod tests {
     use super::{
         ClientPatch, ListQuery, NullablePatch, QaRunInput, RequestListQuery, decode_keyset_cursor,
-        keyset_page, request_filters,
+        keyset_page, owner_lease_attention, request_filters,
     };
     use actix_web::{http::StatusCode, test::TestRequest};
     use base64::Engine;
@@ -2624,6 +2656,15 @@ mod tests {
             before: None,
         };
         assert_eq!(query.limit, Some(50));
+    }
+
+    #[test]
+    fn owner_lease_recovery_is_an_in_place_recheck_not_a_noop_link() {
+        let attention = owner_lease_attention();
+        assert_eq!(attention.code, "owner_lease_stale");
+        assert_eq!(attention.action.label, "lease 다시 확인");
+        assert!(attention.action.href.is_empty());
+        assert_ne!(attention.action.href, "/admin");
     }
 
     #[test]

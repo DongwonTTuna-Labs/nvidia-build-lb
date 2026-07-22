@@ -249,21 +249,33 @@ async fn execute(state: &AppState, run_id: Uuid) -> Result<()> {
         .database
         .as_ref()
         .context("QA runner requires PostgreSQL")?;
-    let (suite, live) = sqlx::query_as::<_, (String, bool)>(
-        "SELECT suite,live FROM nblb.qa_runs WHERE id=$1 AND status='queued'",
+    let (suite, live, provider_identity) = sqlx::query_as::<_, (String, bool, String)>(
+        "SELECT suite,live,provider_identity FROM nblb.qa_runs WHERE id=$1 AND status='queued'",
     )
     .bind(run_id)
     .fetch_one(pool)
     .await
     .context("load QA run mode")?;
+    if live
+        && (provider_identity != "nvidia_hosted"
+            || !crate::provider::live_qa_provider_is_canonical(&state.upstream_url))
+    {
+        bail!("live QA requires canonical NVIDIA hosted provider identity")
+    }
+    if !live && provider_identity != "fake" {
+        bail!("fake QA requires fake provider identity")
+    }
     if suite == "persistence" {
         prepare_persistence(pool, state.vault.owner_id, run_id).await?;
         schedule_persistence_timeout(pool.clone(), run_id);
         return Ok(());
     }
     if suite == "hermes-e2e" {
-        if !live {
-            bail!("Hermes E2E QA requires live mode")
+        if !live
+            || provider_identity != "nvidia_hosted"
+            || !crate::provider::live_qa_provider_is_canonical(&state.upstream_url)
+        {
+            bail!("Hermes E2E QA requires canonical NVIDIA hosted live mode")
         }
         arm_hermes(pool, run_id).await?;
         schedule_hermes_timeout(pool.clone(), run_id);
@@ -447,8 +459,8 @@ pub(crate) async fn complete_hermes(
     request_id: Uuid,
 ) -> Result<(super::dto::QaRun, Uuid)> {
     let mut tx = pool.begin().await.context("begin Hermes QA completion")?;
-    let run = sqlx::query_as::<_, (String, bool, String, Option<DateTime<Utc>>, String)>(
-        "SELECT suite,live,status,started_at,deployment_commit FROM nblb.qa_runs WHERE id=$1 FOR UPDATE",
+    let run = sqlx::query_as::<_, (String, bool, String, String, Option<DateTime<Utc>>, String)>(
+        "SELECT suite,live,provider_identity,status,started_at,deployment_commit FROM nblb.qa_runs WHERE id=$1 FOR UPDATE",
     )
     .bind(run_id)
     .fetch_optional(&mut *tx)
@@ -458,10 +470,10 @@ pub(crate) async fn complete_hermes(
     if run.0 != "hermes-e2e" {
         bail!("QA run is not a Hermes E2E run")
     }
-    if !run.1 {
-        bail!("Hermes QA completion requires a live run")
+    if !run.1 || run.2 != "nvidia_hosted" {
+        bail!("Hermes QA completion requires NVIDIA hosted live evidence")
     }
-    if run.2 == "passed" && input.status == "passed" {
+    if run.3 == "passed" && input.status == "passed" {
         let generation = input
             .generation
             .context("passed Hermes QA requires generation")?;
@@ -489,11 +501,11 @@ pub(crate) async fn complete_hermes(
         }
     }
     let recovering_committed =
-        run.2 == "failed" && input.status == "passed" && input.reconcile_committed;
-    if run.2 != "running" && !recovering_committed {
+        run.3 == "failed" && input.status == "passed" && input.reconcile_committed;
+    if run.3 != "running" && !recovering_committed {
         bail!("Hermes QA run is not running")
     }
-    let started_at = run.3.context("Hermes QA run has no start time")?;
+    let started_at = run.4.context("Hermes QA run has no start time")?;
 
     if input.status == "failed" {
         sqlx::query(
@@ -544,7 +556,7 @@ pub(crate) async fn complete_hermes(
         .app_commit
         .as_deref()
         .context("passed Hermes QA requires app_commit")?;
-    if app_commit != run.4 || app_commit != crate::BUILD_COMMIT {
+    if app_commit != run.5 || app_commit != crate::BUILD_COMMIT {
         bail!("Hermes QA app commit does not match the active deployment")
     }
     let client = sqlx::query_as::<_, (String, bool, DateTime<Utc>, Option<DateTime<Utc>>)>(
@@ -2004,10 +2016,15 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations/sqlx")]
     async fn hermes_completion_revalidates_requests_and_closes_every_case(pool: sqlx::PgPool) {
         let request_id = Uuid::new_v4();
-        let (run, _) =
-            super::super::admin_repository::create_qa_run(&pool, "hermes-e2e", true, request_id)
-                .await
-                .expect("create Hermes QA run");
+        let (run, _) = super::super::admin_repository::create_qa_run(
+            &pool,
+            "hermes-e2e",
+            true,
+            super::super::admin_repository::QaProviderIdentity::NvidiaHosted,
+            request_id,
+        )
+        .await
+        .expect("create Hermes QA run");
         let started_at = Utc::now();
         sqlx::query("UPDATE nblb.qa_runs SET status='running',started_at=$2 WHERE id=$1")
             .bind(run.id)
@@ -2125,6 +2142,7 @@ mod tests {
             &pool,
             "hermes-e2e",
             true,
+            super::super::admin_repository::QaProviderIdentity::NvidiaHosted,
             Uuid::new_v4(),
         )
         .await
@@ -2174,6 +2192,7 @@ mod tests {
             &pool,
             "persistence",
             false,
+            super::super::admin_repository::QaProviderIdentity::Fake,
             Uuid::new_v4(),
         )
         .await
@@ -2201,6 +2220,7 @@ mod tests {
             &pool,
             "persistence",
             false,
+            super::super::admin_repository::QaProviderIdentity::Fake,
             Uuid::new_v4(),
         )
         .await
@@ -2231,7 +2251,7 @@ mod tests {
     async fn completion_uses_all_history_and_separates_latest_failure(pool: sqlx::PgPool) {
         for suite in super::REQUIRED_SUITES {
             sqlx::query(
-                "INSERT INTO nblb.qa_runs(suite,live,deployment_commit,status,created_at,started_at,finished_at) VALUES($1,true,$2,'passed',now()-interval '2 hours',now()-interval '2 hours',now()-interval '2 hours')",
+                "INSERT INTO nblb.qa_runs(suite,live,provider_identity,deployment_commit,status,created_at,started_at,finished_at) VALUES($1,true,'nvidia_hosted',$2,'passed',now()-interval '2 hours',now()-interval '2 hours',now()-interval '2 hours')",
             )
             .bind(suite)
             .bind(crate::BUILD_COMMIT)
@@ -2241,7 +2261,7 @@ mod tests {
         }
         for seconds in 1_i32..=55 {
             sqlx::query(
-                "INSERT INTO nblb.qa_runs(suite,live,deployment_commit,status,created_at,started_at,finished_at) VALUES('smoke',true,$1,'failed',now()-make_interval(secs => $2),now()-make_interval(secs => $2),now()-make_interval(secs => $2))",
+                "INSERT INTO nblb.qa_runs(suite,live,provider_identity,deployment_commit,status,created_at,started_at,finished_at) VALUES('smoke',true,'nvidia_hosted',$1,'failed',now()-make_interval(secs => $2),now()-make_interval(secs => $2),now()-make_interval(secs => $2))",
             )
             .bind(crate::BUILD_COMMIT)
             .bind(seconds)

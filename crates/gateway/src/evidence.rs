@@ -12,6 +12,7 @@ use super::{
 
 const ROLLUP_BATCH_SIZE: i64 = 500;
 const OPERATIONS_MAINTENANCE_LOCK_KEY: i64 = 0x4e42_4c42_4f50_534d;
+const AUDIT_AND_QA_RETENTION_DAYS: i32 = 180;
 const PERMIT_RELEASE_RETRY_INITIAL: Duration = Duration::from_millis(25);
 const PERMIT_RELEASE_RETRY_MAX: Duration = Duration::from_secs(5);
 
@@ -715,6 +716,17 @@ impl VaultStore {
         .await
         .context("load operations retention settings")?;
         let mut deleted = 0_u64;
+        deleted = deleted.saturating_add(
+            sqlx::query(
+                "DELETE FROM nblb.proxy_requests WHERE finished_at IS NOT NULL AND ((rolled_up_at IS NOT NULL AND started_at < now() - make_interval(days=>$1)) OR (rolled_up_at IS NULL AND started_at < now() - make_interval(days=>$2)))",
+            )
+            .bind(request_days)
+            .bind(metric_days)
+            .execute(&mut *tx)
+            .await
+            .context("expire terminal proxy requests at their evidence horizon")?
+            .rows_affected(),
+        );
         for (statement, days) in [
             (
                 "DELETE FROM nblb.downstream_request_permits WHERE released_at IS NOT NULL AND acquired_at < now() - make_interval(days=>$1)",
@@ -722,10 +734,6 @@ impl VaultStore {
             ),
             (
                 "DELETE FROM nblb.request_attempts WHERE finished_at IS NOT NULL AND created_at < now() - make_interval(days=>$1)",
-                request_days,
-            ),
-            (
-                "DELETE FROM nblb.proxy_requests WHERE finished_at IS NOT NULL AND started_at < now() - make_interval(days=>$1) AND rolled_up_at IS NOT NULL",
                 request_days,
             ),
             (
@@ -742,11 +750,11 @@ impl VaultStore {
             ),
             (
                 "DELETE FROM nblb.audit_events WHERE created_at < now() - make_interval(days=>$1)",
-                metric_days,
+                AUDIT_AND_QA_RETENTION_DAYS,
             ),
             (
                 "DELETE FROM nblb.qa_runs WHERE finished_at IS NOT NULL AND created_at < now() - make_interval(days=>$1)",
-                metric_days,
+                AUDIT_AND_QA_RETENTION_DAYS,
             ),
         ] {
             deleted = deleted.saturating_add(
@@ -1282,6 +1290,50 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed unrolled request");
+        let metric_horizon_unrolled_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO nblb.proxy_requests(request_id,endpoint,profile_id,stream,modality,outcome,status_code,duration_ms,started_at,finished_at) VALUES ($1,'/v1/chat/completions','z-ai/glm-5.2',false,'text','succeeded',200,10,now()-interval '91 days',now()-interval '91 days')",
+        )
+        .bind(metric_horizon_unrolled_id)
+        .execute(&pool)
+        .await
+        .expect("seed metric-horizon unrolled request");
+        let recent_audit_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.audit_events(action,resource_kind,outcome,created_at) VALUES('retention.test','test','succeeded',now()-interval '91 days') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed recent audit");
+        let expired_audit_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.audit_events(action,resource_kind,outcome,created_at) VALUES('retention.test','test','succeeded',now()-interval '181 days') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed expired audit");
+        let recent_qa_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.qa_runs(suite,live,status,created_at,started_at,finished_at) VALUES('smoke',false,'failed',now()-interval '91 days',now()-interval '91 days',now()-interval '91 days') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed recent terminal QA run");
+        let expired_qa_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.qa_runs(suite,live,status,created_at,started_at,finished_at) VALUES('smoke',false,'failed',now()-interval '181 days',now()-interval '181 days',now()-interval '181 days') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed expired terminal QA run");
+        let recent_probe_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.probe_runs(kind,status,created_at,started_at,finished_at) VALUES('catalog','failed',now()-interval '89 days',now()-interval '89 days',now()-interval '89 days') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed recent completed probe");
+        let expired_probe_id = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO nblb.probe_runs(kind,status,created_at,started_at,finished_at) VALUES('catalog','failed',now()-interval '91 days',now()-interval '91 days',now()-interval '91 days') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("seed expired completed probe");
         store
             .apply_operations_retention()
             .await
@@ -1296,6 +1348,31 @@ mod tests {
             .expect("count preserved request"),
             1
         );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM nblb.proxy_requests WHERE request_id=$1"
+            )
+            .bind(metric_horizon_unrolled_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count metric-horizon request"),
+            0
+        );
+        for (table, recent_id, expired_id) in [
+            ("audit_events", recent_audit_id, expired_audit_id),
+            ("qa_runs", recent_qa_id, expired_qa_id),
+            ("probe_runs", recent_probe_id, expired_probe_id),
+        ] {
+            let counts = sqlx::query_as::<_, (i64, i64)>(&format!(
+                "SELECT count(*) FILTER (WHERE id=$1),count(*) FILTER (WHERE id=$2) FROM nblb.{table}"
+            ))
+            .bind(recent_id)
+            .bind(expired_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count retention boundary rows");
+            assert_eq!(counts, (1, 0), "unexpected {table} retention boundary");
+        }
         sqlx::query("UPDATE nblb.proxy_requests SET rolled_up_at=now() WHERE request_id=$1")
             .bind(unrolled_id)
             .execute(&pool)

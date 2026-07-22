@@ -5,7 +5,16 @@ import { adminErrorMessage, api, displayTime, startPolling } from "$lib/api";
 import DataState from "$lib/components/DataState.svelte";
 import PageHeader from "$lib/components/PageHeader.svelte";
 import StatusBadge from "$lib/components/StatusBadge.svelte";
-import type { Page, Upstream } from "$lib/types";
+import {
+  credentialProbeNextAction,
+  isCredentialProbeFailure,
+  isProfileProbeFailure,
+  parseCredentialProbeMutation,
+  parseProfileProbeResponse,
+  probeErrorClass,
+  withoutProbeResult,
+} from "$lib/operations";
+import type { Page, ProbeRun, Upstream } from "$lib/types";
 
 const profiles = [
   "z-ai/glm-5.2",
@@ -32,7 +41,9 @@ let items = $state<Upstream[]>([]),
   credential = $state(""),
   busy = $state("");
 let selected = $state<Record<string, string[]>>({}),
-  confirmed = $state<Record<string, boolean>>({});
+  confirmed = $state<Record<string, boolean>>({}),
+  credentialProbeResults = $state<Record<string, ProbeRun>>({}),
+  profileProbeResults = $state<Record<string, ProbeRun[]>>({});
 async function load(): Promise<void> {
   loading = items.length === 0;
   if (!items.length) queryError = "";
@@ -72,10 +83,7 @@ async function create(): Promise<void> {
     busy = "";
   }
 }
-async function action(
-  item: Upstream,
-  name: "probe" | "enable" | "disable" | "retire",
-): Promise<void> {
+async function action(item: Upstream, name: "enable" | "disable" | "retire"): Promise<void> {
   if (name === "retire" && !confirm(`${item.label}을 영구 폐기할까요? 과거 evidence는 보존됩니다.`))
     return;
   busy = `${item.id}:${name}`;
@@ -87,6 +95,32 @@ async function action(
     await load();
   } catch (e) {
     actionError = adminErrorMessage(e, "Upstream 작업에 실패했습니다.");
+  } finally {
+    busy = "";
+  }
+}
+async function probeCredential(item: Upstream): Promise<void> {
+  busy = `${item.id}:probe`;
+  actionError = "";
+  notice = "";
+  credentialProbeResults = withoutProbeResult(credentialProbeResults, item.id);
+  try {
+    const value = await api<unknown>(
+      `/upstreams/${item.id}/probe`,
+      { method: "POST" },
+      [422],
+      (payload) => isCredentialProbeFailure(payload, item.id),
+    );
+    const mutation = parseCredentialProbeMutation(value, item.id);
+    credentialProbeResults = { ...credentialProbeResults, [item.id]: mutation.item };
+    if (mutation.item.status === "passed") {
+      notice = `SLOT ${item.slot_no} · ${item.label}: credential 검증 완료`;
+    } else {
+      actionError = `SLOT ${item.slot_no} · ${item.label}: credential 검증 실패. 저장된 evidence를 확인하세요.`;
+    }
+    await load();
+  } catch (e) {
+    actionError = adminErrorMessage(e, "Credential probe에 실패했습니다.");
   } finally {
     busy = "";
   }
@@ -107,15 +141,28 @@ async function probeProfiles(item: Upstream): Promise<void> {
   busy = `${item.id}:profiles`;
   actionError = "";
   notice = "";
+  profileProbeResults = withoutProbeResult(profileProbeResults, item.id);
   try {
-    await api(`/upstreams/${item.id}/probe-profiles`, {
-      method: "POST",
-      body: JSON.stringify({
-        profile_ids: profileIds,
-        confirm_billable: needsBilling,
-      }),
-    });
-    notice = `${item.label}: ${profileIds.length}개 profile proof 완료`;
+    const value = await api<unknown>(
+      `/upstreams/${item.id}/probe-profiles`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          profile_ids: profileIds,
+          confirm_billable: needsBilling,
+        }),
+      },
+      [422],
+      (payload) => isProfileProbeFailure(payload, item.id, profileIds),
+    );
+    const evidence = parseProfileProbeResponse(value, item.id, profileIds);
+    const runs = evidence.runs;
+    profileProbeResults = { ...profileProbeResults, [item.id]: runs };
+    if (runs.some((run) => run.status !== "passed")) {
+      actionError = `${item.label}: ${evidence.failedProfile ?? "선택한 profile"} 검증에 실패했습니다. slot의 probe evidence를 확인하세요.`;
+    } else {
+      notice = `${item.label}: ${profileIds.length}개 profile proof 완료`;
+    }
     await load();
   } catch (e) {
     actionError = adminErrorMessage(e, "Profile probe에 실패했습니다.");
@@ -249,7 +296,7 @@ onMount(() => {
           <div class="actions">
             {#if !item.verified}<button
                 class="primary"
-                onclick={() => void action(item, "probe")}
+                onclick={() => void probeCredential(item)}
                 disabled={busy !== ""}
                 >{busy === `${item.id}:probe`
                   ? "검증 중…"
@@ -266,6 +313,23 @@ onMount(() => {
               disabled={busy !== ""}>폐기</button
             >
           </div>
+          {#if credentialProbeResults[item.id]}{@const run = credentialProbeResults[item.id]}
+            <section
+              class="probe-evidence"
+              aria-label={`SLOT ${item.slot_no} ${item.label} credential probe evidence`}
+              aria-live="polite"
+            >
+              <h3>방금 실행한 credential probe</h3>
+              <dl class="probe-facts">
+                <div><dt>대상</dt><dd>SLOT {item.slot_no} · {item.label}</dd></div>
+                <div><dt>상태</dt><dd>{run.status}</dd></div>
+                <div><dt>HTTP</dt><dd>{run.status_code ?? "—"}</dd></div>
+                <div><dt>오류 분류</dt><dd><code>{probeErrorClass(run)}</code></dd></div>
+              </dl>
+              <p>{credentialProbeNextAction(run)}</p>
+              <a href={`${base}/probes`}>전체 probe evidence</a>
+            </section>
+          {/if}
           <details open={item.verified && !hasRoutingProof(item)}>
             <summary
               >2. Profile proof 선택 <small
@@ -307,6 +371,23 @@ onMount(() => {
                   : "선택 profile 검증"}</button
               >
             </fieldset>
+            {#if (profileProbeResults[item.id] ?? []).length}<section
+                class="probe-evidence"
+                aria-label={`${item.label} 방금 실행한 profile probe evidence`}
+                aria-live="polite"
+              >
+                <h3>방금 실행한 probe evidence</h3>
+                <ul>
+                  {#each profileProbeResults[item.id] ?? [] as run (run.id)}<li>
+                      <strong>{run.profile_id ?? "credential"}</strong>
+                      <span
+                        >{run.status}{run.status_code
+                          ? ` · HTTP ${run.status_code}`
+                          : ""}{run.error_class ? ` · ${run.error_class}` : ""}</span
+                      >
+                    </li>{/each}
+                </ul>
+              </section>{/if}
           </details>{:else}<h2>비어 있음</h2>
           <span>위 폼에서 credential을 저장하세요.</span>{/if}
       </article>{/each}
@@ -347,6 +428,36 @@ onMount(() => {
   .slot {
     color: #8fc63e;
     font-weight: 900;
+  }
+  .probe-evidence {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid #3f4743;
+  }
+  .probe-evidence h3 {
+    margin: 0 0 8px;
+    font-size: 1rem;
+  }
+  .probe-evidence ul {
+    margin: 0;
+    padding-left: 20px;
+  }
+  .probe-evidence li span {
+    display: block;
+    color: #aeb7b2;
+    overflow-wrap: anywhere;
+  }
+  .probe-facts {
+    margin: 0;
+  }
+  .probe-facts dd {
+    overflow-wrap: anywhere;
+  }
+  .probe-evidence a {
+    display: inline-flex;
+    min-height: 44px;
+    align-items: center;
+    color: #c9f28e;
   }
   .title {
     display: flex;

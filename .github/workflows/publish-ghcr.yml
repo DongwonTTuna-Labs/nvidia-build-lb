@@ -15,6 +15,21 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: nblb-publish-ci-only
+          POSTGRES_DB: nblb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d nblb"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:nblb-publish-ci-only@127.0.0.1:5432/nblb
     outputs:
       app_registry_digest: ${{ steps.publish.outputs.app_registry_digest }}
       postgres_registry_digest: ${{ steps.publish.outputs.postgres_registry_digest }}
@@ -34,9 +49,10 @@ jobs:
       - name: Verify Rust and Svelte source
         run: |
           cargo fmt --all -- --check
-          cargo test --workspace
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --locked --workspace
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           bun install --cwd apps/admin --frozen-lockfile --ignore-scripts --no-progress
+          bun run --cwd apps/admin test
           bun run --cwd apps/admin check
           bun run --cwd apps/admin format
           bun run --cwd apps/admin knip

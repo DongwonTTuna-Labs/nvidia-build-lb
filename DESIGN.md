@@ -100,7 +100,9 @@ Admin v2 overview는 다음 필드를 명시적으로 갖는다. 각 nullable �
 - `profiles`: catalogued, advertised, proven, available
 - `clients`: active_count
 - `qa`: required, passed, complete (현재 app deployment commit의 live suite만 집계)
-- `recent`: last_nvidia_success_at, last_hermes_e2e_at (nullable)
+- `recent`: last_nvidia_success_at, last_hermes_e2e_at (nullable). The legacy
+  `last_nvidia_success_at` wire name records any configured upstream success, so the UI labels it
+  `Upstream 성공`; NVIDIA-specific completion authority comes only from hosted-provider live QA.
 - `metrics_24h`: sample_count와 nullable success/failover/latency/TTFB
 - `primary_action`: severity, code, title, reason, label, href (nullable)
 - `attention_count`
@@ -222,6 +224,7 @@ type QaCase = { id: Uuid; name: string; status: "pending" | "running" | "passed"
   started_at: Timestamp | null; finished_at: Timestamp | null };
 type QaRun = { id: Uuid; suite: "smoke" | "distribution" | "failover" |
   "persistence" | "multimodal" | "hermes-e2e"; live: boolean;
+  provider_identity: "fake" | "nvidia_hosted" | "unverified";
   deployment_commit: string;
   status: "queued" | "running" | "passed" | "failed" | "cancelled";
   created_at: Timestamp; started_at: Timestamp | null; finished_at: Timestamp | null;
@@ -249,8 +252,11 @@ returns `{snapshot:Snapshot,items:AdminModel[],discovered_count:number}`; model 
 never path-decoded. `GET /models` returns `Page<AdminModel>`. Incident create is
 `{slug,title,status,severity,public,public_message}`, patch accepts title/status/severity/public,
 incident update is `{status,public_message}`. QA create is `{suite,live,confirm_billable}`.
-`hermes-e2e`는 `live:true`만 허용하며 fake run은 API와 DB 양쪽에서 거부한다. queued 또는
-running QA run은 전체 DB에서 하나만 존재할 수 있고, 경합한 create는 409
+`hermes-e2e`는 `live:true`만 허용하며 fake run은 API와 DB 양쪽에서 거부한다. 모든 QA
+run은 `provider_identity`를 `fake` 또는 `nvidia_hosted`로 저장한다. canonical
+NVIDIA/NVCF HTTPS origin을 검증한 handler와 runner만 `nvidia_hosted`를 기록할 수 있고,
+기존 `unverified` live history와 fake run은 current-deployment completion에서 제외한다.
+queued 또는 running QA run은 전체 DB에서 하나만 존재할 수 있고, 경합한 create는 409
 `qa_run_active`와 `details.active_run_id`를 반환한다. `GET /qa/runs`는 `limit=1..100`과
 opaque `before` cursor를 받아 `{snapshot,items,next_before}` keyset page를 반환한다.
 invalid cursor는 422이며 case는 page별 batch load해 N+1 query를 만들지 않는다. current

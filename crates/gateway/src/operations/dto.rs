@@ -501,6 +501,7 @@ pub(crate) struct QaRun {
     pub(crate) id: Uuid,
     pub(crate) suite: String,
     pub(crate) live: bool,
+    pub(crate) provider_identity: String,
     pub(crate) deployment_commit: String,
     pub(crate) status: String,
     pub(crate) created_at: DateTime<Utc>,

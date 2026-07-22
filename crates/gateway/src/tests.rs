@@ -1,5 +1,5 @@
 use super::admin::{PageCursor, PageQuery, encode_page_cursor, page_before};
-use super::provider::upstream_endpoint;
+use super::provider::{live_qa_provider_is_canonical, upstream_endpoint};
 use super::proxy::{parse_multimodal_request, validate_chat_request};
 use super::request_id::{assign_request_id, enforce_admin_boundary};
 use super::{
@@ -195,6 +195,22 @@ fn modality_paths_replace_only_the_endpoint_suffix() {
         ),
         "https://provider.example/v1/images/generations"
     );
+}
+
+#[test]
+fn live_qa_accepts_only_canonical_nvidia_provider_origins() {
+    assert!(live_qa_provider_is_canonical(
+        "https://integrate.api.nvidia.com/v1/chat/completions"
+    ));
+    for rejected in [
+        "mock://provider",
+        "http://integrate.api.nvidia.com/v1/chat/completions",
+        "https://provider.example/v1/chat/completions",
+        "https://integrate.api.nvidia.com.evil.example/v1/chat/completions",
+        "https://user@integrate.api.nvidia.com/v1/chat/completions",
+    ] {
+        assert!(!live_qa_provider_is_canonical(rejected), "{rejected}");
+    }
 }
 
 #[test]
@@ -1267,6 +1283,20 @@ async fn stale_profile_proof_is_unavailable_across_health_public_and_admin(pool:
         database_test_state(&pool, &directory.path().join("vault.json"), owner_id).await,
     );
     assert_eq!(select_initial_key(&state, "z-ai/glm-5.2").await, None);
+    sqlx::query(
+        "UPDATE nblb.profile_probe_receipts SET invalidated_at=now(),invalidation_reason='provider_auth_rejected' WHERE profile_id='z-ai/glm-5.2' AND key_id=$1",
+    )
+    .bind(key_id)
+    .execute(&pool)
+    .await
+    .expect("invalidate legacy proof projection");
+    assert!(
+        crate::admin::profile_proof_keys(&state)
+            .await
+            .expect("load legacy valid proofs")
+            .get("z-ai/glm-5.2")
+            .is_none_or(|keys| !keys.contains(&key_id))
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT generation FROM nblb.routing_state WHERE profile_id='z-ai/glm-5.2'",
@@ -1433,6 +1463,76 @@ async fn qa_admin_api_enforces_live_hermes_single_flight_and_cursor_contract(poo
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body: serde_json::Value = test::read_body_json(response).await;
     assert_eq!(body["error"]["code"], "invalid_page_cursor");
+}
+
+#[sqlx::test(migrations = "../../migrations/sqlx")]
+async fn qa_admin_rejects_live_mock_but_accepts_explicit_fake_identity(pool: sqlx::PgPool) {
+    let directory = tempfile::tempdir().expect("QA provider identity vault directory");
+    let state = web::Data::new(
+        database_test_state(&pool, &directory.path().join("vault.json"), Uuid::new_v4()).await,
+    );
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .configure(crate::operations::admin::routes),
+    )
+    .await;
+
+    let live_mock = TestRequest::post()
+        .uri("/admin/api/v2/qa/runs")
+        .insert_header((header::HOST, "localhost:2456"))
+        .insert_header((header::AUTHORIZATION, "Bearer test-admin"))
+        .set_json(serde_json::json!({
+            "suite":"distribution",
+            "live":true,
+            "confirm_billable":false
+        }))
+        .to_request();
+    let response = test::call_service(&app, live_mock).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["error"]["code"], "live_nvidia_provider_required");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.qa_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count rejected live mock runs"),
+        0
+    );
+
+    let fake_mock = TestRequest::post()
+        .uri("/admin/api/v2/qa/runs")
+        .insert_header((header::HOST, "localhost:2456"))
+        .insert_header((header::AUTHORIZATION, "Bearer test-admin"))
+        .set_json(serde_json::json!({
+            "suite":"distribution",
+            "live":false,
+            "confirm_billable":false
+        }))
+        .to_request();
+    let response = test::call_service(&app, fake_mock).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["item"]["provider_identity"], "fake");
+    assert_eq!(body["item"]["live"], false);
+    let run_id =
+        Uuid::parse_str(body["item"]["id"].as_str().expect("fake run ID")).expect("fake run UUID");
+    let terminal_status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM nblb.qa_runs WHERE id=$1")
+                .bind(run_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load fake run status");
+            if matches!(status.as_str(), "passed" | "failed" | "cancelled") {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake QA runner must reach a terminal state before the test database closes");
+    assert_eq!(terminal_status, "failed");
 }
 
 async fn mock_runtime_test_state(
@@ -2953,7 +3053,7 @@ async fn real_http_provider_matrix_crosses_transport_and_evidence_boundaries(poo
     .await
     .expect("load fixture downstream client");
     let run_id = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO nblb.qa_runs(suite,live,status,started_at,deployment_commit) VALUES('failover',true,'running',now(),$1) RETURNING id",
+        "INSERT INTO nblb.qa_runs(suite,live,provider_identity,status,started_at,deployment_commit) VALUES('failover',true,'nvidia_hosted','running',now(),$1) RETURNING id",
     )
     .bind(crate::BUILD_COMMIT)
     .fetch_one(&pool)

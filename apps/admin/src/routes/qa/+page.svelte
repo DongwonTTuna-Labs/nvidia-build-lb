@@ -505,7 +505,11 @@ onMount(() => {
                 >{suites.find((suite) => suite.id === run.suite)?.title ??
                   run.suite}</strong
               ><small
-                >{run.live ? "LIVE" : "FAKE"} · {displayTime(
+                >{run.live
+                  ? run.provider_identity === "nvidia_hosted"
+                    ? "LIVE · NVIDIA HOSTED"
+                    : "LIVE · 출처 미검증"
+                  : "FAKE"} · {displayTime(
                   run.finished_at ?? run.created_at,
                 )}</small
               ></span
@@ -585,7 +589,13 @@ onMount(() => {
   <section class="run" aria-live="polite">
     <div class="run-head">
       <div>
-        <p>{current.suite} · {current.live ? "LIVE" : "FAKE"}</p>
+        <p>
+          {current.suite} · {current.live
+            ? current.provider_identity === "nvidia_hosted"
+              ? "LIVE · NVIDIA HOSTED"
+              : "LIVE · 출처 미검증"
+            : "FAKE"}
+        </p>
         <h2>{current.id}</h2>
         <small
           >시작 {displayTime(current.started_at ?? current.created_at)} · 종료 {displayTime(

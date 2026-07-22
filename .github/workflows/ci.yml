@@ -57,6 +57,7 @@ jobs:
         run: |
           bun install --cwd apps/admin --frozen-lockfile --ignore-scripts --no-progress
           bun install --cwd apps/public --frozen-lockfile --ignore-scripts --no-progress
+          bun run --cwd apps/admin test
           bun run --cwd apps/admin check
           bun run --cwd apps/admin format
           bun run --cwd apps/admin knip
@@ -71,6 +72,8 @@ jobs:
           docker build --pull --file docker/postgres.Dockerfile --tag nvidia-build-lb-postgres:ci .
       - name: Run independent-stack Compose smoke
         env:
+          NBLB_CI_APP_IMAGE: nvidia-build-lb:ci
+          NBLB_CI_POSTGRES_IMAGE: nvidia-build-lb-postgres:ci
           NBLB_APP_REGISTRY_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           NBLB_POSTGRES_REGISTRY_DIGEST: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           NBLB_SECRET_DIR: /tmp/nblb-ci-secrets
@@ -128,6 +131,8 @@ jobs:
       - name: Clean Compose smoke resources
         if: always()
         env:
+          NBLB_CI_APP_IMAGE: nvidia-build-lb:ci
+          NBLB_CI_POSTGRES_IMAGE: nvidia-build-lb-postgres:ci
           NBLB_APP_REGISTRY_DIGEST: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           NBLB_POSTGRES_REGISTRY_DIGEST: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
           NBLB_SECRET_DIR: /tmp/nblb-ci-secrets
