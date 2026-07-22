@@ -5,8 +5,10 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
+use std::collections::HashSet;
 use uuid::Uuid;
 
+use super::audio_probe::{transcription_probe_matches, transcription_probe_wav};
 use super::repository as public_repository;
 use super::{
     admin_repository as repository,
@@ -1475,13 +1477,11 @@ async fn execute_profile_probe_inner(
         })),
         "/v1/chat/completions" => builder.json(&json!({"model":spec.id,"messages":[{"role":"user","content":"Reply OK"}],"max_tokens":2,"stream":false})),
         "/v1/embeddings" => builder.json(&json!({"model":spec.id,"input":["probe"],"encoding_format":"float"})),
-        "/v1/images/generations" => builder.json(&json!({"prompt":"a green square","image":null,"aspect_ratio":"1:1","samples":1})),
+        "/v1/images/generations" => builder.json(&flux_profile_probe_payload()),
         "/v1/videos/generations" => builder.json(&json!({"image":tiny_png,"seed":0,"cfg_scale":1.8,"motion_bucket_id":127})),
         "/v1/audio/speech" => builder.json(&json!({"model":spec.id,"input":"OK","voice":"Magpie-Multilingual.EN-US.Aria","response_format":"wav"})),
         "/v1/audio/transcriptions" => {
-            let wav = vec![
-                b'R',b'I',b'F',b'F',36,0,0,0,b'W',b'A',b'V',b'E',b'f',b'm',b't',b' ',16,0,0,0,1,0,1,0,64,31,0,0,128,62,0,0,2,0,16,0,b'd',b'a',b't',b'a',0,0,0,0,
-            ];
+            let wav = transcription_probe_wav().map_err(|_|(None,"probe_fixture_invalid"))?;
             let part = reqwest::multipart::Part::bytes(wav).file_name("probe.wav").mime_str("audio/wav").map_err(|_|(None,"probe_fixture_invalid"))?;
             builder.multipart(reqwest::multipart::Form::new().text("model",spec.id.to_owned()).part("file",part))
         }
@@ -1526,6 +1526,9 @@ async fn execute_profile_probe_inner(
             .next()
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
             && crate::validate_chat_response(&body, false).is_ok()
+    } else if spec.endpoint == "/v1/audio/transcriptions" {
+        crate::normalize_modality_response(spec.endpoint, &body, &content_type).is_ok()
+            && transcription_probe_matches(&body)
     } else {
         crate::normalize_modality_response(spec.endpoint, &body, &content_type).is_ok()
     };
@@ -1533,6 +1536,10 @@ async fn execute_profile_probe_inner(
         return Err((Some(status), "upstream_protocol_error"));
     }
     Ok(status)
+}
+
+fn flux_profile_probe_payload() -> serde_json::Value {
+    json!({"prompt":"a green square","aspect_ratio":"1:1","samples":1})
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1763,6 +1770,7 @@ async fn probe_upstream_profiles(
         return response;
     }
     if input.profile_ids.is_empty()
+        || input.profile_ids.iter().collect::<HashSet<_>>().len() != input.profile_ids.len()
         || input
             .profile_ids
             .iter()
@@ -1771,7 +1779,7 @@ async fn probe_upstream_profiles(
         return invalid(
             &req,
             "invalid_profile",
-            "profiles must contain supported model IDs.",
+            "profiles must contain distinct supported model IDs.",
         );
     }
     let billable = input.profile_ids.iter().any(|profile| {
@@ -2638,12 +2646,14 @@ async fn update_settings(
 mod tests {
     use super::{
         ClientPatch, ListQuery, NullablePatch, QaRunInput, RequestListQuery, decode_keyset_cursor,
-        keyset_page, owner_lease_attention, request_filters,
+        flux_profile_probe_payload, keyset_page, owner_lease_attention, request_filters,
+        transcription_probe_matches, transcription_probe_wav,
     };
     use actix_web::{http::StatusCode, test::TestRequest};
     use base64::Engine;
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
     #[test]
@@ -2659,6 +2669,54 @@ mod tests {
             before: None,
         };
         assert_eq!(query.limit, Some(50));
+    }
+
+    #[test]
+    fn transcription_probe_fixture_contains_spoken_hello_pcm() {
+        let wav = transcription_probe_wav().expect("decode embedded speech fixture");
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(
+            u16::from_le_bytes(wav[22..24].try_into().expect("WAV channel count")),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(wav[24..28].try_into().expect("WAV sample rate")),
+            16_000
+        );
+        assert_eq!(
+            u16::from_le_bytes(wav[34..36].try_into().expect("WAV bit depth")),
+            16
+        );
+        assert_eq!(
+            u32::from_le_bytes(wav[40..44].try_into().expect("WAV data size")),
+            17_584
+        );
+        assert_eq!(wav.len(), 17_628);
+        assert_eq!(
+            hex::encode(Sha256::digest(&wav)),
+            "61253e48feb239953e971f3785c57f3707c1bdd51de68be2e6c19f61be8aadfa"
+        );
+        assert!(wav[44..].chunks_exact(2).any(|sample| sample != [0, 0]));
+    }
+
+    #[test]
+    fn transcription_probe_requires_the_expected_spoken_token() {
+        assert!(transcription_probe_matches(br#"{"text":"Hello."}"#));
+        assert!(transcription_probe_matches(br#"{"text":"HELLO there"}"#));
+        assert!(!transcription_probe_matches(br#"{"text":""}"#));
+        assert!(!transcription_probe_matches(br#"{"text":"yellow"}"#));
+        assert!(!transcription_probe_matches(br#"{"text":"unrelated"}"#));
+    }
+
+    #[test]
+    fn flux_profile_probe_uses_the_text_to_image_payload_shape() {
+        let payload = flux_profile_probe_payload();
+        assert_eq!(payload["prompt"], "a green square");
+        assert_eq!(payload["aspect_ratio"], "1:1");
+        assert_eq!(payload["samples"], 1);
+        assert!(payload.get("image").is_none());
     }
 
     #[test]

@@ -5,8 +5,8 @@ use super::request_id::{assign_request_id, enforce_admin_boundary};
 use super::{
     AppState, PROFILES, SseValidator, VaultStore, admin_host_allowed,
     admin_surface_allowed_for_port, bearer, eligible_key_count, format_origin_host,
-    host_authority_well_formed, inline_script_bodies, mock_mp4, mock_wav, openai_error,
-    operations_error, percent_encode_userinfo, poll_nvcf, routes, select_initial_key,
+    host_authority_well_formed, inline_script_bodies, mock_chat_content, mock_mp4, mock_wav,
+    openai_error, operations_error, percent_encode_userinfo, poll_nvcf, routes, select_initial_key,
     should_migrate_file_vault, upstream_endpoint_for, validate_admin_token, validate_chat_response,
 };
 use actix_web::http::{Method, StatusCode, header};
@@ -37,6 +37,16 @@ async fn pr1_openai_error() -> HttpResponse {
         "service_unavailable_error",
         "no_eligible_upstream",
     )
+}
+
+#[test]
+fn mock_chat_transcribes_audio_without_changing_generic_chat_content() {
+    let audio = serde_json::json!({
+        "messages":[{"role":"user","content":[{"type":"audio_url","audio_url":{"url":"data:audio/wav;base64,fixture"}}]}]
+    });
+    let generic = serde_json::json!({"messages":[{"role":"user","content":"QA"}]});
+    assert_eq!(mock_chat_content(&audio), "hello");
+    assert_eq!(mock_chat_content(&generic), "NVIDIA Build LB");
 }
 
 #[test]
@@ -1515,6 +1525,87 @@ async fn model_probe_rejects_duplicate_upstreams_before_probe_and_audits_only_th
 }
 
 #[sqlx::test(migrations = "../../migrations/sqlx")]
+async fn profile_probe_rejects_duplicates_before_confirmation_provider_and_evidence(
+    pool: sqlx::PgPool,
+) {
+    let directory = tempfile::tempdir().expect("duplicate profile probe vault directory");
+    let state = web::Data::new(
+        database_test_state(&pool, &directory.path().join("vault.json"), Uuid::new_v4()).await,
+    );
+    let app = test::init_service(
+        App::new()
+            .wrap(from_fn(crate::request_id::audit_failed_admin_mutation))
+            .wrap(from_fn(assign_request_id))
+            .wrap(from_fn(enforce_admin_boundary))
+            .app_data(state)
+            .configure(crate::operations::admin::routes),
+    )
+    .await;
+    let upstream_id = Uuid::new_v4();
+    let before_audits = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.audit_events")
+        .fetch_one(&pool)
+        .await
+        .expect("count audit events before duplicate profile requests");
+
+    for (profile, confirm_billable) in [
+        ("z-ai/glm-5.2", false),
+        ("black-forest-labs/flux.1-kontext-dev", false),
+        ("black-forest-labs/flux.1-kontext-dev", true),
+    ] {
+        let request = TestRequest::post()
+            .uri(&format!(
+                "/admin/api/v2/upstreams/{upstream_id}/probe-profiles"
+            ))
+            .insert_header((header::HOST, "localhost:2456"))
+            .insert_header((header::AUTHORIZATION, "Bearer test-admin"))
+            .set_json(serde_json::json!({
+                "profile_ids":[profile, profile],
+                "confirm_billable":confirm_billable
+            }))
+            .to_request();
+        let response = test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "invalid_profile");
+    }
+
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.probe_runs")
+            .fetch_one(&pool)
+            .await
+            .expect("count probe runs after duplicate profile requests"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.profile_probe_receipts")
+            .fetch_one(&pool)
+            .await
+            .expect("count profile receipts after duplicate profile requests"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM nblb.audit_events")
+            .fetch_one(&pool)
+            .await
+            .expect("count audit events after duplicate profile requests"),
+        before_audits + 3
+    );
+    let failed_audits = sqlx::query_as::<_, (String, String, serde_json::Value)>(
+        "SELECT action,outcome,detail FROM nblb.audit_events ORDER BY id DESC LIMIT 3",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("load duplicate profile rejection audits");
+    assert_eq!(failed_audits.len(), 3);
+    assert!(failed_audits.iter().all(|(action, outcome, detail)| {
+        action == "upstream.probe-profiles"
+            && outcome == "failed"
+            && detail["http_status"] == 422
+            && detail["best_effort"] == true
+    }));
+}
+
+#[sqlx::test(migrations = "../../migrations/sqlx")]
 async fn qa_admin_api_enforces_live_hermes_single_flight_and_cursor_contract(pool: sqlx::PgPool) {
     let active_id = sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO nblb.qa_runs(suite,live,deployment_commit,status,started_at) VALUES('smoke',false,$1,'running',now()) RETURNING id",
@@ -2091,6 +2182,20 @@ async fn downstream_usage_increments_once_only_after_full_admission(pool: sqlx::
         test::call_service(&app, forbidden_model).await.status(),
         StatusCode::FORBIDDEN
     );
+    let forbidden_multimodal = TestRequest::post()
+        .uri("/v1/images/generations")
+        .insert_header((header::HOST, "localhost:2456"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {token}")))
+        .set_json(serde_json::json!({
+            "model":"black-forest-labs/flux.1-kontext-dev",
+            "prompt":"must not reach the provider",
+            "n":1
+        }))
+        .to_request();
+    let response = test::call_service(&app, forbidden_multimodal).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = test::read_body_json(response).await;
+    assert_eq!(body["error"]["code"], "model_not_allowed");
 
     sqlx::query("UPDATE nblb.downstream_credentials SET model_allowlist=NULL WHERE id=$1")
         .bind(client_id)

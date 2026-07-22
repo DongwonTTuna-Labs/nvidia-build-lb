@@ -2,6 +2,7 @@
 
 use actix_web::web;
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,10 @@ use std::{collections::HashSet, time::Duration};
 use uuid::Uuid;
 
 use crate::{AppState, PROFILES, VaultAuditMutation};
+
+use super::audio_probe::{
+    transcription_probe_matches, transcription_probe_wav, transcription_text_matches,
+};
 
 const HERMES_QA_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PERSISTENCE_QA_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -1331,7 +1336,11 @@ async fn send_suite_requests(suite: &str, token: &str, public_port: u16) -> Resu
         }
         "multimodal" => {
             let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
-            let wav_data = "data:audio/wav;base64,UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
+            let wav = transcription_probe_wav().context("decode speech QA fixture")?;
+            let wav_data = format!(
+                "data:audio/wav;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&wav)
+            );
             // One-second, 320x240 H.264/MP4 fixture. Unlike an ftyp-only
             // placeholder this contains a complete moov table and media samples.
             let mp4_data = QA_H264_MP4_DATA_URL;
@@ -1343,10 +1352,6 @@ async fn send_suite_requests(suite: &str, token: &str, public_port: u16) -> Resu
                 (
                     "/v1/chat/completions",
                     json!({"model":"microsoft/phi-4-multimodal-instruct","messages":[{"role":"user","content":[{"type":"text","text":"Describe"},{"type":"image_url","image_url":{"url":png}}]}],"max_tokens":2}),
-                ),
-                (
-                    "/v1/chat/completions",
-                    json!({"model":"microsoft/phi-4-multimodal-instruct","messages":[{"role":"user","content":[{"type":"text","text":"Transcribe"},{"type":"audio_url","audio_url":{"url":wav_data}}]}],"max_tokens":2}),
                 ),
                 (
                     "/v1/nvidia/inference",
@@ -1387,11 +1392,15 @@ async fn send_suite_requests(suite: &str, token: &str, public_port: u16) -> Resu
             ] {
                 send_json(&client, token, &format!("{base}{path}"), body, public_port).await?;
             }
-            let wav = vec![
-                b'R', b'I', b'F', b'F', 38, 0, 0, 0, b'W', b'A', b'V', b'E', b'f', b'm', b't',
-                b' ', 16, 0, 0, 0, 1, 0, 1, 0, 64, 31, 0, 0, 128, 62, 0, 0, 2, 0, 16, 0, b'd',
-                b'a', b't', b'a', 2, 0, 0, 0, 0, 0,
-            ];
+            let audio_chat = send_json(
+                &client,
+                token,
+                &format!("{base}/v1/chat/completions"),
+                json!({"model":"microsoft/phi-4-multimodal-instruct","messages":[{"role":"user","content":[{"type":"text","text":"Transcribe the audio and reply with the spoken word."},{"type":"audio_url","audio_url":{"url":wav_data}}]}],"max_tokens":8}),
+                public_port,
+            )
+            .await?;
+            validate_audio_chat_qa_response(&audio_chat)?;
             let form = reqwest::multipart::Form::new()
                 .text("model", "nvidia/parakeet-ctc-1.1b")
                 .part(
@@ -1412,11 +1421,36 @@ async fn send_suite_requests(suite: &str, token: &str, public_port: u16) -> Resu
             .send()
             .await
             .context("send transcription QA request")?;
-            require_success(response, "transcription").await?;
+            let body = require_success(response, "transcription").await?;
+            validate_transcription_qa_response(&body)?;
         }
         _ => bail!("unsupported traffic QA suite"),
     }
     Ok(())
+}
+
+fn validate_transcription_qa_response(body: &[u8]) -> Result<()> {
+    if transcription_probe_matches(body) {
+        Ok(())
+    } else {
+        bail!("transcription QA response did not contain the expected spoken token")
+    }
+}
+
+fn validate_audio_chat_qa_response(body: &[u8]) -> Result<()> {
+    let content = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/choices/0/message/content")?
+                .as_str()
+                .map(str::to_owned)
+        });
+    if content.is_some_and(|text| transcription_text_matches(&text)) {
+        Ok(())
+    } else {
+        bail!("audio chat QA response did not contain the expected spoken token")
+    }
 }
 
 async fn send_json(
@@ -1829,6 +1863,7 @@ mod tests {
         HermesCompletion, HermesRequestEvidence, PersistenceSnapshot, QA_H264_MP4_DATA_URL,
         SecretScanEvidence, close_interrupted_runs, combine_traffic_cleanup, complete_hermes,
         database_secret_matches, fail_running_run, local_qa_request, persistence_case,
+        validate_audio_chat_qa_response, validate_transcription_qa_response,
     };
     use base64::Engine as _;
     use chrono::{Duration, Utc};
@@ -1855,6 +1890,36 @@ mod tests {
                 .to_str()
                 .expect("ASCII local QA Host"),
             "127.0.0.1:43123"
+        );
+    }
+
+    #[test]
+    fn live_transcription_qa_requires_the_spoken_fixture_token() {
+        assert!(validate_transcription_qa_response(br#"{"text":"hello"}"#).is_ok());
+        assert!(validate_transcription_qa_response(br#"{"text":"Hello."}"#).is_ok());
+        assert!(validate_transcription_qa_response(br#"{"text":""}"#).is_err());
+        assert!(validate_transcription_qa_response(br#"{"text":"yellow"}"#).is_err());
+    }
+
+    #[test]
+    fn live_audio_chat_qa_requires_the_spoken_fixture_token() {
+        assert!(
+            validate_audio_chat_qa_response(br#"{"choices":[{"message":{"content":"hello"}}]}"#)
+                .is_ok()
+        );
+        assert!(
+            validate_audio_chat_qa_response(
+                br#"{"choices":[{"message":{"content":"The word is HELLO."}}]}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_audio_chat_qa_response(br#"{"choices":[{"message":{"content":""}}]}"#)
+                .is_err()
+        );
+        assert!(
+            validate_audio_chat_qa_response(br#"{"choices":[{"message":{"content":"yellow"}}]}"#)
+                .is_err()
         );
     }
 

@@ -2,6 +2,7 @@
 
 pub(crate) mod admin;
 pub(crate) mod admin_repository;
+mod audio_probe;
 pub(crate) mod dto;
 pub(crate) mod openapi;
 pub(crate) mod public;

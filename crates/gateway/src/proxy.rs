@@ -211,7 +211,7 @@ pub(crate) async fn chat_completions(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (mut evidence, first_key_id) = match RequestEvidence::start_selected(
+    let (mut evidence, first_key_id) = match RequestEvidence::admit_and_start_selected(
         state.clone(),
         request_id,
         downstream_credential_id,
@@ -1144,7 +1144,7 @@ pub(crate) async fn multimodal(
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(PROFILES[0]);
-    let (mut evidence, first_key_id) = match RequestEvidence::start_selected(
+    let (mut evidence, first_key_id) = match RequestEvidence::admit_and_start_selected(
         state.clone(),
         request_id,
         downstream_credential_id,

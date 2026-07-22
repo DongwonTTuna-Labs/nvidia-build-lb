@@ -2318,7 +2318,7 @@ fn mock_modality(path: &str, request: &Value) -> (Vec<u8>, &'static str) {
         }
         "/v1/audio/speech" => (mock_wav(), "audio/wav"),
         "/v1/audio/transcriptions" => (
-            serde_json::to_vec(&json!({"text":"NVIDIA Build LB","model":model}))
+            serde_json::to_vec(&json!({"text":"hello","model":model}))
                 .expect("mock transcription fixture is serializable"),
             "application/json",
         ),
@@ -2391,10 +2391,11 @@ fn mock_response(request: &Value, stream: bool) -> HttpResponse {
         .and_then(Value::as_str)
         .unwrap_or("z-ai/glm-5.2");
     let id = format!("chatcmpl-{}", Uuid::new_v4());
+    let content = mock_chat_content(request);
     if stream {
         let first = Bytes::from(format!(
             "data: {}\n\n",
-            json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":"NVIDIA Build LB"},"finish_reason":null}]})
+            json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":null}]})
         ));
         let terminal = Bytes::from(format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -2417,7 +2418,23 @@ fn mock_response(request: &Value, stream: bool) -> HttpResponse {
             .insert_header(("cache-control", "no-cache"))
             .streaming(body)
     } else {
-        HttpResponse::Ok().json(json!({"id":id,"object":"chat.completion","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":"NVIDIA Build LB"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":3,"total_tokens":3}}))
+        HttpResponse::Ok().json(json!({"id":id,"object":"chat.completion","model":model,"choices":[{"index":0,"message":{"role":"assistant","content":content},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":3,"total_tokens":3}}))
+    }
+}
+
+fn mock_chat_content(request: &Value) -> &'static str {
+    let has_audio = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("audio_url"));
+    if has_audio {
+        "hello"
+    } else {
+        "NVIDIA Build LB"
     }
 }
 
@@ -2438,9 +2455,10 @@ async fn mock_stream_response(
         .unwrap_or("z-ai/glm-5.2")
         .to_owned();
     let id = format!("chatcmpl-{}", Uuid::new_v4());
+    let content = mock_chat_content(request);
     let first = Bytes::from(format!(
         "data: {}\n\n",
-        json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":"NVIDIA Build LB"},"finish_reason":null}]})
+        json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":null}]})
     ));
     let terminal = Bytes::from(format!(
         "data: {}\n\ndata: [DONE]\n\n",

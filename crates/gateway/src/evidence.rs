@@ -107,7 +107,10 @@ pub(crate) struct RequestEvidence {
 }
 
 impl RequestEvidence {
-    pub(crate) async fn start_selected(
+    /// Applies the downstream model/RPM/daily/concurrency admission policy,
+    /// then persists the parent request and first provider attempt as one
+    /// fail-closed operation before any upstream traffic is sent.
+    pub(crate) async fn admit_and_start_selected(
         state: web::Data<AppState>,
         request_id: Uuid,
         downstream_credential_id: Option<Uuid>,
