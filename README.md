@@ -49,10 +49,13 @@ bun run --cwd apps/public build
 
 ## 로컬 이미지
 
-```bash
-docker build --file Dockerfile.rust --tag nvidia-build-lb:local .
-docker build --file docker/postgres.Dockerfile --tag nvidia-build-lb-postgres:local .
-```
+로컬 image를 raw `docker build` 명령으로 따로 쌓지 않습니다. app과 migrate는
+`nvidia-build-lb:local-smoke` 하나를 공유하고, DB는 역할이 다른
+`nvidia-build-lb-postgres:local-smoke` 하나만 재사용합니다. 빌드·사전 reconciliation·종료
+cleanup은 [`docs/UI_SMOKE.md`](docs/UI_SMOKE.md)의 단일 절차로만 실행합니다. 이 절차는
+고정 Compose project와 동시실행 lock을 사용하고 test 전용 label의 이전 image ID까지
+삭제한 뒤 잔존 0개를 확인합니다. 수정 중에는 image를 다시 만들지 않고 Rust/Svelte 영향
+테스트만 실행합니다.
 
 운영 compose는 root-only secret directory에 `admin_token`, `vault_master_key`,
 `db_password`를 둔 뒤 `NBLB_APP_REGISTRY_DIGEST`와
